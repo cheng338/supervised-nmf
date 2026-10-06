@@ -30,7 +30,7 @@ from sklearn.metrics import (
     accuracy_score, average_precision_score, balanced_accuracy_score,
     confusion_matrix, precision_recall_fscore_support, roc_auc_score,
 )
-from sklearn.model_selection import ParameterGrid, StratifiedKFold
+from sklearn.model_selection import ParameterGrid
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.utils.validation import check_X_y
@@ -38,6 +38,7 @@ from threadpoolctl import threadpool_info, threadpool_limits
 
 from .classifier import _record_warnings
 from .screening import _clear_fitted_attributes
+from .validation import build_cv_folds, validate_metadata
 
 
 class _TrackedLogisticRegression(LogisticRegression):
@@ -159,7 +160,10 @@ def _warning_records(caught):
 
 def _diagnostics(estimator):
     result = {}
-    for attribute in ("n_iter_", "converged_", "last_transform_converged_",
+    for attribute in ("n_iter_", "converged_", "convergence_warnings_",
+                      "last_transform_converged_", "last_transform_warnings_", "last_transform_seconds_", "last_transform_error_",
+                      "factorization_converged_", "factorization_convergence_warnings_",
+                      "training_projection_converged_", "training_projection_convergence_warnings_", "training_projection_performed_",
                       "classifier_n_iter_", "classifier_converged_", "classifier_convergence_warnings_",
                       "fit_times_", "n_features_in_"):
         if hasattr(estimator, attribute):
@@ -187,6 +191,14 @@ def _diagnostics(estimator):
                 result[name.rstrip("_")] = int(getattr(selector, name))
     elif hasattr(estimator, "n_features_in_"):
         result["n_selected_features"] = int(estimator.n_features_in_)
+    decomposition = getattr(estimator, "decomposition_", None)
+    if decomposition is not None:
+        result["decomposition"] = {
+            attribute.rstrip("_"): _jsonable(getattr(decomposition, attribute))
+            for attribute in ("n_iter_", "reconstruction_err_", "converged_",
+                              "anchor_condition_", "original_anchor_condition_", "basis_condition_")
+            if hasattr(decomposition, attribute)
+        }
     return result
 
 
@@ -232,7 +244,8 @@ def support_recovery(estimator, signal_support):
             "exact_support_recovered": bool(np.array_equal(retained, truth))}
 
 
-def _search_identity(estimator, candidates, X, y, cv, seed, threads, refit=True):
+def _search_identity(estimator, candidates, X, y, cv, seed, threads, refit=True,
+                     *, groups=None, folds=None, data_ids=None):
     environment = provenance(threads)
     runtime_keys = ("user_api", "internal_api", "prefix", "filepath", "version", "threading_layer", "architecture")
     numerical_runtime = sorted([{key: library.get(key) for key in runtime_keys}
@@ -242,6 +255,7 @@ def _search_identity(estimator, candidates, X, y, cv, seed, threads, refit=True)
             "parameters": _jsonable(estimator.get_params(deep=True)),
             "candidates": _jsonable(candidates), "data_sha256": data_fingerprint(X, y),
             "cv": cv, "seed": seed, "threads": threads, "refit": refit,
+            "groups": _jsonable(groups), "folds": _jsonable(folds), "data_ids": _jsonable(data_ids),
             "python": environment["python"], "platform": environment["platform"],
             "numerical_runtime": numerical_runtime,
             "software": environment["versions"],
@@ -277,7 +291,8 @@ class CalibrationResult:
 
 
 def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
-                       threads=1, checkpoint_path=None, refit=True):
+                       threads=1, checkpoint_path=None, refit=True,
+                       groups=None, folds=None, data_ids=None):
     """Calibrate on training data with complete, resumable per-fold records.
 
     Both fit and held-out-fold prediction warnings are retained. Convergence
@@ -287,13 +302,16 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
     with ``is_fallback=True``. It is never presented as the requested method.
     With ``refit=False``, only CV is performed and the returned estimator is
     None. This supports staged tuning without intermediate full-data fits.
+    Supply one subject ID per row in ``groups`` for group-disjoint CV, or pass
+    exhaustive custom ``folds`` accepted by :func:`build_cv_folds`. Optional
+    unique ``data_ids``, groups and the exact folds are bound to checkpoints.
     """
     X, y = check_X_y(X, y)
     classes, counts = np.unique(y, return_counts=True)
-    if len(classes) != 2:
-        raise ValueError("Calibration currently requires exactly two classes.")
-    if not isinstance(cv, int) or cv < 2 or counts.min() < cv:
-        raise ValueError("Every class must have at least cv samples; cv must be >= 2.")
+    groups = validate_metadata(groups, len(y), name="groups")
+    data_ids = validate_metadata(data_ids, len(y), name="data_ids", unique=True)
+    folds = build_cv_folds(X, y, cv=cv, seed=seed, groups=groups, folds=folds)
+    cv = len(folds)
     if not isinstance(threads, int) or threads < 1:
         raise ValueError("threads must be a positive integer.")
     if not isinstance(refit, bool):
@@ -301,9 +319,9 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
     candidates = list(ParameterGrid(param_grid))
     if not candidates:
         raise ValueError("At least one parameter candidate is required.")
-    identity = _search_identity(estimator, candidates, X, y, cv, seed, threads, refit=refit)
+    identity = _search_identity(estimator, candidates, X, y, cv, seed, threads, refit=refit,
+                                groups=groups, folds=folds, data_ids=data_ids)
     fingerprint = _digest(identity)
-    folds = list(StratifiedKFold(n_splits=cv, shuffle=True, random_state=seed).split(X, y))
     path = Path(checkpoint_path) if checkpoint_path is not None else None
     if path is not None and path.exists():
         report = json.loads(path.read_text(encoding="utf-8"))
@@ -426,14 +444,95 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
     return CalibrationResult(fitted, report)
 
 
-def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None):
-    """Evaluate a fitted classifier; no fitting or threshold selection occurs."""
+def _evaluation_metadata(y, classes, *, sample_ids, groups, train_sample_ids,
+                         train_groups, train_y, min_class_support, min_groups):
+    """Validate supplied split metadata before any held-out prediction."""
+    for name, value in (("min_class_support", min_class_support), ("min_groups", min_groups)):
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value < 1:
+            raise ValueError(f"{name} must be a positive integer.")
+    sample_ids = validate_metadata(sample_ids, len(y), name="sample_ids", unique=True)
+    groups = validate_metadata(groups, len(y), name="groups")
+    train_count = None
+    if train_y is not None:
+        train_y = np.asarray(train_y)
+        if (train_y.ndim != 1 or not len(train_y)
+                or not np.all(np.isin(train_y, classes)) or len(np.unique(train_y)) != 2):
+            raise ValueError("train_y must contain both fitted binary classes in a one-dimensional array.")
+        train_count = len(train_y)
+    for name, values in (("train_sample_ids", train_sample_ids), ("train_groups", train_groups)):
+        if values is not None:
+            array = np.asarray(values, dtype=object)
+            if array.ndim != 1:
+                raise ValueError(f"{name} must match rows as a one-dimensional array.")
+            if train_count is None:
+                train_count = len(array)
+    if train_count == 0:
+        raise ValueError("Training metadata must not be empty.")
+    train_sample_ids = validate_metadata(train_sample_ids, train_count, name="train_sample_ids", unique=True)
+    train_groups = validate_metadata(train_groups, train_count, name="train_groups")
+    if train_sample_ids is not None:
+        if sample_ids is None:
+            raise ValueError("sample_ids are required when train_sample_ids are supplied.")
+        if set(train_sample_ids.tolist()) & set(sample_ids.tolist()):
+            raise ValueError("Training and evaluation sample IDs must not overlap.")
+    if train_groups is not None:
+        if groups is None:
+            raise ValueError("groups are required when train_groups are supplied.")
+        if set(train_groups.tolist()) & set(groups.tolist()):
+            raise ValueError("Training and evaluation groups must not overlap.")
+    counts = [int(np.sum(y == label)) for label in classes]
+    group_count = None if groups is None else len(set(groups.tolist()))
+    low_class_support = min(counts) < min_class_support
+    low_group_support = group_count is not None and group_count < min_groups
+    metadata = {
+        "sample_count": len(y), "class_labels": _jsonable(classes), "class_counts": counts,
+        "min_class_support": int(min_class_support), "low_class_support": bool(low_class_support),
+        "group_count": group_count, "min_groups": int(min_groups),
+        "low_group_support": bool(low_group_support),
+        "meets_support_criteria": not (low_class_support or low_group_support),
+        "support_criteria_note": "Descriptive reporting thresholds, not a test of statistical independence or significance.",
+        "sample_overlap_checked": train_sample_ids is not None,
+        "group_overlap_checked": train_groups is not None,
+        "training_sample_count": train_count,
+        "training_group_count": None if train_groups is None else len(set(train_groups.tolist())),
+    }
+    if groups is not None:
+        metadata["per_class_group_count"] = [len(set(groups[y == label].tolist())) for label in classes]
+    if train_y is None:
+        baseline = {"available": False, "reason": "Training labels were not supplied; majority class was not inferred from evaluation labels."}
+    else:
+        training_counts = [int(np.sum(train_y == label)) for label in classes]
+        majority = classes[int(np.argmax(training_counts))]
+        baseline = {"available": True, "label": _jsonable(majority),
+                    "training_class_counts": training_counts, "class_labels": _jsonable(classes),
+                    "tie_rule": "First fitted class when training class counts tie.",
+                    "accuracy": float(np.mean(y == majority)),
+                    "balanced_accuracy": 0.5 if min(counts) > 0 else None}
+    return sample_ids, groups, metadata, baseline
+
+
+def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
+                        groups=None, train_sample_ids=None, train_groups=None,
+                        train_y=None, min_class_support=10, min_groups=5):
+    """Evaluate a fitted classifier without fitting or threshold selection.
+
+    Optional ``train_y`` defines a training-only majority reference. Subject IDs
+    in ``groups`` provide subject counts; with ``train_groups`` they also enforce
+    disjoint training/evaluation subjects. Likewise, ``train_sample_ids`` require
+    explicit evaluation ``sample_ids`` and reject shared rows. Metadata is
+    checked before prediction. Support thresholds add descriptive flags only;
+    they do not alter predictions, scores, numerical status or model selection.
+    """
     X, y = check_X_y(X, y)
     classes = np.asarray(estimator.classes_)
     if len(classes) != 2 or not np.all(np.isin(y, classes)):
         raise ValueError("Evaluation labels must belong to the fitted binary classes.")
-    if sample_ids is not None and len(sample_ids) != len(y):
-        raise ValueError("sample_ids must match evaluation rows.")
+    if isinstance(threads, bool) or not isinstance(threads, int) or threads < 1:
+        raise ValueError("threads must be a positive integer.")
+    sample_ids, groups, support_diagnostics, majority_reference = _evaluation_metadata(
+        y, classes, sample_ids=sample_ids, groups=groups, train_sample_ids=train_sample_ids,
+        train_groups=train_groups, train_y=train_y, min_class_support=min_class_support,
+        min_groups=min_groups)
     positive = classes[1]
     start = time.perf_counter()
     with threadpool_limits(limits=threads), warnings.catch_warnings(record=True) as caught:
@@ -473,6 +572,7 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None):
             return {"status": "failed", "error_type": type(error).__name__, "error": str(error),
                     "prediction_seconds": time.perf_counter() - start,
                     "warnings": _warning_records(caught), "diagnostics": _diagnostics(estimator),
+                    "support_diagnostics": support_diagnostics, "training_majority_reference": majority_reference,
                     "data_sha256": data_fingerprint(X, y)}
     elapsed = time.perf_counter() - start
     precision, recall, f1, support = precision_recall_fscore_support(y, predicted, labels=classes,
@@ -499,9 +599,81 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None):
             "metrics": metrics, "prediction_seconds": elapsed, "prediction_operation": prediction_operation,
             "warnings": _warning_records(caught),
             "diagnostics": _diagnostics(estimator), "data_sha256": data_fingerprint(X, y),
+            "support_diagnostics": support_diagnostics, "training_majority_reference": majority_reference,
+            "evaluation_groups": _jsonable(groups),
             "predictions": {"sample_ids": _jsonable(np.arange(len(y)) if sample_ids is None else sample_ids),
                             "true_labels": _jsonable(y), "predicted_labels": _jsonable(predicted),
                             "positive_class_probability": _jsonable(probability)}}
+
+
+def format_evaluation_summary(report):
+    """Format metrics, support, stage timings and convergence without raw rows.
+
+    Accept an evaluation report, or a comparison record containing ``evaluation``
+    and its tuning/final-fit times. Missing diagnostics remain explicitly absent.
+    """
+    evaluation = report.get("evaluation", report)
+    lines = [f"Evaluation status: {evaluation.get('status', 'unavailable')}."]
+    if "error" in evaluation:
+        lines.append(f"Error: {evaluation['error']}")
+
+    def number(value):
+        return "unavailable" if value is None else f"{value:.6g}"
+
+    metrics = evaluation.get("metrics", {})
+    if metrics:
+        lines += ["", "| Metric | Value |", "| --- | --- |"]
+        for key in ("accuracy", "balanced_accuracy", "roc_auc", "average_precision"):
+            lines.append(f"| {key.replace('_', ' ').capitalize()} | {number(metrics.get(key))} |")
+        lines += ["", "| Class | Recall | Support |", "| --- | --- | --- |"]
+        for row in metrics.get("per_class", []):
+            label = str(row["label"]).replace("|", "\\|").replace("\n", " ")
+            lines.append(f"| {label} | {number(row['recall'])} | {row['support']} |")
+    reference = evaluation.get("training_majority_reference", {})
+    if reference.get("available"):
+        lines += ["", f"Training-majority reference (class {reference['label']}): "
+                  f"accuracy {number(reference['accuracy'])}; balanced accuracy {number(reference['balanced_accuracy'])}."]
+    else:
+        lines += ["", "Training-majority reference: unavailable; training labels were not supplied."]
+    support = evaluation.get("support_diagnostics", {})
+    if support:
+        groups = support.get("group_count")
+        lines.append(f"Evaluation support: {support['sample_count']} rows; "
+                     f"{'subject count unavailable' if groups is None else str(groups) + ' distinct subjects'}.")
+        if support.get("low_class_support"):
+            lines.append(f"Low class support: at least one class has fewer than {support['min_class_support']} rows.")
+        if support.get("low_group_support"):
+            lines.append(f"Low subject support: fewer than {support['min_groups']} distinct subjects.")
+        if not support.get("group_overlap_checked"):
+            lines.append("Training/evaluation subject overlap was not checked: paired subject metadata was not supplied.")
+    diagnostics = evaluation.get("diagnostics", {})
+    phases = (("Overall fit", "converged", "convergence_warnings"),
+              ("Factorization", "factorization_converged", "factorization_convergence_warnings"),
+              ("Training projection", "training_projection_converged", "training_projection_convergence_warnings"),
+              ("Classifier fit", "classifier_converged", "classifier_convergence_warnings"),
+              ("Latest projection", "last_transform_converged", "last_transform_warnings"))
+    lines += ["", "| Numerical phase | Convergence |", "| --- | --- |"]
+    phase_warnings = []
+    for label, flag, warning_key in phases:
+        value = diagnostics.get(flag)
+        state = "unavailable" if value is None else "passed" if value else "failed"
+        if flag == "training_projection_converged" and diagnostics.get("training_projection_performed") is False:
+            state = "not performed"
+        lines.append(f"| {label} | {state} |")
+        for message in diagnostics.get(warning_key, ()):
+            phase_warnings.append(f"{label} warning: {message}")
+    if phase_warnings:
+        lines += ["", *phase_warnings]
+    if diagnostics.get("last_transform_error"):
+        lines += ["", f"Latest projection error: {diagnostics['last_transform_error']}"]
+    lines += ["", "| Timed stage | Seconds |", "| --- | --- |"]
+    for label, value in (("Tuning", report.get("tuning_seconds")),
+                         ("Final fit", report.get("final_fit_seconds")),
+                         ("Prediction", evaluation.get("prediction_seconds"))):
+        lines.append(f"| {label} | {number(value)} |")
+    for label, value in diagnostics.get("fit_times", {}).items():
+        lines.append(f"| Fit: {label.replace('_', ' ')} | {number(value)} |")
+    return "\n".join(lines) + "\n"
 
 
 def comparison_models(*, random_state=0, quick=False, max_iter=20000, tol=1e-4,
@@ -617,7 +789,8 @@ def run_comparison(models, X_train, y_train, X_validation, y_validation, *,
             record["support_recovery"] = support_recovery(calibrated.estimator, signal_support)
         try:
             record["evaluation"] = evaluate_classifier(calibrated.estimator, X_validation, y_validation,
-                                                        threads=threads, sample_ids=validation_ids)
+                                                        threads=threads, sample_ids=validation_ids,
+                                                        train_y=y_train)
         except Exception as error:
             record["evaluation"] = {"status": "failed", "error_type": type(error).__name__, "error": str(error)}
         write_json(result_path, record)

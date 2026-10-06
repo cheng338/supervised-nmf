@@ -21,14 +21,17 @@ import warnings
 import numpy as np
 from scipy import sparse
 from sklearn.base import clone
+from sklearn.decomposition import PCA
 from sklearn.metrics import balanced_accuracy_score
-from sklearn.model_selection import ParameterGrid, StratifiedKFold
+from sklearn.model_selection import ParameterGrid
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.utils.validation import check_X_y
 from threadpoolctl import threadpool_info, threadpool_limits
 
 from .classifier import NMFClassifier
+from .screening import BinaryScreening
+from .validation import build_cv_folds, validate_metadata
 from .evaluation import (
     _diagnostics, _digest, _jsonable, _nonconverged, _search_identity,
     _warning_records, provenance, refinement_diagnostics, write_json,
@@ -146,12 +149,97 @@ def _finite(matrix):
     return bool(np.isfinite(values).all())
 
 
+class _PreparedScreening(BinaryScreening):
+    """Carry a fold-local screen through a standard uncached Pipeline fit."""
+
+    def __init__(self, reference):
+        self.reference = reference
+        super().__init__(**reference.get_params(deep=False))
+
+    def fit(self, X, y):
+        return self._fit_from_statistics(self.reference)
+
+
+def _screening_template(estimator, kind):
+    if kind == "nmf" and estimator.screening in {"percentile", "absolute"}:
+        return BinaryScreening(estimator.screening, estimator.percentile, estimator.score_threshold)
+    # Arbitrary pipelines may change values, sample order, metadata or fitting
+    # semantics. Only the two exact standard layouts below use this shortcut.
+    if kind == "pipeline" and estimator.memory is None:
+        steps = estimator.steps
+        if (len(steps) in {2, 3} and type(steps[0][1]) is BinaryScreening
+                and (len(steps) == 2 or type(steps[1][1]) is PCA)):
+            return steps[0][1]
+    return None
+
+
+def _check_rank_feasibility(estimator, kind, n_train, n_features):
+    if kind == "nmf":
+        rank = estimator.n_components
+        if (isinstance(rank, (bool, np.bool_)) or not isinstance(rank, Integral)
+                or not 1 <= rank <= min(n_train, n_features)):
+            raise ValueError("n_components must be between 1 and min(training samples, selected features).")
+    elif kind == "pipeline":
+        steps = estimator.steps
+        standard = ((len(steps) == 2 and type(steps[0][1]) is PCA)
+                    or (len(steps) == 3 and type(steps[0][1]) is BinaryScreening
+                        and type(steps[1][1]) is PCA))
+        if standard:
+            pca = steps[-2][1]
+            rank = pca.n_components
+            if isinstance(rank, Integral) and not isinstance(rank, (bool, np.bool_)):
+                limit = min(n_train, n_features)
+                if rank > limit or (pca.svd_solver == "arpack" and rank >= limit):
+                    raise ValueError("PCA n_components exceeds the limit for this training fold's selected features and solver.")
+
+
+class _ScreeningCache:
+    """Bound to one call's immutable data and materialized training folds."""
+
+    def __init__(self):
+        self.statistics = {}
+        self.selectors = {}
+
+    def prepare(self, template, fold, X, y, train, record):
+        # Validate the actual requested screen even when another cutoff already
+        # populated this fold's cache.
+        template._validate_settings()
+        if fold not in self.statistics:
+            start = time.perf_counter()
+            try:
+                base = BinaryScreening(screening="absolute", score_threshold=0.0).fit(X[train], y[train])
+                self.statistics[fold] = base
+            except Exception as error:
+                self.statistics[fold] = error
+            finally:
+                record["screening_statistics_seconds"] = time.perf_counter() - start
+                record["screening_statistics_fit_performed"] = True
+        base = self.statistics[fold]
+        if isinstance(base, Exception):
+            raise base
+        key = (fold, _digest(template.get_params(deep=False)))
+        if key not in self.selectors:
+            start = time.perf_counter()
+            try:
+                self.selectors[key] = clone(template)._fit_from_statistics(base)
+            except Exception as error:
+                self.selectors[key] = error
+            finally:
+                record["screening_selection_seconds"] = time.perf_counter() - start
+        selector = self.selectors[key]
+        if isinstance(selector, Exception):
+            raise selector
+        return selector
+
+
 def _run_representation_fold(estimator, kind, neighbor_parameter, representation_parameters,
-                             neighbors, X, y, train, validation, record):
+                             neighbors, X, y, train, validation, record, *, screening_cache=None):
     fitted = None
     caught = []
     record.update(representation_fit_seconds=0.0, projection_seconds=0.0,
-                  representation_fit_performed=False, neighbors={})
+                  representation_fit_performed=False, neighbors={},
+                  screening_statistics_seconds=0.0, screening_selection_seconds=0.0,
+                  screening_statistics_fit_performed=False, preflight_rejected=False)
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -160,13 +248,34 @@ def _run_representation_fold(estimator, kind, neighbor_parameter, representation
                 # This initial KNN fit is only the carrier for the representation;
                 # its small cost is retained in the shared fit timer exactly once.
                 fitted.set_params(**{neighbor_parameter: 1})
+                selected = None
+                template = _screening_template(fitted, kind)
+                failure_stage = "screening"
+                if template is not None and screening_cache is not None:
+                    selected = screening_cache.prepare(template, record["fold"], X, y, train, record)
+                    record["screening_cache_used"] = True
+                    record["n_selected_features"] = selected.n_features_selected_
+                failure_stage = "rank_feasibility"
+                # For unknown preprocessing layouts, leave all validation to
+                # their ordinary fit: the input dimension may legitimately change.
+                if kind == "nmf" or selected is not None or (kind == "pipeline" and len(fitted.steps) == 2):
+                    _check_rank_feasibility(fitted, kind, len(train),
+                                            selected.n_features_selected_ if selected is not None else X.shape[1])
+                if selected is not None and kind == "pipeline":
+                    name, _ = fitted.steps[0]
+                    fitted.steps[0] = (name, _PreparedScreening(selected))
+                failure_stage = "fit"
                 record["representation_fit_performed"] = True
                 start = time.perf_counter()
                 try:
-                    fitted.fit(X[train], y[train])
+                    if selected is not None and kind == "nmf":
+                        fitted._fit_with_screening(X[train], y[train], selected)
+                    else:
+                        fitted.fit(X[train], y[train])
                 finally:
                     record["representation_fit_seconds"] = time.perf_counter() - start
                 training_coordinates, knn_template = _stored_training_representation(fitted, kind)
+                failure_stage = "projection"
                 start = time.perf_counter()
                 try:
                     validation_coordinates = _validation_representation(fitted, kind, X[validation])
@@ -179,7 +288,9 @@ def _run_representation_fold(estimator, kind, neighbor_parameter, representation
                 record["representation_shape"] = list(training_coordinates.shape)
                 record["status"] = "nonconverged" if _nonconverged(fitted, caught) else "valid"
             except Exception as error:
-                record.update(status="failed", error_type=type(error).__name__, error=str(error))
+                record.update(status="failed", error_type=type(error).__name__, error=str(error),
+                              failure_stage=locals().get("failure_stage", "configuration"),
+                              preflight_rejected=not record["representation_fit_performed"])
     finally:
         record["warnings"] = _warning_records(caught)
         if fitted is not None:
@@ -215,8 +326,9 @@ def _run_representation_fold(estimator, kind, neighbor_parameter, representation
         record["neighbors"][str(neighbors_count)] = result
 
 
-def calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=1, checkpoint_dir):
-    """Evaluate an explicit grid, sharing each representation fit across k only.
+def calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=1,
+                         checkpoint_dir, groups=None, folds=None, data_ids=None):
+    """Evaluate an explicit grid, sharing fold-local screening and representations.
 
     The return value is a JSON-compatible report containing ordinary complete
     candidate/fold records, provisional CV ranking and refinement diagnostics.
@@ -225,6 +337,12 @@ def calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=1
     must be fixed integer seeds. Only standard supported estimator types are
     accepted because representation independence from k is essential.
     Logistic regression uses the general-purpose ``calibration_search`` instead.
+    ``groups`` keeps subjects together; ``folds`` supplies a validated complete
+    CV partition. Optional unique ``data_ids`` bind checkpoints to sample IDs.
+    Standard NMFClassifier and screen/PCA/KNN layouts reuse screening statistics
+    across cutoffs and ranks. Arbitrary pipelines keep their ordinary fit path.
+    Impossible ranks and empty screens are explicit failed candidates, never
+    silently reduced ranks or changed cutoffs.
 
     Completed representation/fold receipts, including numerical failures, are
     reused only for the identical data, folds, grid, parameters, code and runtime.
@@ -250,7 +368,7 @@ def calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=1
     candidates = list(ParameterGrid(param_grid))
     if not candidates:
         raise ValueError("The grid must declare at least one candidate.")
-    groups = {}
+    rep_groups = {}
     for index, params in enumerate(candidates):
         if set(params) & forbidden:
             raise ValueError("Only n_neighbors may vary among classifier settings; fix other classifier knobs on the estimator.")
@@ -263,23 +381,27 @@ def calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=1
             raise ValueError("Every declared n_neighbors value must be a positive integer.")
         representation = {name: value for name, value in params.items() if name != neighbor_parameter}
         key = _digest(representation)
-        group = groups.setdefault(key, {"parameters": representation, "candidate_indices": [], "neighbors": []})
+        group = rep_groups.setdefault(key, {"parameters": representation, "candidate_indices": [], "neighbors": []})
         group["candidate_indices"].append(index)
         if int(neighbors_count) not in group["neighbors"]:
             group["neighbors"].append(int(neighbors_count))
     X, y = np.array(X, copy=True), np.array(y, copy=True)
     X.setflags(write=False)
     y.setflags(write=False)
-    folds = list(StratifiedKFold(cv, shuffle=True, random_state=seed).split(X, y))
+    groups = validate_metadata(groups, len(y), name="groups")
+    data_ids = validate_metadata(data_ids, len(y), name="data_ids", unique=True)
+    folds = build_cv_folds(X, y, cv=cv, seed=seed, groups=groups, folds=folds)
     runtime = _runtime_identity(estimator, threads)
-    identity = _jsonable({"schema_version": 1, "method": "explicit_grid_shared_knn_representation",
-                         "calibration": _search_identity(estimator, candidates, X, y, cv, seed, threads, refit=False),
+    identity = _jsonable({"schema_version": 2, "method": "explicit_grid_shared_knn_representation",
+                         "calibration": _search_identity(estimator, candidates, X, y, cv, seed, threads,
+                                                         refit=False, groups=groups, folds=folds, data_ids=data_ids),
                          "runtime": runtime, "folds": [{"training_indices": a, "validation_indices": b} for a, b in folds],
                          "neighbor_parameter": neighbor_parameter, "representation_backend": kind})
     fingerprint = _digest(identity)
     directory = Path(checkpoint_dir)
     directory.mkdir(parents=True, exist_ok=True)
     receipts = []
+    screening_cache = _ScreeningCache()
     reused = new_fits = 0
     with _checkpoint_lock(directory):
         manifest = directory / "identity.json"
@@ -290,7 +412,7 @@ def calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=1
             _write_receipt(manifest, identity)
         with threadpool_limits(limits=threads):
             active_pools = threadpool_info()
-            for representation_key, group in groups.items():
+            for representation_key, group in rep_groups.items():
                 for fold, (train, validation) in enumerate(folds):
                     key = _digest({"identity": fingerprint, "representation": representation_key, "fold": fold})
                     path = directory / "folds" / f"{key}.json"
@@ -308,7 +430,8 @@ def calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=1
                         _write_receipt(attempt, record)
                         try:
                             _run_representation_fold(estimator, kind, neighbor_parameter, group["parameters"],
-                                                     group["neighbors"], X, y, train, validation, record)
+                                                     group["neighbors"], X, y, train, validation, record,
+                                                     screening_cache=screening_cache)
                             if _runtime_identity(estimator, threads) != runtime:
                                 raise ValueError("Source or numerical runtime changed during a representation fit.")
                             record["state"] = "completed"
@@ -339,7 +462,7 @@ def calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=1
                 else:
                     row = {"status": shared["status"], "fit_seconds": 0.0, "prediction_seconds": 0.0,
                            "warnings": shared["warnings"]}
-                    for field in ("error", "error_type"):
+                    for field in ("error", "error_type", "failure_stage", "preflight_rejected"):
                         if field in shared:
                             row[field] = shared[field]
                 row.update(fold=fold, shared_representation_key=shared["key"],
@@ -354,21 +477,25 @@ def calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=1
         ranked = sorted((row["index"] for row in candidate_reports if row["valid"]),
                         key=lambda index: (-candidate_reports[index]["mean_balanced_accuracy"], index))
         selected = candidates[ranked[0]] if ranked else None
-        costs = {"representation_fit_seconds": sum(row["representation_fit_seconds"] for row in receipts),
+        costs = {"screening_statistics_seconds": sum(row["screening_statistics_seconds"] for row in receipts),
+                 "screening_selection_seconds": sum(row["screening_selection_seconds"] for row in receipts),
+                 "representation_fit_seconds": sum(row["representation_fit_seconds"] for row in receipts),
                  "validation_projection_seconds": sum(row["projection_seconds"] for row in receipts),
                  "knn_fit_seconds": sum(item["fit_seconds"] for row in receipts for item in row["neighbors"].values()),
                  "knn_prediction_seconds": sum(item["prediction_seconds"] for row in receipts for item in row["neighbors"].values())}
-        report = {"schema_version": 1, "author": "Chang Cheng", "state": "cv_completed", "fingerprint": fingerprint,
+        report = {"schema_version": 2, "author": "Chang Cheng", "state": "cv_completed", "fingerprint": fingerprint,
                   "identity": identity, "active_threadpools": active_pools, "candidates": candidate_reports,
                   "ranked_candidate_indices": ranked, "selected_parameters": selected,
                   "selection_role": "provisional_highest_complete_training_cv_score_in_declared_grid",
                   "refinement": refinement_diagnostics(candidates, selected),
-                  "representation_folds": receipts, "unique_representations": len(groups),
+                  "representation_folds": receipts, "unique_representations": len(rep_groups),
+                  "screening_statistics_fits": sum(row["screening_statistics_fit_performed"] for row in receipts),
+                  "preflight_rejected_representation_folds": sum(row["preflight_rejected"] for row in receipts),
                   "unique_representation_fits": sum(row["representation_fit_performed"] for row in receipts),
                   "new_representation_fits": new_fits, "reused_representation_folds": reused,
                   "compute_seconds": costs, "tuning_seconds": sum(costs.values()),
                   "current_call_wall_seconds": time.perf_counter() - start_call,
-                  "timing_note": "Shared fit and projection are counted once per representation/fold; candidate fit times contain only their KNN fits. Recorded numerical compute excludes checkpoint I/O and uncommitted interrupted attempts, which remain in attempts/.",
+                  "timing_note": "Screen statistics and mask selection are counted once when computed; a partial resume may recompute in-memory screens. Shared fit and projection are counted once per representation/fold; candidate fit times contain only their KNN fits. Recorded numerical compute excludes checkpoint I/O and uncommitted interrupted attempts, which remain in attempts/.",
                   "refit_performed": False, "final_fit_seconds": 0.0, "is_fallback": False,
                   "tuning_complete": False, "defaults_frozen": False}
         report = _jsonable(report)

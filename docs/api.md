@@ -146,6 +146,38 @@ Checkpoints can resume only when data, parameters, versions, folds and package
 source hashes match. Changing code or settings requires a new run. The source
 examples create unique run directories and expose `--resume` for compatible runs.
 
+Both `calibration_search` and `calibration_knn_grid` accept `groups`, `folds`,
+and `data_ids`. `groups` keeps rows from a subject together. `folds` supplies
+exact training/validation index pairs and must contain `cv` exhaustive splits;
+each validation row appears once and training indices are its complement.
+Every validation fold must contain both classes, and every training fold needs
+at least two observations per class. Supplied IDs and folds are validated and
+bound to checkpoints. See [tuning improvements](tuning-improvements.md).
+
+Evaluation metadata is optional, but independence is checked only when the
+corresponding metadata is supplied:
+
+```python
+from supervised_nmf.evaluation import format_evaluation_summary
+
+validation = evaluate_classifier(
+    calibrated.estimator, X_validation, y_validation,
+    sample_ids=validation_ids, train_sample_ids=training_ids,
+    groups=validation_subjects, train_groups=training_subjects,
+    train_y=y_train,
+)
+print(format_evaluation_summary(validation))
+```
+
+Training/evaluation IDs and subjects must not overlap. Training labels determine
+the majority-class reference; evaluation labels never choose that class.
+`min_class_support=10` and `min_groups=5` flag small evaluation samples without
+altering predictions or excluding rows. The summary includes both class recalls,
+class counts, available subject counts, timing, and numerical-stage diagnostics.
+Numerical-phase diagnostics on `NMFClassifier` now include
+`factorization_converged_` and `training_projection_converged_`, with their
+corresponding `*_convergence_warnings_` attributes.
+
 The commands below exercise a paired development comparison:
 
 ```powershell
@@ -217,6 +249,35 @@ Checksummed fold records can be reused only with matching data, folds, grid,
 estimator, source and runtime identity. A report describes the declared grid and
 does not certify completed tuning. Record subsequent grid decisions and numerical
 qualification before freezing the final study.
+
+Recognized NMFClassifier and screening/PCA/KNN layouts also share training-fold
+screening statistics across cutoff and rank settings. The report counts
+`screening_statistics_seconds` and `screening_selection_seconds` separately.
+Empty screens and impossible ranks remain explicit failed candidates with a
+`failure_stage`; no threshold or rank is silently substituted. Generic pipeline
+layouts retain their ordinary fit path.
+
+## Bounded rank exploration
+
+`supervised_nmf.search.calibration_rank_search` accepts the same estimator,
+explicit grid, training data, fold metadata, and checkpoint controls as
+`calibration_knn_grid`. It adds `rank_parameter=None`, `max_expansions=2`, and
+`max_rank=None`. The rank parameter is inferred only when exactly one
+`n_components` grid parameter is declared. An upper-boundary winner may be
+tested at doubled rank with its other parameters fixed. New ranks are bounded
+by known fold-local dimensions and an optional user cap. Original grid entries
+are preserved, including infeasible ones.
+
+The returned report contains each stage, its candidates, the selected settings,
+`stop_reason`, and `unresolved_upper_rank_boundary`. Exhausted budgets, user
+caps, and unresolved failed upper candidates do not certify completed search.
+Even when `search_complete` is true for this upper-rank policy,
+`tuning_complete` remains false: screening and neighbor choices have not been
+jointly reoptimized and no global optimum is claimed. This helper supports the
+shared evaluator's KNN layouts and performs no refit or outer evaluation.
+
+Run `python examples/grouped_tuning.py --output runs/grouped-example` for a
+small synthetic subject-separated example.
 
 ## Local CelebA data
 

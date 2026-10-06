@@ -25,7 +25,7 @@ implements Chapter 7 of:
 
 See [CITATION.cff](CITATION.cff) for citation details and
 [source provenance](provenance/README.md) for the original scripts. This is a
-development release, version 0.1.0a1. A distribution license has not yet been
+development version, 0.1.0a2. A distribution license has not yet been
 selected.
 
 # Installation
@@ -147,6 +147,20 @@ a universal best solver. SPA's factor-recovery results require additional
 separability and noise assumptions; classification accuracy does not establish
 those assumptions. See [solver comparisons](docs/nmf-solver-comparison.md),
 [methodology](docs/methodology.md), and [theoretical scope](docs/theory-implementation.md).
+
+# Tuning and reporting update
+
+Version 0.1.0a2 adds subject-aware training folds, bounded rank exploration,
+reused fold-local screening statistics, and evaluation summaries with class
+support and numerical-stage diagnostics. Solver, screening, and rank defaults
+are unchanged. SPA retains public SciPy NNLS projection and uses direct BLAS
+anchor updates. See [tuning improvements](docs/tuning-improvements.md) and the
+[API guide](docs/api.md).
+
+Run `python examples/grouped_tuning.py --output runs/grouped-example` for a
+small subject-separated example. Search budgets and failed upper-rank
+candidates remain explicit; a completed grid does not establish a global
+optimum or complete statistical validation.
 
 # Parameter tuning
 

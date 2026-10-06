@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "supervised-nmf"
-version = "0.1.0a1"
+version = "0.1.0a2"
 description = "Supervised nonnegative matrix factorization for binary classification"
 readme = "README.md"
 requires-python = ">=3.10"

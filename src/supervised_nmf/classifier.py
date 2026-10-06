@@ -109,6 +109,17 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
         self.logistic_class_weight = logistic_class_weight
 
     def fit(self, X, y):
+        return self._fit(X, y)
+
+    def _fit_with_screening(self, X, y, selector):
+        """Reuse a selector fitted on this training fold by the study runner.
+
+        This private entry point does not fit or select features globally. The
+        caller owns the fold/data binding and counts screening computation once.
+        """
+        return self._fit(X, y, prepared_selector=selector)
+
+    def _fit(self, X, y, prepared_selector=None):
         _clear_fitted_attributes(self)
         start = time.perf_counter()
         if self.solver not in {"cd", "spa", "mu"}:
@@ -144,12 +155,27 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
             raise ValueError("tol must be finite and nonnegative.")
         stage = time.perf_counter()
         if self.screening == "none":
+            if prepared_selector is not None:
+                raise ValueError("A prepared selector requires screening to be enabled.")
             selector = None
             selected_features = np.arange(X.shape[1])
             X_selected = X
         else:
-            selector = BinaryScreening(self.screening, self.percentile, self.score_threshold)
-            X_selected = selector.fit_transform(X, y)
+            if prepared_selector is None:
+                selector = BinaryScreening(self.screening, self.percentile, self.score_threshold)
+                X_selected = selector.fit_transform(X, y)
+            else:
+                selector = prepared_selector
+                if type(selector) is not BinaryScreening:
+                    raise TypeError("The prepared selector must be a fitted BinaryScreening instance.")
+                check_is_fitted(selector, "support_")
+                if (selector.screening != self.screening or selector.percentile != self.percentile
+                        or selector.score_threshold != self.score_threshold
+                        or selector.n_samples_seen_ != len(y)
+                        or not np.array_equal(selector.classes_, classes)
+                        or not np.array_equal(selector.class_counts_, counts)):
+                    raise ValueError("Prepared screening does not match this training fold or estimator.")
+                X_selected = selector.transform(X)
             selected_features = selector.get_support(indices=True)
         screen_seconds = time.perf_counter() - stage
         if isinstance(self.n_components, bool) or not isinstance(self.n_components, Integral) or not 1 <= self.n_components <= min(X_selected.shape):
@@ -209,6 +235,12 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
         self.classifier_convergence_warnings_ = classifier_warnings
         self.classifier_converged_ = not classifier_warnings
         self.classifier_n_iter_ = classifier_n_iter
+        self.factorization_convergence_warnings_ = fitting_warnings
+        self.factorization_converged_ = not fitting_warnings
+        self.training_projection_convergence_warnings_ = projection_warnings
+        self.training_projection_performed_ = self.training_coordinates == "transform"
+        self.training_projection_converged_ = (not projection_warnings
+                                              if self.training_projection_performed_ else None)
         self.convergence_warnings_ = fitting_warnings + projection_warnings + classifier_warnings
         self.converged_ = not self.convergence_warnings_
         self.training_coordinates_ = W.copy()
@@ -219,16 +251,24 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
 
     def transform(self, X):
         check_is_fitted(self, "classifier_")
-        X = _nonnegative_array(X)
-        if X.shape[1] != self.n_features_in_:
-            raise ValueError(f"X has {X.shape[1]} features; expected {self.n_features_in_}.")
-        X_selected = X[:, self.selected_features_]
         start = time.perf_counter()
-        W, messages = _record_warnings(lambda: self.decomposition_.transform(X_selected))
-        self.last_transform_seconds_ = time.perf_counter() - start
-        self.last_transform_warnings_ = messages
-        self.last_transform_converged_ = not messages
-        return W
+        self.last_transform_converged_ = False
+        self.last_transform_warnings_ = ()
+        self.last_transform_error_ = None
+        try:
+            X = _nonnegative_array(X)
+            if X.shape[1] != self.n_features_in_:
+                raise ValueError(f"X has {X.shape[1]} features; expected {self.n_features_in_}.")
+            X_selected = X[:, self.selected_features_]
+            W, messages = _record_warnings(lambda: self.decomposition_.transform(X_selected))
+            self.last_transform_warnings_ = messages
+            self.last_transform_converged_ = not messages
+            return W
+        except Exception as error:
+            self.last_transform_error_ = f"{type(error).__name__}: {error}"
+            raise
+        finally:
+            self.last_transform_seconds_ = time.perf_counter() - start
 
     def predict(self, X):
         check_is_fitted(self, "classifier_")

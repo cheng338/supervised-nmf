@@ -5,6 +5,7 @@ ANOVA screen. For two classes, the pooled two-sample t statistic squared is F.
 """
 
 from numbers import Real
+from copy import deepcopy
 
 import numpy as np
 from sklearn.base import BaseEstimator, TransformerMixin
@@ -84,13 +85,51 @@ class BinaryScreening(TransformerMixin, BaseEstimator):
 
     def fit(self, X, y):
         _clear_fitted_attributes(self)
+        self._validate_settings()
+        X, y, classes, counts = _binary_data(X, y)
+        return self._fit_statistics(X, y, classes, counts)
+
+    def _validate_settings(self):
         if self.screening not in {"percentile", "absolute"}:
             raise ValueError("screening must be 'percentile' or 'absolute'.")
         if not isinstance(self.percentile, Real) or not np.isfinite(self.percentile) or not 0 <= self.percentile <= 100:
             raise ValueError("percentile must be finite and between 0 and 100.")
         if not isinstance(self.score_threshold, Real) or not np.isfinite(self.score_threshold) or self.score_threshold < 0:
             raise ValueError("score_threshold must be finite and nonnegative.")
-        X, y, classes, counts = _binary_data(X, y)
+
+    def _support_from_statistics(self, t_scores, constant):
+        if self.screening == "percentile":
+            support = _percentile_support(np.abs(t_scores), ~constant, self.percentile)
+        else:
+            support = (np.abs(t_scores) >= self.score_threshold) & ~constant
+        if not support.any():
+            raise ValueError("Screening selected zero features; choose a different threshold or percentile.")
+        return support
+
+    def _fit_from_statistics(self, reference):
+        """Reuse trusted statistics from the identical training observations.
+
+        This private helper is used only by the fold-local calibration cache.
+        It recomputes the requested mask, including ties and infinite scores;
+        it never borrows the reference screen's selected features.
+        """
+        _clear_fitted_attributes(self)
+        self._validate_settings()
+        if type(reference) is not BinaryScreening:
+            raise TypeError("reference must be a fitted BinaryScreening instance.")
+        check_is_fitted(reference, "support_")
+        constant = np.zeros(reference.n_features_in_, dtype=bool)
+        constant[reference.constant_features_] = True
+        support = self._support_from_statistics(reference.t_scores_, constant)
+        for name, value in vars(reference).items():
+            if name.endswith("_") and not name.startswith("__"):
+                setattr(self, name, deepcopy(value))
+        self.support_ = support
+        self.selected_features_ = np.flatnonzero(support)
+        self.n_features_selected_ = int(support.sum())
+        return self
+
+    def _fit_statistics(self, X, y, classes, counts):
         # Scale only the statistic computation, not the transformed features.
         # A common positive scale per feature leaves pooled t/F unchanged and
         # avoids squaring very large or very small raw measurement units.
@@ -121,12 +160,7 @@ class BinaryScreening(TransformerMixin, BaseEstimator):
         t_scores[constant] = 0.0
         with np.errstate(over="ignore"):
             scores = np.square(t_scores)
-        if self.screening == "percentile":
-            support = _percentile_support(np.abs(t_scores), ~constant, self.percentile)
-        else:
-            support = (np.abs(t_scores) >= self.score_threshold) & ~constant
-        if not support.any():
-            raise ValueError("Screening selected zero features; choose a different threshold or percentile.")
+        support = self._support_from_statistics(t_scores, constant)
         self.n_features_in_ = X.shape[1]
         self.n_samples_seen_ = X.shape[0]
         self.classes_ = classes

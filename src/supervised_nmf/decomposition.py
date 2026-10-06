@@ -3,6 +3,7 @@
 from numbers import Integral, Real
 
 import numpy as np
+from scipy.linalg.blas import dgemv, dger
 from scipy.optimize import nnls
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
@@ -80,7 +81,13 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
             direction /= norm
             anchors.append(index)
             directions.append(direction)
-            residual -= np.outer(direction, direction @ residual)
+            # residual is an owned C-order workspace. Its transpose is an
+            # F-order view, allowing BLAS to update it in place without the
+            # full-size outer-product temporary. Keep the original residual
+            # layout for column norms and the same reorthogonalized SPA step.
+            projection = dgemv(1.0, residual.T, direction)
+            residual = dger(-1.0, projection, direction,
+                            a=residual.T, overwrite_a=1).T
         anchors = np.asarray(anchors, dtype=int)
         anchor_condition = float(np.linalg.cond(scaled[:, anchors]))
         original_anchor_condition = float(np.linalg.cond(X[:, anchors]))
@@ -118,8 +125,13 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
         X = _nonnegative_array(X).astype(np.float64, copy=False)
         if X.shape[1] != self.n_features_in_:
             raise ValueError(f"X has {X.shape[1]} features; expected {self.n_features_in_}.")
+        # scipy.optimize.nnls requests a C-order design matrix. Prepare the
+        # shared fixed basis once, rather than copying its transpose per row.
+        # Continue using the public solver, including its finite checks and
+        # max-iteration failure behavior; never overwrite the fitted basis.
+        design = np.ascontiguousarray(self.components_.T)
         return np.vstack([
-            nnls(self.components_.T, row, maxiter=self.nnls_max_iter)[0]
+            nnls(design, row, maxiter=self.nnls_max_iter)[0]
             for row in X
         ])
 

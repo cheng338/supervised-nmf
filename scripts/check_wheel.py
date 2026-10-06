@@ -5,21 +5,24 @@ Run with `python -I scripts/check_wheel.py` to exclude source-checkout imports.
 
 from email.parser import Parser
 from pathlib import Path
+import re
 import sys
 import tarfile
 import zipfile
 
 root = Path(__file__).resolve().parents[1]
-withdrawn_workflow = ("supervised_nmf/search.py", "supervised_nmf/tuning.py",
+withdrawn_workflow = ("supervised_nmf/tuning.py",
                       "examples/adaptive_policy.json", "examples/adaptive_support.py",
                       "tests/test_search.py", "tests/test_tuning.py", "tests/test_adaptive_examples.py",
                       "docs/adaptive-tuning.md", "provenance/tuning-reference.json")
-wheel = root / "dist" / "supervised_nmf-0.1.0a1-py3-none-any.whl"
+version = re.search(r'^version = "([^"]+)"$',
+                    (root / "pyproject.toml").read_text(encoding="utf-8"), re.MULTILINE).group(1)
+wheel = root / "dist" / f"supervised_nmf-{version}-py3-none-any.whl"
 with zipfile.ZipFile(wheel) as archive:
     metadata_file = next(n for n in archive.namelist() if n.endswith(".dist-info/METADATA"))
     metadata = Parser().parsestr(archive.read(metadata_file).decode("utf-8"))
     assert metadata["Author"] == "Chang Cheng"
-    assert metadata["Version"] == "0.1.0a1"
+    assert metadata["Version"] == version
     assert metadata["Requires-Python"] == ">=3.10"
     assert "study" in metadata.get_all("Provides-Extra", [])
     assert any("matplotlib" in requirement and 'extra == "study"' in requirement
@@ -36,10 +39,17 @@ import supervised_nmf
 from supervised_nmf import NMFClassifier
 from supervised_nmf.datasets import make_original_simulation
 from supervised_nmf.study import calibration_knn_grid
+from supervised_nmf.search import calibration_rank_search
+from supervised_nmf.validation import build_cv_folds
+from supervised_nmf.evaluation import format_evaluation_summary
 
 assert ".whl" in supervised_nmf.__file__, supervised_nmf.__file__
 assert supervised_nmf.__author__ == "Chang Cheng"
+assert supervised_nmf.__version__ == version
 assert callable(calibration_knn_grid)
+assert callable(calibration_rank_search)
+assert callable(build_cv_folds)
+assert callable(format_evaluation_summary)
 defaults = NMFClassifier().get_params()
 assert defaults["solver"] == "spa", defaults
 assert defaults["screening"] == "absolute", defaults
@@ -90,7 +100,7 @@ assert logistic_labels.shape == (5,) and logistic_probabilities.shape == (5, 2)
 np.testing.assert_allclose(logistic_probabilities.sum(axis=1), 1)
 np.testing.assert_array_equal(logistic_labels, logistic.predict(data.data[:5]))
 
-with tarfile.open(root / "dist" / "supervised_nmf-0.1.0a1.tar.gz") as archive:
+with tarfile.open(root / "dist" / f"supervised_nmf-{version}.tar.gz") as archive:
     members = archive.getnames()
     assert not any(set(Path(n).parts) & {"tmp", "data", "runs"} or "ensemble-reference" in n for n in members)
     assert not any(n.endswith(withdrawn_workflow) for n in members)
@@ -110,6 +120,11 @@ with tarfile.open(root / "dist" / "supervised_nmf-0.1.0a1.tar.gz") as archive:
                    "tests/test_default_study.py", "tests/test_default_shortlist.py",
                    "tests/test_select_celeba_default.py", "tests/test_frozen_evaluation.py",
                    "tests/test_core.py", "tests/test_logistic.py", "examples/compare_classifiers.py",
-                   "requirements/robust.txt", "docs/compatibility.md", "CITATION.cff"):
+                   "requirements/robust.txt", "docs/compatibility.md", "CITATION.cff",
+                   "src/supervised_nmf/search.py", "src/supervised_nmf/validation.py",
+                   "tests/test_rank_search.py", "tests/test_group_validation.py",
+                   "tests/test_study_improvements.py", "tests/test_phase_reporting.py",
+                   "tests/test_spa_blas.py", "examples/grouped_tuning.py",
+                   "docs/tuning-improvements.md", "portable_speedtest/benchmark.py"):
         assert any(n.endswith(suffix) for n in members), suffix
 print("Wheel import, author metadata, SPA/CD/MU fit/predict, KNN/logistic classifiers, installed defaults, explicit override, and source archive contents verified.")

@@ -63,8 +63,10 @@ The first priority is whether factorization improves on screening alone and
 whether screened NMF improves on screened PCA (Wang's R7). Compare the two NMF
 estimators, CD and feature-anchor SPA, and the two screening rules, percentile
 and absolute pooled-t cutoff. Include screening-only KNN, raw-feature KNN,
-independently tuned unscreened NMF, and majority prediction. KNN is the classifier
-throughout; linear classifiers are outside the package scope.
+independently tuned unscreened NMF, and majority prediction. These completed
+comparisons used KNN throughout. Optional logistic regression is now available
+for a separate comparison across the same representation paths; its matched
+development results and theoretical assessment remain pending.
 
 Each method receives its own explicit parameter grid and is tuned separately
 for Smiling and Wearing_Necktie. Within each attribute, shared samples, folds
@@ -241,6 +243,26 @@ fingerprints. Creating a cache also requires `--dir`, `--attributes` and
 same settings. The four-to-eight-worker continuation above was a separately
 recorded execution transition, rather than an in-place configuration change.
 Keep output paths short enough for the host's filesystem limits.
+
+The specialized `celeba_parameter_study.py` runner remains KNN-only. For an
+optional logistic development comparison, use the general example with local
+data paths:
+
+```powershell
+conda run --no-capture-output -n py12_df_aocl python examples/celeba_classification.py `
+  --dir D:/datasets/img_align_celeba `
+  --attributes D:/datasets/list_attr_celeba.txt `
+  --partitions D:/datasets/list_eval_partition.txt `
+  --attribute Smiling --classifier logistic --quick --output runs
+```
+
+Replace these paths with the local files. `--quick` verifies execution only;
+it does not tune sufficiently or revise the historical default decision.
+For a substantive comparison, independently tune `logistic_C` for NMF and
+`logistic__C` for the sklearn baseline pipelines, alongside the applicable
+representation parameters. Standardization is fitted within training folds.
+Record logistic iteration limits, tolerances and class weights separately from
+factorization settings, and compare against KNN on matching data and folds.
 
 After the main study has completed, replace `RUN_DIRECTORY` below with its
 printed run directory. Review training-only evidence before inspecting validation

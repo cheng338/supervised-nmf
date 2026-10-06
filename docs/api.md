@@ -11,8 +11,13 @@ classifier = NMFClassifier(
     screening="absolute",        # default; also "percentile" or "none"
     score_threshold=2.0,         # absolute pooled-t units, inclusive comparison
     percentile=10.0,             # used only by percentile screening
+    classifier="knn",            # also "logistic"
     n_neighbors=5,
     weights="uniform",           # sklearn KNN weighting choice
+    logistic_C=1.0,              # inverse L2 regularization strength
+    logistic_max_iter=1000,
+    logistic_tol=1e-4,
+    logistic_class_weight=None,  # also "balanced" or a class-weight dictionary
     max_iter=20000,
     tol=1e-4,
     random_state=42,
@@ -27,7 +32,7 @@ probabilities = classifier.predict_proba(X_new)
 The default is SPA with absolute-score screening. Available solvers are
 `"spa"`, `"mu"`, and `"cd"`; CD reproduces the original solver choice. The
 [four-method development comparison](nmf-solver-comparison.md) supplies empirical
-context, not a universal solver ranking. Rank, cutoff and neighbor count remain
+context, not a universal solver ranking. Rank, cutoff and classifier parameters remain
 tunable. `max_iter=20000` preserves that study's numerical allowance: it caps
 CD/MU iterations or each SPA NNLS solve, depending on
 the solver. Converged routines stop earlier. The tolerance remains `1e-4` for
@@ -40,7 +45,26 @@ Both MU and CD use scikit-learn NMF with NNDSVDa initialization, unregularized
 Frobenius loss, and the existing `max_iter`, `tol`, and `random_state` parameters.
 NNDSVDa fills initialization zeros with the data mean, avoiding the zero-locking
 initialization of plain NNDSVD under MU. Features and factors retain their
-original scales. The fitted screening mask and basis are reused for prediction.
+original scales during factorization. The fitted screening mask and basis are
+reused for prediction.
+
+`classifier="knn"` preserves Euclidean KNN on unscaled NMF coordinates.
+`classifier="logistic"` uses a pipeline containing `StandardScaler` and
+L2-regularized scikit-learn `LogisticRegression` with the `lbfgs` solver.
+Means and scales are learned only from the training coordinates. The same
+scaler is reused for prediction; `transform` and reconstruction diagnostics
+still use the unscaled NMF coordinates. `logistic_C` must be finite and positive;
+larger values mean weaker regularization. `logistic_class_weight="balanced"`
+uses training class frequencies, without resampling or changing screening.
+A dictionary maps class labels to finite nonnegative weights, for example
+`{0: 1.0, 1: 2.0}`. The default `None` leaves observations equally weighted.
+Class weighting applies to the logistic loss; the coordinate scaler remains
+unweighted.
+
+The logistic iteration limit and tolerance are separate from the NMF
+`max_iter` and `tol`. Tune `logistic_C` for predictive performance, and set the
+numerical controls to obtain qualified fits. KNN's `n_neighbors` and `weights`
+do not tune logistic regression.
 
 Inputs are dense finite nonnegative matrices. Binary labels can be strings or
 numbers; `classes_[1]` is the positive class in evaluation reports. Each training
@@ -51,9 +75,17 @@ classification are not supported.
 `selected_features_` maps back to the original columns. `selected_components_`
 is the learned basis in retained-feature coordinates; `components_` pads that
 basis with zeros in discarded columns. `training_coordinates_` contains the
-coordinates used to train KNN. `get_support()` returns the original feature mask.
+unscaled coordinates supplied to the final classifier. `get_support()` returns
+the original feature mask. `classifier_` is the fitted KNN estimator or the
+pipeline with steps named `scale` and `logistic`.
 `fit_times_`, `n_iter_`, `converged_`, and `convergence_warnings_` expose fit
-diagnostics. `last_transform_converged_` and `last_transform_warnings_` concern
+diagnostics. `n_iter_` remains the factorization iteration count.
+`classifier_n_iter_`, `classifier_converged_`, and
+`classifier_convergence_warnings_` report the final classifier separately;
+`classifier_n_iter_` is `None` for KNN. The overall convergence flag and warning
+list include both stages. Classifier
+fit timing includes scaler fitting when logistic regression is selected.
+`last_transform_converged_` and `last_transform_warnings_` concern
 the most recent transform. Convergence here means the numerical routine did not
 report nonconvergence; it is not a certificate of global optimality or consistency.
 
@@ -104,6 +136,12 @@ retains each attempt, parameters, warnings, folds, selected dimensions, and
 timings. If every candidate fails, a clearly labeled training-majority fallback
 is returned. It must not be reported as the requested method's successful fit.
 
+For logistic regression, pass `NMFClassifier(classifier="logistic")` and replace
+`n_neighbors` with `logistic_C`, for example `[0.01, 0.1, 1.0, 10.0, 100.0]`.
+Each fold fits its own screening, NMF, scaler and classifier. A logistic
+convergence warning disqualifies a candidate just as a factorization warning
+does; raising the logistic cap requires a recorded numerical configuration.
+
 Checkpoints can resume only when data, parameters, versions, folds and package
 source hashes match. Changing code or settings requires a new run. The source
 examples create unique run directories and expose `--resume` for compatible runs.
@@ -121,13 +159,21 @@ by model name, and record the reason for each expansion.
 Refinement diagnostics flag boundaries and interior intervals; they do not
 automatically certify that tuning is complete. Neither command freezes defaults.
 
-Set rank, the applicable screening parameter, and neighbor count in each method's
+Set rank, the applicable screening parameter, and classifier parameter in each method's
 explicit grid. Tune unscreened NMF independently, and use the same saved folds
 for paired method comparisons. `comparison_models()` includes independently
 tuned `screened_mu_absolute` and `screened_mu_percentile` alongside the existing
 CD, SPA, PCA and screening-only comparisons. The raw KNN, majority-class and
 historical unscreened-CD baselines remain available. CD, SPA and MU, and
 percentile and absolute screening, remain separate alternatives.
+`comparison_models(classifier="logistic")` substitutes scaled logistic
+regression for KNN in each representation path, including raw features, and
+tunes its inverse regularization strength independently. The ordinary C grid
+is `[0.01, 0.1, 1.0, 10.0, 100.0]`; the quick grid is `[1.0]` and is only a
+smoke check. Logistic model names have a `_logistic` suffix; the raw-feature
+model is `raw_logistic`. NMF estimators use the grid key `logistic_C`, while
+the standard sklearn baseline pipelines use `logistic__C`.
+`comparison_models()` retains the original KNN choices.
 Set `max_iter` and `tol` to numerically qualify
 the intended method; do not select them to exploit unconverged fits.
 
@@ -164,6 +210,8 @@ candidate. Computational accounting counts the shared fit once. Representation
 random states must be fixed integers. Supported estimators are `NMFClassifier`,
 raw `KNeighborsClassifier`, and standard sklearn pipelines ending in KNN;
 other KNN settings stay fixed within this grid.
+An `NMFClassifier` using logistic regression is not supported by this helper;
+use `calibration_search` instead.
 
 Checksummed fold records can be reused only with matching data, folds, grid,
 estimator, source and runtime identity. A report describes the declared grid and

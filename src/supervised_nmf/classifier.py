@@ -1,4 +1,4 @@
-"""Screening -> NMF -> KNN, based on Chang Cheng's original scripts."""
+"""Screening and NMF classification, based on Chang Cheng's original scripts."""
 
 from numbers import Integral, Real
 import time
@@ -8,7 +8,10 @@ import numpy as np
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.decomposition import NMF
 from sklearn.exceptions import ConvergenceWarning
+from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_is_fitted
 
 from .decomposition import FeatureSPA
@@ -46,11 +49,22 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
     absolute screening among comparably accurate methods. Choose ``solver='cd'``
     or ``solver='mu'``, or screening ``'percentile'``/``'none'``, explicitly to use
     another method.
-    Rank, screening level and neighbor count still require data-specific tuning.
+    Rank, screening level and final classifier parameters still require
+    data-specific tuning.
     Coordinate descent uses sklearn NMF with NNDSVDa initialization and Frobenius
     loss, matching the original scripts. Multiplicative updates use the same
     initialization and loss with sklearn's MU solver. Raw nonnegative feature
     values and Euclidean KNN coordinates are not automatically scaled.
+
+    ``classifier='knn'`` retains the original final classifier. The optional
+    ``classifier='logistic'`` extension standardizes the NMF coordinates using
+    training means and standard deviations, then fits L2-regularized logistic
+    regression with sklearn's LBFGS solver. ``logistic_C`` is the inverse
+    regularization strength; ``logistic_class_weight`` accepts ``None``,
+    ``'balanced'``, or a dictionary of class weights. These parameters affect
+    only logistic regression. ``n_neighbors`` and ``weights`` affect only KNN.
+    The scaler and final estimator are stored in ``classifier_`` as a pipeline
+    with steps ``'scale'`` and ``'logistic'`` when logistic regression is used.
 
     ``training_coordinates='fit_transform'`` reproduces the scripts' convention;
     ``'transform'`` instead reprojects training data against the fitted basis
@@ -64,11 +78,19 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
     numerical accuracy. SPA's NNLS routine does not use ``tol``. Increasing the
     cap can change a previously truncated fit without changing its objective
     or stopping tolerance.
+
+    ``n_iter_`` records factorization iterations. ``classifier_n_iter_`` records
+    logistic regression iterations, or is ``None`` for KNN. ``converged_`` and
+    ``convergence_warnings_`` include factorization, training projection, and
+    classifier fitting; classifier-specific diagnostics are also available as
+    ``classifier_converged_`` and ``classifier_convergence_warnings_``.
     """
 
     def __init__(self, n_components=2, *, solver="spa", screening="absolute", percentile=10.0,
                  score_threshold=2.0, n_neighbors=5, weights="uniform", max_iter=20000,
-                 tol=1e-4, random_state=None, training_coordinates="fit_transform"):
+                 tol=1e-4, random_state=None, training_coordinates="fit_transform",
+                 classifier="knn", logistic_C=1.0, logistic_max_iter=1000,
+                 logistic_tol=1e-4, logistic_class_weight=None):
         self.n_components = n_components
         self.solver = solver
         self.screening = screening
@@ -80,6 +102,11 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
         self.tol = tol
         self.random_state = random_state
         self.training_coordinates = training_coordinates
+        self.classifier = classifier
+        self.logistic_C = logistic_C
+        self.logistic_max_iter = logistic_max_iter
+        self.logistic_tol = logistic_tol
+        self.logistic_class_weight = logistic_class_weight
 
     def fit(self, X, y):
         _clear_fitted_attributes(self)
@@ -90,8 +117,26 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
             raise ValueError("screening must be 'percentile', 'absolute', or 'none'.")
         if self.training_coordinates not in {"fit_transform", "transform"}:
             raise ValueError("training_coordinates must be 'fit_transform' or 'transform'.")
+        if not isinstance(self.classifier, str) or self.classifier not in {"knn", "logistic"}:
+            raise ValueError("classifier must be 'knn' or 'logistic'.")
+        if self.classifier == "logistic":
+            for name in ("logistic_C", "logistic_tol"):
+                value = getattr(self, name)
+                if isinstance(value, bool) or not isinstance(value, Real) or not np.isfinite(value) or value <= 0:
+                    raise ValueError(f"{name} must be finite and positive.")
+            if (isinstance(self.logistic_max_iter, bool)
+                    or not isinstance(self.logistic_max_iter, Integral)
+                    or self.logistic_max_iter < 1):
+                raise ValueError("logistic_max_iter must be a positive integer.")
+            if isinstance(self.logistic_class_weight, dict):
+                for value in self.logistic_class_weight.values():
+                    if isinstance(value, bool) or not isinstance(value, Real) or not np.isfinite(value) or value < 0:
+                        raise ValueError("logistic_class_weight values must be finite and nonnegative.")
+            elif self.logistic_class_weight is not None and not (
+                    isinstance(self.logistic_class_weight, str) and self.logistic_class_weight == "balanced"):
+                raise ValueError("logistic_class_weight must be None, 'balanced', or a dictionary.")
         X, y, classes, counts = _binary_data(X, y)
-        if isinstance(self.n_neighbors, bool) or not isinstance(self.n_neighbors, Integral) or not 1 <= self.n_neighbors <= X.shape[0]:
+        if self.classifier == "knn" and (isinstance(self.n_neighbors, bool) or not isinstance(self.n_neighbors, Integral) or not 1 <= self.n_neighbors <= X.shape[0]):
             raise ValueError("n_neighbors must be a positive integer no larger than the training sample count.")
         if isinstance(self.max_iter, bool) or not isinstance(self.max_iter, Integral) or self.max_iter < 1:
             raise ValueError("max_iter must be a positive integer.")
@@ -126,8 +171,21 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
             W, projection_warnings = _record_warnings(lambda: decomposition.transform(X_selected))
         training_projection_seconds = time.perf_counter() - stage
         stage = time.perf_counter()
-        knn = KNeighborsClassifier(n_neighbors=self.n_neighbors, weights=self.weights)
-        knn.fit(W, y)
+        if self.classifier == "knn":
+            classifier = KNeighborsClassifier(n_neighbors=self.n_neighbors, weights=self.weights)
+            classifier.fit(W, y)
+            classifier_warnings = ()
+            classifier_n_iter = None
+        else:
+            classifier = Pipeline([
+                ("scale", StandardScaler()),
+                ("logistic", LogisticRegression(
+                    C=self.logistic_C, solver="lbfgs", max_iter=self.logistic_max_iter,
+                    tol=self.logistic_tol, class_weight=self.logistic_class_weight,
+                    random_state=self.random_state)),
+            ])
+            _, classifier_warnings = _record_warnings(lambda: classifier.fit(W, y))
+            classifier_n_iter = classifier.named_steps["logistic"].n_iter_.copy()
         classifier_seconds = time.perf_counter() - stage
         components = np.zeros((self.n_components, X.shape[1]), dtype=np.float64)
         components[:, selected_features] = decomposition.components_
@@ -137,7 +195,7 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
         self.class_counts_ = counts
         self.selector_ = selector
         self.decomposition_ = decomposition
-        self.classifier_ = knn
+        self.classifier_ = classifier
         self.selected_features_ = selected_features
         self.n_features_selected_ = selected_features.size
         self.selected_components_ = decomposition.components_.copy()
@@ -148,7 +206,10 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
         self.reconstruction_err_ = (float(np.linalg.norm(X_selected - W @ decomposition.components_))
                                     if self.training_coordinates == "transform"
                                     else decomposition.reconstruction_err_)
-        self.convergence_warnings_ = fitting_warnings + projection_warnings
+        self.classifier_convergence_warnings_ = classifier_warnings
+        self.classifier_converged_ = not classifier_warnings
+        self.classifier_n_iter_ = classifier_n_iter
+        self.convergence_warnings_ = fitting_warnings + projection_warnings + classifier_warnings
         self.converged_ = not self.convergence_warnings_
         self.training_coordinates_ = W.copy()
         self.fit_times_ = {"screening": screen_seconds, "factorization": factorization_seconds,
@@ -181,12 +242,18 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
         """Return labels and class probabilities with one fixed-basis projection.
 
         KNN ties use the first class in ``classes_``, as in sklearn's predict.
-        This avoids repeating expensive projection and neighbor searches when
+        Logistic labels use sklearn's decision rule, including when a small
+        nonzero decision rounds to a probability of one half. This avoids
+        repeating expensive projection, and KNN neighbor searches, when
         benchmark metrics require both predicted labels and probabilities.
         """
         check_is_fitted(self, "classifier_")
-        probabilities = self.classifier_.predict_proba(self.transform(X))
-        labels = self.classes_[probabilities.argmax(axis=1)]
+        coordinates = self.transform(X)
+        probabilities = self.classifier_.predict_proba(coordinates)
+        if isinstance(self.classifier_, KNeighborsClassifier):
+            labels = self.classes_[probabilities.argmax(axis=1)]
+        else:
+            labels = self.classifier_.predict(coordinates)
         return labels, probabilities
 
     def get_support(self, indices=False):

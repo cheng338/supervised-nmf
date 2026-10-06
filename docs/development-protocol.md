@@ -17,7 +17,8 @@ Author: Chang Cheng.
    selects SPA and remains `selected_for_audit`. SPA remains installed; absolute
    screening is fixed in that comparison. Both original CelebA decisions are preserved.
 4. Include screened PCA and screening without factorization as classification
-   comparisons. Use KNN. Linear classifiers are outside the package scope.
+   comparisons, together with raw-feature baselines. KNN remains the default;
+   optional logistic regression is evaluated independently for the NMF study.
 5. Complete tuning and numerical confirmation: expand boundary winners and refine
    interior intervals. An exhausted time/search budget is not completion.
 6. Fit all learned transformations inside training folds. Use five-fold calibration;
@@ -29,7 +30,7 @@ Author: Chang Cheng.
    attribute annotations, and official partition metadata were available on October 3, 2026.
    Preserve the published partitions in the training/validation examples.
 9. The additional adaptive workflow was withdrawn. Use the package's
-   own explicit grids for NMF/PCA rank, screening and KNN neighbors. Record grid
+   own explicit grids for NMF/PCA rank, screening and the final classifier. Record grid
    choices, boundary checks, and any expansions or refinements as study decisions.
    No external search policy is required.
 10. Freeze external development protocols before evaluation. Official-test
@@ -41,6 +42,12 @@ Author: Chang Cheng.
     MU retains the experimental comparison's unregularized Frobenius objective
     and NNDSVDa initialization. ANLS-BPP remains experimental. Record this API
     extension separately from the completed, frozen benchmark evidence.
+12. Logistic regression is an explicit extension of the dissertation's KNN
+    classification stage. Fit its coordinate scaler within training folds;
+    tune inverse L2 regularization strength independently for each representation.
+    Preserve the historical KNN comparisons and solver/screening decision.
+    Matched logistic comparisons and their theoretical assessment remain separate
+    work before reconsidering the final classifier default.
 
 ## Stages and what constitutes evidence
 
@@ -82,7 +89,8 @@ Numerical convergence and empirical success do not prove the theory's assumption
 ## Parameters and numerical qualification
 
 The main predictive parameters are rank, retained percentile or absolute pooled-t
-cutoff, and KNN neighbor count. Rank applies to NMF/PCA; the screening parameters
+cutoff, and KNN neighbor count or logistic inverse regularization strength.
+Rank applies to NMF/PCA; the screening parameters
 apply to their corresponding rule. Tune each method independently on the same
 five training folds. The external follow-up compares CD, SPA, MU and ANLS-BPP with
 absolute screening fixed; only its cutoff is tuned. Percentile comparisons remain available
@@ -94,6 +102,15 @@ these settings on training data before comparing predictive candidates. Reject
 candidates with failed or nonconverged required folds and retain the diagnostics.
 Any numerical change requires a recorded new configuration; a successful rank-2
 smoke fit does not qualify larger ranks or samples.
+
+Logistic regression has its own iteration cap and tolerance. Qualify both
+factorization and classifier convergence; a converged factorization does not
+excuse an unconverged logistic fit. The starting C grid is
+`[0.01, 0.1, 1.0, 10.0, 100.0]`. Apply the same boundary and refinement checks
+as for representation parameters, using training folds only. Use matched
+partitions and metrics for KNN/logistic comparisons on NMF, PCA, screening-only
+and raw-feature paths. Record class weighting as part of the configuration;
+balanced accuracy does not require fitting with balanced class weights.
 
 Screened PCA is a priority comparison for Wang's R7. Smiling and Wearing_Necktie
 require separate tuning and reports. For the latter, report positive counts and

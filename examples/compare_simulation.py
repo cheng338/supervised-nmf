@@ -6,6 +6,8 @@ tuning or determines package defaults. Use --grid-json to supply expanded grids,
 --seeds for replications, and --scenario/--correlation/--signal-strength for harder
 designs. --resume RUN_DIRECTORY preserves compatible completed model results.
 All metrics here use a held-out development subset; there is no final-test claim.
+Use --classifier logistic to compare the same representations with logistic
+regression; the default final classifier remains KNN.
 """
 
 from __future__ import annotations
@@ -44,6 +46,10 @@ def parse_args():
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--max-iter", type=int, default=20000)
     parser.add_argument("--tol", type=float, default=1e-4)
+    parser.add_argument("--classifier", choices=("knn", "logistic"), default="knn")
+    parser.add_argument("--logistic-max-iter", type=int, default=1000)
+    parser.add_argument("--logistic-tol", type=float, default=1e-4)
+    parser.add_argument("--logistic-class-weight", choices=("none", "balanced"), default="none")
     return parser.parse_args()
 
 
@@ -51,6 +57,7 @@ def main():
     args = parse_args()
     if len(set(args.seeds)) != len(args.seeds):
         raise ValueError("Replication seeds must be distinct.")
+    logistic_class_weight = None if args.logistic_class_weight == "none" else "balanced"
     config = {"quick": args.quick, "seeds": args.seeds,
               "n_samples": args.n_samples if args.n_samples is not None else (120 if args.quick else 400),
               "n_features": args.n_features if args.n_features is not None else (40 if args.quick else 120),
@@ -59,6 +66,8 @@ def main():
               "correlation_scope": args.correlation_scope,
               "scenario": args.scenario, "threads": args.threads,
               "max_iter": args.max_iter, "tol": args.tol,
+              "classifier": args.classifier, "logistic_max_iter": args.logistic_max_iter,
+              "logistic_tol": args.logistic_tol, "logistic_class_weight": logistic_class_weight,
               "cv": 5, "development_validation_fraction": 0.25,
               "grid_override": json.loads(args.grid_json.read_text(encoding="utf-8")) if args.grid_json else {}}
     if args.resume:
@@ -84,7 +93,9 @@ def main():
                                             "metadata": data.metadata,
                                             "training_indices": training, "validation_indices": validation,
                                             "role": "development_only_not_final_test"})
-        models = comparison_models(random_state=seed, quick=args.quick, max_iter=args.max_iter, tol=args.tol)
+        models = comparison_models(random_state=seed, quick=args.quick, max_iter=args.max_iter, tol=args.tol,
+                                   classifier=args.classifier, logistic_max_iter=args.logistic_max_iter,
+                                   logistic_tol=args.logistic_tol, logistic_class_weight=logistic_class_weight)
         unknown = set(config["grid_override"]) - set(models)
         if unknown:
             raise ValueError(f"Unknown grid model names: {sorted(unknown)}")

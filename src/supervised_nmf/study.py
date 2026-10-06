@@ -79,14 +79,17 @@ def _checkpoint_lock(directory):
 
 def _layout(estimator):
     if type(estimator) is NMFClassifier:
-        return "nmf", "n_neighbors", {"weights"}
+        if estimator.classifier != "knn":
+            raise TypeError("calibration_knn_grid requires classifier='knn'; use calibration_search for logistic regression.")
+        return "nmf", "n_neighbors", {"weights", "classifier", "logistic_C", "logistic_max_iter",
+                                       "logistic_tol", "logistic_class_weight"}
     if type(estimator) is KNeighborsClassifier:
         return "raw", "n_neighbors", set(estimator.get_params()) - {"n_neighbors"}
     if type(estimator) is Pipeline and type(estimator.steps[-1][1]) is KNeighborsClassifier:
         name, classifier = estimator.steps[-1]
         forbidden = {name, "steps"} | {f"{name}__{key}" for key in classifier.get_params() if key != "n_neighbors"}
         return "pipeline", f"{name}__n_neighbors", forbidden
-    raise TypeError("Use NMFClassifier, a standard Pipeline ending in KNeighborsClassifier, or raw KNeighborsClassifier.")
+    raise TypeError("Use NMFClassifier with classifier='knn', a standard Pipeline ending in KNeighborsClassifier, or raw KNeighborsClassifier.")
 
 
 def _runtime_identity(estimator, threads):
@@ -221,6 +224,7 @@ def calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=1
     including them in the grid is rejected. Representation random_state settings
     must be fixed integer seeds. Only standard supported estimator types are
     accepted because representation independence from k is essential.
+    Logistic regression uses the general-purpose ``calibration_search`` instead.
 
     Completed representation/fold receipts, including numerical failures, are
     reused only for the identical data, folds, grid, parameters, code and runtime.

@@ -125,6 +125,16 @@ the factorization solver does not make that corollary apply. The general pipelin
 decomposition still applies conditionally, with classifier estimation error left
 explicit.
 
+The optional logistic classifier is a separate extension of the classification
+stage. Theorem 7.4.3 can still express its excess risk with an explicit classifier
+error term; the KNN corollary does not transfer to logistic regression. A useful
+logistic bound must address approximation by a linear log-odds model in the
+learned coordinates, regularization and estimation error, and dependence from
+reusing observations across stages. Training-coordinate standardization is a
+fitted part of that classifier and must be included in the argument. A successful
+`lbfgs` stop establishes neither those statistical assumptions nor consistency.
+No additional logistic-regression theorem is supplied by this implementation.
+
 The four results concern ordinary 0–1/Bayes risk. The study's balanced accuracy,
 average precision and AUC are empirical metrics; those risk bounds are not proofs
 about these metrics. A balanced-risk extension must specify a class-reweighted
@@ -142,6 +152,11 @@ The reconstruction argument applies to the fitted representation without
 attributing SPA recovery guarantees to another solver. CD and SPA have both
 been compared, together with MU and ANLS-BPP. R7's screened-PCA and
 screening-only comparisons remain separate evidence about NMF's contribution.
+Optional raw-feature logistic regression supplies a parametric baseline for R7,
+and logistic regression on NMF coordinates permits the comparison requested in
+R14. Implementation alone does not settle these comments: matched predictive
+and timing results, and a separate theoretical assessment of the classifier
+error term, are still needed.
 
 Absolute screening is therefore preferred for methodological/theoretical alignment
 when accuracy is close. All four solvers remain eligible under the common proof

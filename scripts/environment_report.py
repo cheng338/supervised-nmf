@@ -16,6 +16,6 @@ print(json.dumps({
     "platform": platform.platform(),
     "cpu_count": os.cpu_count(),
     "versions": {name: importlib.metadata.version(name) for name in
-                 ["numpy", "scipy", "scikit-learn", "threadpoolctl"]},
+                 ["numpy", "scipy", "scikit-learn", "joblib", "threadpoolctl"]},
     "thread_pools": threadpool_info(),
 }, indent=2))

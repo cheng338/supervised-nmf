@@ -20,6 +20,7 @@ generator preserves the original random draw order with a local RandomState.
 | Reusable sklearn-style estimators | Extract the script pipeline without coupling training to plotting, console output, or dataset paths. |
 | SPA with absolute-score screening as the default | The revised CelebA selection policy prioritizes absolute screening among accuracy-qualified methods, then measured cost. The completed [four-solver comparison](nmf-solver-comparison.md#development-results) also selects SPA under its declared rule; its status remains `selected_for_audit`. The original time-first decision and revised policy are recorded in the [results](celeba-default-results.md). CD and historical percentile screening remain available. |
 | MU solver alongside SPA and CD | `NMFClassifier(solver="mu")` uses the same unregularized Frobenius objective and NNDSVDa initialization as the MU comparison. Screening, KNN, and the SPA default are unchanged. ANLS-BPP remains experimental. Adding MU to the API does not provide additional benchmark evidence or establish theoretical superiority. |
+| Optional logistic final classifier | `classifier="logistic"` replaces KNN with training-coordinate standardization and L2-regularized logistic regression. This is an explicit extension of the original classification stage. KNN remains the default; the factorization and screening definitions are unchanged. Matched logistic versions of NMF, PCA, screening-only and raw-feature comparisons support assessment of Wang's R7/R14 concerns. Their inclusion does not establish comparative performance. |
 | Numerical cap increased to 20,000, tolerance unchanged at 1e-4 | Six formerly limited CD folds converged above 10,000 iterations. The classifier and comparison convenience defaults now match the qualified study allowance. This changes permitted work, not equations or stopping tolerance; previously truncated outputs need not be identical. |
 | Absolute pooled-t cutoff alongside percentile selection | Supports threshold-based screening with an inclusive boundary. Historical percentile screening remains a separate option. |
 | Stable float64 screening statistics | Per-feature rescaling prevents overflow/underflow without changing the pooled-t statistic mathematically. The returned feature values and float32 CD input retain their original scale and dtype. Finite-precision differences from f_classif remain possible. |
@@ -32,7 +33,7 @@ generator preserves the original random draw order with a local RandomState.
 | Official CelebA partition loader | Replaces selecting the first sorted files then randomly splitting. This is a new evaluation protocol, not historical reproduction. Grayscale resizing and intensity scale are retained. |
 | Optional fixed-basis training-coordinate recomputation | A diagnostic alternative to the original returned training coefficients. It is explicit and cannot be relabeled as a confirmed correction before controlled diagnosis. |
 | Controlled simulation extensions | Independent within-block noise factors vary signal/background correlations; an explicit all-features mode tests cross-block correlation. The exact original generator remains separate. XOR is an additional marginal-screening failure case. |
-| Explicit per-method parameter grids | Tune NMF/PCA rank, the applicable screening parameter, and KNN neighbors on the same training folds. Record grid revisions and numerical qualification before final evaluation. |
+| Explicit per-method parameter grids | Tune NMF/PCA rank, the applicable screening parameter, and either KNN neighbors or logistic inverse regularization strength on the same training folds. Record grid revisions and numerical qualification before final evaluation. |
 
 ## SPA procedure and scope
 
@@ -70,6 +71,30 @@ MU uses a different convergence criterion from CD. Objective decrease and a
 successful numerical fit do not establish global factor recovery or statistical
 consistency. The reconstruction-based classification argument remains conditional
 on its stated assumptions for MU, SPA, and CD alike.
+
+## Logistic classification extension
+
+`classifier="logistic"` fits a `StandardScaler` followed by scikit-learn
+logistic regression with L2 regularization and the `lbfgs` solver. Scaling is
+learned from the classifier's training coordinates within each training fold,
+then reused without refitting for new observations. It does not change the
+NMF objective, basis, coefficient map or reconstruction diagnostic.
+The default KNN path retains its original unscaled coordinates.
+
+`logistic_C` controls inverse regularization strength. The separate
+`logistic_max_iter` and `logistic_tol` settings control classifier convergence;
+they do not alter the factorization controls. Optional balanced class weights
+are computed from training labels only. Comparisons should record whether
+weights were used and tune each representation/classifier combination on the
+same folds. Raw-feature and PCA logistic baselines use the same final scaling
+and classifier convention.
+
+Classifier convergence warnings are retained separately and included in the
+complete fit's convergence assessment. Classifier fit time includes scaling;
+tuning and prediction time remain separate. The completed solver-selection
+studies used KNN. Logistic-regression implementation checks do not replace
+matched development comparisons, final evaluation, or a classifier-specific
+theoretical analysis.
 
 ## Limits of claims
 

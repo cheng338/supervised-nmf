@@ -4,4 +4,5 @@ recursive-include examples *.py *.json
 recursive-include provenance *.json *.py *.md
 recursive-include tests *.py
 recursive-include scripts *.py
+recursive-include requirements *.txt
 

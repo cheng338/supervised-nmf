@@ -25,6 +25,7 @@ import numpy as np
 from sklearn.base import clone
 from sklearn.dummy import DummyClassifier
 from sklearn.exceptions import ConvergenceWarning
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score, average_precision_score, balanced_accuracy_score,
     confusion_matrix, precision_recall_fscore_support, roc_auc_score,
@@ -34,6 +35,27 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.utils.validation import check_X_y
 from threadpoolctl import threadpool_info, threadpool_limits
+
+from .classifier import _record_warnings
+from .screening import _clear_fitted_attributes
+
+
+class _TrackedLogisticRegression(LogisticRegression):
+    """Retain fit convergence evidence for later standalone evaluation."""
+
+    def fit(self, X, y, sample_weight=None):
+        for attribute in ("convergence_warnings_", "converged_"):
+            if hasattr(self, attribute):
+                delattr(self, attribute)
+        fit = super().fit
+        try:
+            result, messages = _record_warnings(lambda: fit(X, y, sample_weight=sample_weight))
+        except BaseException:
+            _clear_fitted_attributes(self)
+            raise
+        self.convergence_warnings_ = messages
+        self.converged_ = not messages
+        return result
 
 
 def _jsonable(value):
@@ -138,6 +160,7 @@ def _warning_records(caught):
 def _diagnostics(estimator):
     result = {}
     for attribute in ("n_iter_", "converged_", "last_transform_converged_",
+                      "classifier_n_iter_", "classifier_converged_", "classifier_convergence_warnings_",
                       "fit_times_", "n_features_in_"):
         if hasattr(estimator, attribute):
             result[attribute.rstrip("_")] = _jsonable(getattr(estimator, attribute))
@@ -147,6 +170,14 @@ def _diagnostics(estimator):
         selector = getattr(estimator, "screening_", None)
     if hasattr(estimator, "named_steps"):
         selector = estimator.named_steps.get("screen", selector)
+    if isinstance(estimator, Pipeline) and estimator.steps:
+        final_classifier = estimator.steps[-1][1]
+        if hasattr(final_classifier, "n_iter_"):
+            result["classifier_n_iter"] = _jsonable(final_classifier.n_iter_)
+        if hasattr(final_classifier, "converged_"):
+            result["classifier_converged"] = bool(final_classifier.converged_)
+        if hasattr(final_classifier, "convergence_warnings_"):
+            result["classifier_convergence_warnings"] = _jsonable(final_classifier.convergence_warnings_)
     if selector is not None and hasattr(selector, "support_"):
         indices = np.flatnonzero(selector.get_support())
         result["n_selected_features"] = len(indices)
@@ -160,8 +191,11 @@ def _diagnostics(estimator):
 
 
 def _nonconverged(estimator, caught):
+    final_classifier = estimator.steps[-1][1] if isinstance(estimator, Pipeline) and estimator.steps else None
     return (any(issubclass(w.category, ConvergenceWarning) for w in caught)
             or not bool(getattr(estimator, "converged_", True))
+            or not bool(getattr(estimator, "classifier_converged_", True))
+            or not bool(getattr(final_classifier, "converged_", True))
             or not bool(getattr(estimator, "last_transform_converged_", True)))
 
 
@@ -421,6 +455,14 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None):
                 predicted = estimator.classes_[np.argmax(all_probabilities, axis=1)]
                 probability = all_probabilities[:, 1]
                 prediction_operation = "joint_label_and_probability_prediction_no_projection"
+            elif isinstance(estimator, Pipeline) and isinstance(estimator.steps[-1][1], LogisticRegression):
+                projected = estimator[:-1].transform(X) if len(estimator.steps) > 1 else X
+                logistic = estimator.steps[-1][1]
+                # Keep sklearn's decision-score tie rule. Probability rounding
+                # can produce a 0.5 tie for a small nonzero decision score.
+                predicted = logistic.predict(projected)
+                probability = logistic.predict_proba(projected)[:, 1]
+                prediction_operation = "joint_label_and_probability_prediction_one_projection"
             else:
                 predicted = estimator.predict(X)
                 probability = estimator.predict_proba(X)[:, 1] if hasattr(estimator, "predict_proba") else None
@@ -462,47 +504,78 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None):
                             "positive_class_probability": _jsonable(probability)}}
 
 
-def comparison_models(*, random_state=0, quick=False, max_iter=20000, tol=1e-4):
+def comparison_models(*, random_state=0, quick=False, max_iter=20000, tol=1e-4,
+                      classifier="knn", logistic_max_iter=1000,
+                      logistic_tol=1e-4, logistic_class_weight=None):
     """Create independent CD/SPA/MU, PCA, screening-only and original baseline grids.
 
     Grids are deliberately modest starting grids. Caller-supplied JSON can expand
     them, and diagnostics identify unfinished boundaries/interior refinement.
     Absolute screening uses |t|, not the F statistic used for percentile ranking.
+    ``classifier='knn'`` preserves the historical method names and grids.
+    ``classifier='logistic'`` uses standardized representations and L2 logistic
+    regression, with distinct names so both mappings can be combined. Scaling,
+    screening and decompositions are fitted independently within each CV fold.
     """
     from sklearn.decomposition import PCA
     from sklearn.neighbors import KNeighborsClassifier
     from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
     from .classifier import NMFClassifier
     from .screening import BinaryScreening
 
+    if classifier not in {"knn", "logistic"}:
+        raise ValueError("classifier must be 'knn' or 'logistic'.")
     ranks = [2] if quick else [2, 4]
     neighbors = [3] if quick else [3, 5, 7]
     percentages = [25.0] if quick else [10.0, 25.0]
     thresholds = [1.0] if quick else [1.0, 2.0]
+    regularization = [1.0] if quick else [0.01, 0.1, 1.0, 10.0, 100.0]
+    suffix = "" if classifier == "knn" else "_logistic"
+    nmf_options = {} if classifier == "knn" else {
+        "classifier": "logistic", "logistic_max_iter": logistic_max_iter,
+        "logistic_tol": logistic_tol, "logistic_class_weight": logistic_class_weight,
+    }
+    nmf_classifier_grid = ({"n_neighbors": neighbors} if classifier == "knn"
+                           else {"logistic_C": regularization})
+    pipeline_classifier_grid = ({"knn__n_neighbors": neighbors} if classifier == "knn"
+                                else {"logistic__C": regularization})
+
+    def classifier_steps():
+        if classifier == "knn":
+            return [("knn", KNeighborsClassifier(n_jobs=1))]
+        return [("scale", StandardScaler()),
+                ("logistic", _TrackedLogisticRegression(solver="lbfgs", max_iter=logistic_max_iter,
+                                                         tol=logistic_tol, class_weight=logistic_class_weight,
+                                                         random_state=random_state))]
+
     models = {}
     for screening in ("percentile", "absolute"):
         screen_parameter = "percentile" if screening == "percentile" else "score_threshold"
         screen_values = percentages if screening == "percentile" else thresholds
         for solver in ("cd", "spa", "mu"):
-            models[f"screened_{solver}_{screening}"] = (
+            models[f"screened_{solver}_{screening}{suffix}"] = (
                 NMFClassifier(solver=solver, screening=screening, random_state=random_state,
-                              max_iter=max_iter, tol=tol),
-                {screen_parameter: screen_values, "n_components": ranks, "n_neighbors": neighbors})
+                              max_iter=max_iter, tol=tol, **nmf_options),
+                {screen_parameter: screen_values, "n_components": ranks, **nmf_classifier_grid})
         screen = BinaryScreening(screening=screening)
-        models[f"screened_pca_{screening}"] = (
-            Pipeline([("screen", screen), ("pca", PCA(svd_solver="full", random_state=random_state)),
-                      ("knn", KNeighborsClassifier(n_jobs=1))]),
+        models[f"screened_pca_{screening}{suffix}"] = (
+            Pipeline([("screen", screen), ("pca", PCA(svd_solver="full", random_state=random_state))]
+                     + classifier_steps()),
             {f"screen__{screen_parameter}": screen_values, "pca__n_components": ranks,
-             "knn__n_neighbors": neighbors})
-        models[f"screening_only_{screening}"] = (
-            Pipeline([("screen", clone(screen)), ("knn", KNeighborsClassifier(n_jobs=1))]),
-            {f"screen__{screen_parameter}": screen_values, "knn__n_neighbors": neighbors})
-    models["raw_knn"] = (KNeighborsClassifier(n_jobs=1), {"n_neighbors": neighbors})
-    models["majority_class"] = (DummyClassifier(strategy="most_frequent"), {})
-    models["unscreened_cd_nmf"] = (
+             **pipeline_classifier_grid})
+        models[f"screening_only_{screening}{suffix}"] = (
+            Pipeline([("screen", clone(screen))] + classifier_steps()),
+            {f"screen__{screen_parameter}": screen_values, **pipeline_classifier_grid})
+    if classifier == "knn":
+        models["raw_knn"] = (KNeighborsClassifier(n_jobs=1), {"n_neighbors": neighbors})
+    else:
+        models["raw_logistic"] = (Pipeline(classifier_steps()), {"logistic__C": regularization})
+    models[f"majority_class{suffix}"] = (DummyClassifier(strategy="most_frequent"), {})
+    models[f"unscreened_cd_nmf{suffix}"] = (
         NMFClassifier(solver="cd", screening="none", random_state=random_state,
-                      max_iter=max_iter, tol=tol),
-        {"n_components": ranks, "n_neighbors": neighbors})
+                      max_iter=max_iter, tol=tol, **nmf_options),
+        {"n_components": ranks, **nmf_classifier_grid})
     return models
 
 

@@ -9,6 +9,34 @@ thread. These results do not establish compatibility with every allowed version.
 
 ## Current implementation checks
 
+- Version **0.1.0a1** adds optional logistic regression while retaining
+  SPA, absolute screening and KNN as defaults. The complete suite passed
+  **281 tests in 59.991 seconds** in `py12_df_aocl` and **281 tests in
+  57.313 seconds** under Windows 11 with Python 3.10.12, NumPy 2.2.6,
+  SciPy 1.15.3, scikit-learn 1.7.0, joblib 1.5.1 and threadpoolctl 3.6.0.
+  Pillow 12.3.0 enabled the image-loader fixtures in the latter environment.
+  These checks support the updated Python >=3.10 requirement. Ubuntu execution
+  remains untested; see [runtime compatibility](compatibility.md).
+- Logistic checks cover explicit sklearn reference equivalence for SPA/CD/MU,
+  both training-coordinate conventions, fold-local screening and scaling,
+  fixed-basis prediction, string labels, exact decision ties, cloning,
+  serialization, classifier switching, numerical warnings and rejection of
+  nonconverged candidates. Generated raw-feature logistic baselines retain fit
+  convergence evidence for later evaluation. The KNN representation-sharing
+  helper rejects logistic configurations and directs them to the general search.
+- The paired classifier example completed all **25 methods** on the exact
+  Python 3.10 profile with no fallbacks or nonconverged evaluations: 125 training
+  folds followed by final refits and development-validation predictions. It used
+  one candidate per method and one numerical thread. This is an implementation
+  check, not evidence for changing the classifier default or resolving the
+  requested CelebA comparisons. Logs and generated reports remain local.
+- The 0.1.0a1 wheel and source archive built successfully. Isolated wheel-import
+  checks passed in both environments. The wheel also installed with `--no-deps`
+  into the exact Python 3.10.12 profile, preserving all five numerical pins.
+  All six SPA/CD/MU by KNN/logistic combinations passed installed-package
+  fit/predict checks; `pip check` reported no broken requirements. Archive
+  checks verified the author metadata, Python requirement, original-source
+  hashes, compatibility pins, documentation links and exclusion of local data.
 - After the public MU addition, `python scripts/check.py` passed **269 tests in
   58.743 seconds**. The log is `tmp/mu-public-full-check.log`. The wheel and source
   archive built successfully. An isolated wheel check verified SPA, CD and MU

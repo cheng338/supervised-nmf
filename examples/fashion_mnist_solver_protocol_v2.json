@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "author": "Chang Cheng",
+  "protocol_id": "fashion-mnist-absolute-four-solvers-v2",
+  "created_utc": "2026-10-03T15:50:34.4666422Z",
+  "dataset": "data/fashion-mnist-training",
+  "cache": "data/fashion-mnist-training",
+  "dataset_manifest_sha256": "2fdbce64552c7c1a38915fb4ad95d55712325cf9d1010d10eb44836f66d7f8fb",
+  "document": "docs/fashion-mnist-protocol.md",
+  "screening": "absolute",
+  "methods": [
+    "screened_cd_absolute",
+    "screened_spa_absolute",
+    "screened_mu_absolute",
+    "screened_anls_bpp_absolute"
+  ],
+  "cv": 5,
+  "native_threads": 1,
+  "workers": 8,
+  "validation_size_per_pair": 2000,
+  "validation_seed": 104729,
+  "train_sizes": [
+    2000,
+    8000
+  ],
+  "seeds": [
+    43,
+    44,
+    45
+  ],
+  "pairs": [
+    {
+      "id": "tshirt-shirt",
+      "negative": 0,
+      "positive": 6
+    },
+    {
+      "id": "pullover-coat",
+      "negative": 2,
+      "positive": 4
+    },
+    {
+      "id": "sneaker-boot",
+      "negative": 7,
+      "positive": 9
+    }
+  ],
+  "grid": {
+    "n_components": [
+      2,
+      5,
+      10,
+      20,
+      40,
+      80
+    ],
+    "score_threshold": [
+      0,
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "n_neighbors": [
+      1,
+      3,
+      5,
+      9,
+      15,
+      25,
+      41
+    ]
+  },
+  "max_iter": 20000,
+  "tol": 0.0001,
+  "training_coordinates": "fit_transform",
+  "profile_repeats": 3,
+  "profile_order_seed": 42043,
+  "baseline_train_size": 8000,
+  "baseline_seed": 43,
+  "baseline_methods": [
+    "screened_pca_absolute",
+    "screening_only_absolute",
+    "raw_knn"
+  ],
+  "validation_policy": "automatic_after_cv",
+  "boundary_policy": "Report all training-CV boundary selections; do not change the grid after validation. Fixed-budget evidence does not establish tuning optimality.",
+  "official_test_policy": "Do not download or evaluate official test data in this development runner.",
+  "cross_dataset_decision": {
+    "role": "Prospective external-data four-solver comparison plus a matched retuned CelebA block; historical CelebA outcomes already known.",
+    "celeba_original_decision": "runs/default-selection/decision/decision.json",
+    "celeba_original_decision_sha256": "4dc78d3328b299b7dcf1730f0f262065bcad3578166113aecf6bde60daa35107",
+    "celeba_preference_amendment": "runs/default-selection/decision-spca-preference/decision.json",
+    "celeba_preference_amendment_sha256": "31bd48300b1a0610168b2105c9759e957b2c63249594f23d963511df2620c41c",
+    "candidates": [
+      "screened_cd_absolute",
+      "screened_spa_absolute",
+      "screened_mu_absolute",
+      "screened_anls_bpp_absolute"
+    ],
+    "eligibility": "Every declared selected NMF case and all three profiles valid, converged, warning-free, and exact label/probability reproduction; no omitted unsuccessful cases.",
+    "weighting": "Equal dataset weight; equal task weight within each dataset; equal size-seed case weight within each task.",
+    "primary_metric": "balanced_accuracy",
+    "global_regret_limit": 0.01,
+    "per_dataset_regret_limit": 0.01,
+    "per_task_regret_limit": 0.02,
+    "accuracy_reference": "Best eligible absolute-screening solver among all four at each corresponding aggregation level.",
+    "primary_case_cost": "Median of three serial (total fit plus joint labels/probabilities prediction) sums, using each dataset's fixed validation batch (CelebA 4000, Fashion-MNIST 2000).",
+    "cost_aggregation": "Divide each case cost by the fastest eligible solver on that same case; weighted geometric mean with the same dataset/task/case weights.",
+    "relative_cost_tie_band": 0.05,
+    "tie_rule": "Among accuracy-qualified methods within 5% of minimum weighted cost: higher global balanced accuracy, then lower weighted cost, then CD, SPA, MU, ANLS-BPP in this order for an exact tie. Numerical comparisons use absolute slack 1e-12.",
+    "no_accuracy_qualified_method": "Select minimum maximum normalized global/dataset/task regret; then lower weighted cost; report the unresolved accuracy conflict prominently.",
+    "no_eligible_method": "Do not finalize the default; retain numerical failures and diagnose separately.",
+    "sensitivities": {
+      "global_and_dataset_regret_limits": [
+        0.005,
+        0.01,
+        0.02
+      ],
+      "per_task_limit_multiplier": 2,
+      "prediction_cost_multipliers": [
+        0.1,
+        1,
+        10,
+        100
+      ],
+      "omit_one_dataset": true,
+      "omit_one_task": true,
+      "omit_one_training_seed": true,
+      "tuning_cost": "Report CV wall and aggregate compute separately; add aggregate per-job CV compute to serial deployment cost as a labeled secondary sensitivity, not the primary workload."
+    },
+    "primary_celeba_protocol": "examples/celeba_four_solver_protocol.json",
+    "historical_celeba_role": "Earlier CD/SPA decision and amendment are preserved context and sensitivity only; no imputation of missing MU/BPP cases into the primary four-solver comparison.",
+    "numerical_comparison_slack": 1E-12
+  },
+  "supersedes": "examples/fashion_mnist_solver_protocol.json; author added MU and ANLS-BPP before any Fashion-MNIST fits",
+  "execution_order": [
+    "Fashion-MNIST complete CV",
+    "Matched four-solver CelebA complete CV",
+    "Fashion-MNIST serial development validation and profiling",
+    "Matched CelebA serial development validation and profiling"
+  ],
+  "anls_max_iter": 1000,
+  "anls_nnls_max_iter": null,
+  "anls_nnls_tol": 1E-10,
+  "anls_numerical_policy": "Float64 NNDSVDa ANLS-BPP; at most 1000 outer NNLS sweeps; inner cap max(100,5*rank), relative KKT tolerance 1e-10 plus explicit roundoff allowance 256*float64_epsilon*max(NNLS design shape); outer relative initial projected-gradient tolerance 1e-4; no factor rescaling. Every inner/outer failure warns and invalidates. Iteration counts and tolerances are algorithm-specific and not equal optimization error."
+}

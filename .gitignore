@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+tmp/
+data/
+runs/
+*.joblib
+portable_speedtest/validation/*.json
+

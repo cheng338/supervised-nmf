@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "Please cite this software and Chang Cheng's dissertation when using this package."
+type: software
+title: "Supervised NMF for Classification"
+version: 0.1.0a0
+repository-code: "https://github.com/cheng338/supervised-nmf"
+authors:
+  - family-names: Cheng
+    given-names: Chang
+abstract: >-
+  Supervised nonnegative matrix factorization for binary classification, using
+  feature screening, nonnegative factorization and nearest-neighbor prediction.
+  Implements Chapter 7 of Chang Cheng's dissertation, Overcoming the Curses of
+  Dimensionality and Kernelization: Scalable DWD and Supervised NMF, from the
+  original simulation and CelebA experiment scripts.
+

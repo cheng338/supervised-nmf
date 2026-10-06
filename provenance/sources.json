@@ -1,0 +1,18 @@
+[
+  {
+    "file": "sim.py",
+    "author": "Chang Cheng",
+    "sha256": "f03b86b695ec02ecc2a62da19f1e96bff583eb1f172547c80851bfc731be0436",
+    "last_modified_utc": "2026-07-30T03:27:19.0000000Z",
+    "origin": "Original research script supplied by Chang Cheng",
+    "note": "Modification time is not verified experiment provenance."
+  },
+  {
+    "file": "snmf_am.py",
+    "author": "Chang Cheng",
+    "sha256": "2072270e7472d8e60e6f5dd8326ea2138b94c54776cd369aef6d40690e91249c",
+    "last_modified_utc": "2026-07-31T11:42:01.0000000Z",
+    "origin": "Original research script supplied by Chang Cheng",
+    "note": "Modification time is not verified experiment provenance."
+  }
+]

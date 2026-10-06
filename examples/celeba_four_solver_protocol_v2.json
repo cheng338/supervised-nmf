@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "author": "Chang Cheng",
+  "protocol_id": "celeba-matched-four-solvers-v2-numerical-repair",
+  "created_utc": "2026-10-04T09:54:47.038891+00:00",
+  "cache": "data/default-selection/n8000-seed43",
+  "cache_manifest_sha256": "b12b4281ec9870528feff522d3e98d21fcf6f3e577478bd2271b9b37834f71ed",
+  "attributes": [
+    "Smiling",
+    "Wearing_Necktie"
+  ],
+  "methods": [
+    "screened_cd_absolute",
+    "screened_spa_absolute",
+    "screened_mu_absolute",
+    "screened_anls_bpp_absolute"
+  ],
+  "seed": 43,
+  "n_train": 8000,
+  "n_validation": 4000,
+  "cv": 5,
+  "native_threads": 1,
+  "workers": 8,
+  "max_iter": 20000,
+  "tol": 0.0001,
+  "profile_repeats": 3,
+  "profile_order_seed": 42043,
+  "grid": {
+    "n_components": [
+      2,
+      5,
+      10,
+      20,
+      40,
+      80
+    ],
+    "score_threshold": [
+      0,
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "n_neighbors": [
+      1,
+      2,
+      3,
+      5,
+      9,
+      15,
+      25,
+      41,
+      65,
+      81
+    ]
+  },
+  "extra_representations": {
+    "Smiling": [
+      {
+        "n_components": 12,
+        "score_threshold": 9.899494936611665
+      },
+      {
+        "n_components": 80,
+        "score_threshold": 11.313708498984761
+      }
+    ],
+    "Wearing_Necktie": [
+      {
+        "n_components": 24,
+        "score_threshold": 9.899494936611665
+      },
+      {
+        "n_components": 20,
+        "score_threshold": 8.485281374238571
+      }
+    ]
+  },
+  "extra_representation_provenance": "The four old n8000/seed43 CD/SPA absolute calibration-summary selections supplied these rank/threshold pairs; all four methods receive both pairs and the full ten-k grid for each attribute. No new validation outcome selects additions.",
+  "screening": "absolute",
+  "training_coordinates": "fit_transform",
+  "source_data_role": "Existing official CelebA training subset and existing official development validation images; natural class proportions preserved; no test arrays.",
+  "boundary_policy": "Retain every boundary flag and dimensional exclusion; no post-validation grid changes or substitutions.",
+  "validation_policy": "Run only after all declared Fashion and matched CelebA CV jobs reach terminal status; serial profiles follow with no CV pool running.",
+  "primary_decision_protocol": "examples/fashion_mnist_solver_protocol_v3.json",
+  "earlier_results_role": "Historical results preserved; this full common-grid matched 8-job block supplies the primary CelebA contribution for all four solvers.",
+  "anls_max_iter": 1000,
+  "anls_nnls_max_iter": null,
+  "anls_nnls_tol": 1e-10,
+  "anls_numerical_policy": "Float64 NNDSVDa ANLS-BPP; at most 1000 outer NNLS sweeps; inner cap max(100,5*rank), relative KKT tolerance 1e-10 plus explicit roundoff allowance 256*float64_epsilon*max(NNLS design shape); outer relative initial projected-gradient tolerance 1e-4; no factor rescaling. Every inner/outer failure warns and invalidates. Iteration counts and tolerances are algorithm-specific and not equal optimization error. Ill-conditioned passive sets use the direct low-level LAPACK DGELSD wrapper, with explicit float64-epsilon rank cutoff and checked workspace/info; the high-level scipy.linalg.lstsq batched dispatcher is bypassed as a disclosed crash workaround.",
+  "supersedes": "examples/celeba_four_solver_protocol.json; numerical repair before any new development-validation evaluation",
+  "parent_protocol_sha256": "def9a51a2a21bcbb31b3554d9d3fe53fd9232b0378a5c192e2b29a079fbab610",
+  "numerical_repair": {
+    "author": "Chang Cheng",
+    "reason": "Repeated Windows native access violation in scipy.linalg.lstsq -> _batched_linalg._lstsq during ANLS-BPP original-design passive-set least squares.",
+    "parent_run": "runs/four-solvers-20261003",
+    "parent_source_freeze_sha256": "666aaff1d81ed0b50639ccb7ce9426115629d4774246f62b4140bba93e4339eb",
+    "evidence": "runs/four-solvers-20261003/native-fault-recovery-20261004.json",
+    "implementation_change": "Call SciPy's low-level LAPACK DGELSD wrapper directly, preserving the original-design minimum-norm least-squares problem and float64-epsilon rank cutoff; validate workspaces and LAPACK status. Avoid the high-level batched lstsq dispatch.",
+    "unchanged": "Data, preprocessing, folds, predictive grids, NMF objective, NNDSVDa initialization, NNLS/KKT tolerances, iteration caps, factor geometry, metrics, and default-selection rule.",
+    "receipt_policy": "Copy only unchanged non-BPP calibration chunks and committed folds byte-for-byte after strict identity verification; retain source hashes and lineage. Rerun every ANLS-BPP chunk. Preserve all original results, including failures, as historical evidence.",
+    "training_cv_results_already_available": true,
+    "fashion_development_validation_evaluated_before_amendment": false,
+    "new_celeba_development_validation_evaluated_before_amendment": false,
+    "historical_celeba_validation_outcomes_known": true,
+    "official_test_evaluated": false,
+    "document": "docs/numerical-repair-20261004.md"
+  },
+  "anls_passive_lstsq_backend": "scipy.linalg.lapack.dgelsd with explicit workspace query; original-design float64 minimum-norm solve"
+}

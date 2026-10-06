@@ -1,0 +1,27 @@
+Supplied target environment (verbatim report below; hardware model not supplied).
+
+Ubuntu 22.04.5 LTS
+5.15.0-190-generic
+Architecture:                x86_64
+  CPU op-mode(s):            32-bit, 64-bit
+  Address sizes:             46 bits physical, 48 bits virtual
+  Byte Order:                Little Endian
+CPU(s):                      40
+  On-line CPU(s) list:       0-39
+               total        used        free      shared  buff/cache   available
+Mem:           503Gi       4.0Gi       480Gi       332Mi        19Gi       496Gi
+Swap:           46Gi        30Mi        46Gi
+
+Python 3.10.12
+ipykernel 6.7.0 requires debugpy, which is not installed.
+
+cvxpy               1.6.6
+dwd                 1.0.5
+joblib              1.5.1
+numpy               2.2.6
+scikit-learn        1.7.0
+scipy               1.15.3
+threadpoolctl       3.6.0
+
+ddopenblas 0.3.29
+openblas 0.3.28

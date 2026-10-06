@@ -1,0 +1,13 @@
+PC1 hardware reference:
+Operating system: Windows
+CPU: AMD Ryzen 9 6900HS with Radeon Graphics
+Physical cores: 8
+Logical processors: 16
+Usable total physical RAM: approximately 39.23 GiB
+
+The exact active Python, dependency, and numerical-backend versions used to build
+the bundle are recorded in builder-provenance.json. The benchmark records its
+own environment at execution time; that record governs interpretation of results.
+
+An existing solver study was active while this portable package was developed.
+No development smoke check performed during that study is an official timing.

@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "author": "Chang Cheng",
+  "protocol_id": "celeba-matched-four-solvers-v1",
+  "created_utc": "2026-10-03T15:51:43.4732505Z",
+  "cache": "data/default-selection/n8000-seed43",
+  "cache_manifest_sha256": "b12b4281ec9870528feff522d3e98d21fcf6f3e577478bd2271b9b37834f71ed",
+  "attributes": [
+    "Smiling",
+    "Wearing_Necktie"
+  ],
+  "methods": [
+    "screened_cd_absolute",
+    "screened_spa_absolute",
+    "screened_mu_absolute",
+    "screened_anls_bpp_absolute"
+  ],
+  "seed": 43,
+  "n_train": 8000,
+  "n_validation": 4000,
+  "cv": 5,
+  "native_threads": 1,
+  "workers": 8,
+  "max_iter": 20000,
+  "tol": 0.0001,
+  "profile_repeats": 3,
+  "profile_order_seed": 42043,
+  "grid": {
+    "n_components": [
+      2,
+      5,
+      10,
+      20,
+      40,
+      80
+    ],
+    "score_threshold": [
+      0,
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "n_neighbors": [
+      1,
+      2,
+      3,
+      5,
+      9,
+      15,
+      25,
+      41,
+      65,
+      81
+    ]
+  },
+  "extra_representations": {
+    "Smiling": [
+      {
+        "n_components": 12,
+        "score_threshold": 9.899494936611665
+      },
+      {
+        "n_components": 80,
+        "score_threshold": 11.313708498984761
+      }
+    ],
+    "Wearing_Necktie": [
+      {
+        "n_components": 24,
+        "score_threshold": 9.899494936611665
+      },
+      {
+        "n_components": 20,
+        "score_threshold": 8.485281374238571
+      }
+    ]
+  },
+  "extra_representation_provenance": "The four old n8000/seed43 CD/SPA absolute calibration-summary selections supplied these rank/threshold pairs; all four methods receive both pairs and the full ten-k grid for each attribute. No new validation outcome selects additions.",
+  "screening": "absolute",
+  "training_coordinates": "fit_transform",
+  "source_data_role": "Existing official CelebA training subset and existing official development validation images; natural class proportions preserved; no test arrays.",
+  "boundary_policy": "Retain every boundary flag and dimensional exclusion; no post-validation grid changes or substitutions.",
+  "validation_policy": "Run only after all declared Fashion and matched CelebA CV jobs reach terminal status; serial profiles follow with no CV pool running.",
+  "primary_decision_protocol": "examples/fashion_mnist_solver_protocol_v2.json",
+  "earlier_results_role": "Historical results preserved; this full common-grid matched 8-job block supplies the primary CelebA contribution for all four solvers.",
+  "anls_max_iter": 1000,
+  "anls_nnls_max_iter": null,
+  "anls_nnls_tol": 1E-10,
+  "anls_numerical_policy": "Float64 NNDSVDa ANLS-BPP; at most 1000 outer NNLS sweeps; inner cap max(100,5*rank), relative KKT tolerance 1e-10 plus explicit roundoff allowance 256*float64_epsilon*max(NNLS design shape); outer relative initial projected-gradient tolerance 1e-4; no factor rescaling. Every inner/outer failure warns and invalidates. Iteration counts and tolerances are algorithm-specific and not equal optimization error."
+}

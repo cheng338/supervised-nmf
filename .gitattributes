@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.cmd text eol=crlf
+provenance/original/* -text
+portable_speedtest/compatible_manifests/*.json -text

@@ -24,9 +24,10 @@ implements Chapter 7 of:
 > manuscript, Purdue University, Department of Statistics.
 
 See [CITATION.cff](CITATION.cff) for citation details and
-[source provenance](provenance/README.md) for the original scripts. This is a
-development version, 0.1.0a2. A distribution license has not yet been
-selected.
+[source provenance](provenance/README.md) for the original scripts. The first
+formal release is 0.1.0. It includes the algorithms and BLAS improvements from
+0.1.0a2; this version change does not change their numerical behavior.
+A distribution license has not yet been selected.
 
 # Installation
 

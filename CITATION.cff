@@ -2,8 +2,8 @@ cff-version: 1.2.0
 message: "Please cite this software and Chang Cheng's dissertation when using this package."
 type: software
 title: "Supervised NMF for Classification"
-version: 0.1.0
-date-released: 2026-10-07
+version: 0.2.0
+date-released: 2026-10-09
 repository-code: "https://github.com/cheng338/supervised-nmf"
 authors:
   - family-names: Cheng

@@ -160,7 +160,7 @@ labels and probabilities with one projection. The shared KNN calibration
 helper honors fixed thresholds, but threshold grids require the general
 `calibration_search` helper.
 
-These execution and decision-policy additions are unreleased source changes.
+These execution and decision-policy additions are included in version 0.2.0.
 They do not revise saved study results or establish an accuracy improvement.
 
 ### Screening and anchor details

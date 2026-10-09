@@ -2,7 +2,7 @@
 
 Author: Chang Cheng.
 
-The current source adds guarded batched NNLS projection, optional reusable
+Version 0.2.0 adds guarded batched NNLS projection, optional reusable
 process workers, separate projection/native-thread limits, and a fitted
 binary decision threshold. The default projection setting is `auto` with one
 worker; an explicit `scipy` setting and legacy serialized models retain the
@@ -52,5 +52,5 @@ normalization and the training-coordinate convention retain their defaults;
 the exploratory normalization results did not support a universal change.
 
 Run the source tests with `python -m unittest discover -s tests -q` after
-installing the optional study dependencies. The changes are source updates
-after formal release 0.1.0; the existing release tag is unchanged.
+installing the optional study dependencies. These changes are included in
+formal release 0.2.0; the historical 0.1.0 release tag remains unchanged.

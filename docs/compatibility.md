@@ -14,8 +14,8 @@ running Python 3.10.12 with the following numerical stack:
 These five versions are recorded in
 [requirements/robust.txt](../requirements/robust.txt). This file pins the target
 runtime for reproducibility; it is not a list of new dependencies to add to an
-environment that already supplies those versions. joblib is a scikit-learn
-dependency.
+environment that already supplies those versions. Version 0.2.0 declares
+joblib>=1.3 directly for optional projection process workers.
 
 ## Validation scope
 
@@ -27,7 +27,7 @@ installed for the image-loader fixtures. The runtime reported NumPy OpenBLAS
 all 281 tests in 59.991 seconds.
 
 The package now declares Python 3.10 or later. These results validate the tested
-source revision on Windows; Ubuntu execution has not been tested. Matching
+historical source revision on Windows; that check did not test Ubuntu. Matching
 Python, package and OpenBLAS version numbers does not establish identical
 binary builds, Linux behavior or timing. Each runtime's actual libraries and
 thread counts must be recorded with its results.
@@ -76,3 +76,12 @@ python -m pip install --no-deps .
 Use a separate environment when the active one has different dependency
 versions. The requirements file should not be applied to an unrelated working
 environment merely to run the package.
+
+## Version 0.2.0 checks
+
+The full source suite passed all 370 tests on Windows Python 3.10 and 3.12.
+Before the final workspace-lifetime change, the projection and threshold
+implementation also passed 153 regression tests on Linux Python 3.12/OpenBLAS.
+Those Linux results do not establish a full Linux test of the final release.
+See the [implementation record](implementation-improvements.md) and
+[release notes](release-0.2.0.md) for scope and installation details.

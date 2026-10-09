@@ -24,9 +24,10 @@ implements Chapter 7 of:
 > manuscript, Purdue University, Department of Statistics.
 
 See [CITATION.cff](CITATION.cff) for citation details and
-[source provenance](provenance/README.md) for the original scripts. The first
-formal release is 0.1.0. It includes the algorithms and BLAS improvements from
-0.1.0a2; this version change does not change their numerical behavior.
+[source provenance](provenance/README.md) for the original scripts. The current
+formal release is **0.2.0**, adding guarded batched projection, optional process
+workers, saved decision thresholds and reduced SPA workspace memory. See the
+[release notes](docs/release-0.2.0.md).
 A distribution license has not yet been selected.
 
 # Installation
@@ -53,9 +54,10 @@ for an editable development installation. Tested environments and remaining
 compatibility checks are listed in [validation](docs/validation.md).
 The supplied Python 3.10.12 numerical profile is recorded in
 [runtime compatibility](docs/compatibility.md), including exact dependency pins
-and instructions for preserving an existing environment. All 281 source tests
-passed with that exact numerical stack on Windows 11; Ubuntu execution has not
-been tested.
+and instructions for preserving an existing environment. The full source suite
+passed all 370 tests on Windows with Python 3.10 and 3.12. Earlier Linux checks
+covered the projection/threshold changes; the final workspace-lifetime change
+has been verified on Windows. See [implementation checks](docs/implementation-improvements.md).
 
 # Basic use
 
@@ -112,7 +114,7 @@ multiplicative updates or `solver="cd"` for the dissertation's original
 coordinate-descent implementation.
 
 SPA uses direct BLAS anchor updates and releases anchor-selection workspaces
-before fitting its basis. The current source uses guarded batched NNLS for
+before fitting its basis. Version 0.2.0 uses guarded batched NNLS for
 suitable query batches, with public SciPy NNLS as its numerical fallback.
 Use `projection_solver="scipy"` for the original row-wise projection.
 Optional `projection_workers=8` enables reusable processes for large batches;
@@ -168,9 +170,10 @@ those assumptions. See [solver comparisons](docs/nmf-solver-comparison.md),
 Version 0.1.0a2 adds subject-aware training folds, bounded rank exploration,
 reused fold-local screening statistics, and evaluation summaries with class
 support and numerical-stage diagnostics. Solver, screening, and rank defaults
-are unchanged in that release. The current unreleased source additionally
-provides guarded batched projection, saved decision thresholds and lower SPA
-workspace memory. Existing serialized models retain their SciPy projection path. See [tuning improvements](docs/tuning-improvements.md) and the
+are unchanged in that release. Version 0.2.0 additionally provides guarded
+batched projection, saved decision thresholds and lower SPA workspace memory.
+Existing serialized models retain their SciPy projection path. See
+[tuning improvements](docs/tuning-improvements.md) and the
 [API guide](docs/api.md).
 
 Run `python examples/grouped_tuning.py --output runs/grouped-example` for a

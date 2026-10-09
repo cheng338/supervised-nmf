@@ -15,6 +15,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_is_fitted
 
 from .decomposition import FeatureSPA
+from ._projection import validate_projection_parameters
 from .screening import BinaryScreening, _binary_data, _clear_fitted_attributes, _nonnegative_array
 
 
@@ -66,6 +67,24 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
     The scaler and final estimator are stored in ``classifier_`` as a pipeline
     with steps ``'scale'`` and ``'logistic'`` when logistic regression is used.
 
+    ``decision_threshold=None`` preserves the final classifier's own decision
+    rule. An explicit threshold predicts ``positive_label`` exactly when its
+    probability is strictly greater than the threshold; equality is negative.
+    ``positive_label=None`` uses the second class in ``classes_``. Thresholds
+    lie in [0, 1], with the exact ``np.nextafter(0.0, -np.inf)`` sentinel also
+    accepted for an all-positive rule. A threshold of 1 is all-negative.
+    Probabilities are unchanged. No threshold is learned by this estimator:
+    choose it on training/calibration data, never on test data. The fitted
+    policy is stored in ``decision_threshold_`` and ``positive_label_``;
+    changing constructor parameters takes effect on the next fit.
+
+    ``projection_solver``, ``projection_workers``, ``projection_batch_size``
+    and ``projection_native_threads`` configure SPA's fixed-basis prediction
+    projection (and training reprojection when requested). See ``FeatureSPA``
+    for their numerical safeguards and process-pool behavior. They are
+    validated but unused by CD and MU. Unlike the fitted decision policy,
+    projection execution settings may be changed without refitting.
+
     ``training_coordinates='fit_transform'`` reproduces the scripts' convention;
     ``'transform'`` instead reprojects training data against the fitted basis
     using the same operation as prediction. No operation on test data refits
@@ -90,7 +109,10 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
                  score_threshold=2.0, n_neighbors=5, weights="uniform", max_iter=20000,
                  tol=1e-4, random_state=None, training_coordinates="fit_transform",
                  classifier="knn", logistic_C=1.0, logistic_max_iter=1000,
-                 logistic_tol=1e-4, logistic_class_weight=None):
+                 logistic_tol=1e-4, logistic_class_weight=None,
+                 decision_threshold=None, positive_label=None,
+                 projection_solver="auto", projection_workers=1,
+                 projection_batch_size=256, projection_native_threads=1):
         self.n_components = n_components
         self.solver = solver
         self.screening = screening
@@ -107,6 +129,22 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
         self.logistic_max_iter = logistic_max_iter
         self.logistic_tol = logistic_tol
         self.logistic_class_weight = logistic_class_weight
+        self.decision_threshold = decision_threshold
+        self.positive_label = positive_label
+        self.projection_solver = projection_solver
+        self.projection_workers = projection_workers
+        self.projection_batch_size = projection_batch_size
+        self.projection_native_threads = projection_native_threads
+
+    def __setstate__(self, state):
+        # Legacy fitted models retain their original serial projection policy;
+        # restoring constructor defaults also keeps get_params/clone usable.
+        state = state.copy()
+        for name, value in (("decision_threshold", None), ("positive_label", None),
+                            ("projection_solver", "scipy"), ("projection_workers", 1),
+                            ("projection_batch_size", 256), ("projection_native_threads", 1)):
+            state.setdefault(name, value)
+        super().__setstate__(state)
 
     def fit(self, X, y):
         return self._fit(X, y)
@@ -121,7 +159,22 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
 
     def _fit(self, X, y, prepared_selector=None):
         _clear_fitted_attributes(self)
+        try:
+            return self._fit_impl(X, y, prepared_selector)
+        except Exception:
+            _clear_fitted_attributes(self)
+            raise
+
+    def _fit_impl(self, X, y, prepared_selector=None):
         start = time.perf_counter()
+        threshold = getattr(self, "decision_threshold", None)
+        if threshold is not None and (
+                isinstance(threshold, (bool, np.bool_)) or not isinstance(threshold, Real)
+                or not np.isfinite(threshold)
+                or (threshold < 0 and threshold != np.nextafter(0.0, -np.inf))
+                or threshold > 1.0):
+            raise ValueError("decision_threshold must be None, finite in [0, 1], or np.nextafter(0.0, -np.inf).")
+        projection_settings = self._projection_settings()
         if self.solver not in {"cd", "spa", "mu"}:
             raise ValueError("solver must be 'cd', 'spa', or 'mu'.")
         if self.screening not in {"percentile", "absolute", "none"}:
@@ -147,6 +200,15 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
                     isinstance(self.logistic_class_weight, str) and self.logistic_class_weight == "balanced"):
                 raise ValueError("logistic_class_weight must be None, 'balanced', or a dictionary.")
         X, y, classes, counts = _binary_data(X, y)
+        positive_label = getattr(self, "positive_label", None)
+        positive_index = 1
+        if positive_label is not None:
+            if not np.isscalar(positive_label):
+                raise ValueError("positive_label must be one of the two training classes.")
+            matches = [i for i, label in enumerate(classes) if label == positive_label]
+            if len(matches) != 1:
+                raise ValueError("positive_label must be one of the two training classes.")
+            positive_index = matches[0]
         if self.classifier == "knn" and (isinstance(self.n_neighbors, bool) or not isinstance(self.n_neighbors, Integral) or not 1 <= self.n_neighbors <= X.shape[0]):
             raise ValueError("n_neighbors must be a positive integer no larger than the training sample count.")
         if isinstance(self.max_iter, bool) or not isinstance(self.max_iter, Integral) or self.max_iter < 1:
@@ -187,7 +249,9 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
                                 beta_loss="frobenius",
                                 max_iter=self.max_iter, tol=self.tol, random_state=self.random_state)
         else:
-            decomposition = FeatureSPA(n_components=self.n_components, nnls_max_iter=self.max_iter)
+            decomposition = FeatureSPA(
+                n_components=self.n_components, nnls_max_iter=self.max_iter,
+                **projection_settings)
         stage = time.perf_counter()
         W, fitting_warnings = _record_warnings(lambda: decomposition.fit_transform(X_selected))
         factorization_seconds = time.perf_counter() - stage
@@ -219,6 +283,9 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
         self.n_samples_seen_ = X.shape[0]
         self.classes_ = classes
         self.class_counts_ = counts
+        self.decision_threshold_ = None if threshold is None else float(threshold)
+        self.positive_label_ = classes[positive_index]
+        self.positive_class_index_ = positive_index
         self.selector_ = selector
         self.decomposition_ = decomposition
         self.classifier_ = classifier
@@ -249,6 +316,15 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
                            "total": time.perf_counter() - start}
         return self
 
+    def _projection_settings(self):
+        settings = dict(
+            projection_solver=getattr(self, "projection_solver", "scipy"),
+            projection_workers=getattr(self, "projection_workers", 1),
+            projection_batch_size=getattr(self, "projection_batch_size", 256),
+            projection_native_threads=getattr(self, "projection_native_threads", 1))
+        validate_projection_parameters(**settings)
+        return settings
+
     def transform(self, X):
         check_is_fitted(self, "classifier_")
         start = time.perf_counter()
@@ -256,6 +332,9 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
         self.last_transform_warnings_ = ()
         self.last_transform_error_ = None
         try:
+            projection_settings = self._projection_settings()
+            if isinstance(self.decomposition_, FeatureSPA):
+                self.decomposition_.set_params(**projection_settings)
             X = _nonnegative_array(X)
             if X.shape[1] != self.n_features_in_:
                 raise ValueError(f"X has {X.shape[1]} features; expected {self.n_features_in_}.")
@@ -272,7 +351,17 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
 
     def predict(self, X):
         check_is_fitted(self, "classifier_")
-        return self.classifier_.predict(self.transform(X))
+        coordinates = self.transform(X)
+        if getattr(self, "decision_threshold_", None) is None:
+            return self.classifier_.predict(coordinates)
+        return self._labels_from_probabilities(self.classifier_.predict_proba(coordinates))
+
+    def _labels_from_probabilities(self, probabilities):
+        """Apply an explicit fitted threshold, including to shared KNN scores."""
+        positive_index = self.positive_class_index_
+        indices = np.where(probabilities[:, positive_index] > self.decision_threshold_,
+                           positive_index, 1 - positive_index)
+        return self.classes_[indices]
 
     def predict_proba(self, X):
         check_is_fitted(self, "classifier_")
@@ -281,16 +370,19 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
     def predict_with_probabilities(self, X):
         """Return labels and class probabilities with one fixed-basis projection.
 
-        KNN ties use the first class in ``classes_``, as in sklearn's predict.
-        Logistic labels use sklearn's decision rule, including when a small
-        nonzero decision rounds to a probability of one half. This avoids
-        repeating expensive projection, and KNN neighbor searches, when
+        With no explicit threshold, KNN ties use the first class in ``classes_``
+        and logistic labels use sklearn's decision rule, including when a small
+        nonzero decision rounds to a probability of one half. An explicit
+        fitted threshold uses the same strict probability rule as ``predict``.
+        This avoids repeating expensive projection, and KNN neighbor searches, when
         benchmark metrics require both predicted labels and probabilities.
         """
         check_is_fitted(self, "classifier_")
         coordinates = self.transform(X)
         probabilities = self.classifier_.predict_proba(coordinates)
-        if isinstance(self.classifier_, KNeighborsClassifier):
+        if getattr(self, "decision_threshold_", None) is not None:
+            labels = self._labels_from_probabilities(probabilities)
+        elif isinstance(self.classifier_, KNeighborsClassifier):
             labels = self.classes_[probabilities.argmax(axis=1)]
         else:
             labels = self.classifier_.predict(coordinates)

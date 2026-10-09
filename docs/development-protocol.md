@@ -51,6 +51,26 @@ Author: Chang Cheng.
 
 ## Stages and what constitutes evidence
 
+On October 9, after training-only prototype tests, the author approved
+integrating guarded batched SPA projection, optional reusable process workers,
+separate projection/native-thread controls, and a saved decision threshold.
+The implementation changes query execution while preserving basis fitting
+and the NNLS objective. New source models use `projection_solver="auto"`;
+old serialized models retain SciPy. Numerical checks and fallback are required.
+No new data tuning, study rerun, deployment, or release is implied. Saved
+benchmarks keep their original source fingerprints; subsequent benchmarks
+must freeze this new source and record all execution controls. Optional
+decision thresholds preserve the already-tested strict probability rule;
+they do not supply new accuracy evidence. See the [API details](api.md#spa-projection-execution).
+
+After the remaining diagnostics, the author also approved early release of
+SPA anchor-selection workspaces. This memory optimization occurs after the
+anchor condition checks and before basis NNLS. It preserves the tested
+numerical path and estimator defaults. The normalization results do not justify
+a universal KNN normalization default. The completed study and diagnostic
+receipts retain their frozen source hashes; applying this package fix does not
+rerun or replace those studies.
+
 - **Implementation checks:** unit tests and a small development run establish
   execution, isolation, deterministic behavior, and numerical edge-case handling.
   They cannot choose defaults or resolve Wang's scientific concerns.

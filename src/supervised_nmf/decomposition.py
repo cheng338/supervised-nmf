@@ -9,6 +9,7 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
 
 from .screening import _clear_fitted_attributes, _nonnegative_array
+from ._projection import project_rows, validate_projection_parameters
 
 
 class FeatureSPA(TransformerMixin, BaseEstimator):
@@ -33,16 +34,52 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
     conditions; success on a classification example does not establish them.
     References: Gillis and Vavasis (2014), doi:10.1109/TPAMI.2013.226.
     SPA/NNLS computations use float64, including when inputs are float32.
+
+    ``projection_solver='auto'`` uses guarded batched NNLS for suitable query
+    batches and public SciPy NNLS otherwise. ``'scipy'`` selects the legacy
+    row-wise solver; ``'batched'`` attempts batching even for small inputs,
+    with the same numerical guards and fallback. Basis fitting is unchanged.
+    ``projection_batch_size`` bounds rows per numerical block. Optional
+    ``projection_workers>1`` uses reusable process workers for at least 512
+    rows and two blocks; smaller queries run in the caller. Each projection
+    worker uses ``projection_native_threads`` numerical threads. These controls
+    are separate from outer cross-validation workers and classifier threads.
     """
 
-    def __init__(self, n_components=2, *, normalize=True, condition_limit=1e12, nnls_max_iter=None):
+    def __init__(self, n_components=2, *, normalize=True, condition_limit=1e12, nnls_max_iter=None,
+                 projection_solver="auto", projection_workers=1,
+                 projection_batch_size=256, projection_native_threads=1):
         self.n_components = n_components
         self.normalize = normalize
         self.condition_limit = condition_limit
         self.nnls_max_iter = nnls_max_iter
+        self.projection_solver = projection_solver
+        self.projection_workers = projection_workers
+        self.projection_batch_size = projection_batch_size
+        self.projection_native_threads = projection_native_threads
+
+    def __setstate__(self, state):
+        # Make get_params/clone work for models serialized before these
+        # execution controls existed, retaining their original solver.
+        state = dict(state)
+        state.setdefault("projection_solver", "scipy")
+        state.setdefault("projection_workers", 1)
+        state.setdefault("projection_batch_size", 256)
+        state.setdefault("projection_native_threads", 1)
+        super().__setstate__(state)
+
+    def _projection_options(self):
+        # Older serialized estimators retain their historical numerical path.
+        options = dict(solver=getattr(self, "projection_solver", "scipy"),
+                       workers=getattr(self, "projection_workers", 1),
+                       batch_size=getattr(self, "projection_batch_size", 256),
+                       native_threads=getattr(self, "projection_native_threads", 1))
+        validate_projection_parameters(*options.values())
+        return options
 
     def fit(self, X, y=None):
         _clear_fitted_attributes(self)
+        self._projection_options()
         X = _nonnegative_array(X).astype(np.float64, copy=False)
         if isinstance(self.n_components, bool) or not isinstance(self.n_components, Integral) or not 1 <= self.n_components <= min(X.shape):
             raise ValueError("n_components must be an integer between 1 and min(n_samples, n_features).")
@@ -93,6 +130,12 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
         original_anchor_condition = float(np.linalg.cond(X[:, anchors]))
         if max(anchor_condition, original_anchor_condition) > self.condition_limit:
             raise ValueError("SPA anchors exceed condition_limit; reduce rank or examine feature scaling.")
+        # Anchor selection and its condition checks are finished. Release the
+        # full-size workspaces before allocating coordinates and fitting H;
+        # loop variables otherwise keep the final directions alive as well.
+        del scaled, residual, directions, direction, projection, norms
+        if len(anchors) > 1:
+            del old_direction
         coordinates = X[:, anchors].copy()
         components = np.column_stack([
             nnls(coordinates, X[:, j], maxiter=self.nnls_max_iter)[0]
@@ -127,13 +170,11 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
             raise ValueError(f"X has {X.shape[1]} features; expected {self.n_features_in_}.")
         # scipy.optimize.nnls requests a C-order design matrix. Prepare the
         # shared fixed basis once, rather than copying its transpose per row.
-        # Continue using the public solver, including its finite checks and
-        # max-iteration failure behavior; never overwrite the fitted basis.
+        # Never overwrite the fitted basis. The guarded batched path falls
+        # back to the public solver when numerical qualification fails.
         design = np.ascontiguousarray(self.components_.T)
-        return np.vstack([
-            nnls(design, row, maxiter=self.nnls_max_iter)[0]
-            for row in X
-        ])
+        return project_rows(design, X, maxiter=self.nnls_max_iter,
+                            **self._projection_options())
 
     def inverse_transform(self, W):
         check_is_fitted(self, "components_")

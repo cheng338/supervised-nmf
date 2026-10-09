@@ -22,6 +22,12 @@ classifier = NMFClassifier(
     tol=1e-4,
     random_state=42,
     training_coordinates="fit_transform",
+    projection_solver="auto",   # SPA only: "auto", "scipy", or "batched"
+    projection_workers=1,        # maximum process count for large queries
+    projection_batch_size=256,
+    projection_native_threads=1,
+    decision_threshold=None,    # optional fixed, training-selected cutoff
+    positive_label=None,        # defaults to classes_[1]
 )
 classifier.fit(X_train, y_train)
 W_new = classifier.transform(X_new)
@@ -96,6 +102,68 @@ coefficient convention. Report this choice when comparing CD, MU and SPA fits.
 `factorization_reconstruction_err_` preserves the initial factorization diagnostic.
 
 ## Screening and SPA separately
+
+### SPA projection execution
+
+These controls apply to both `FeatureSPA` and `NMFClassifier(solver="spa")`.
+They affect fixed-basis projection, including training reprojection when
+`training_coordinates="transform"`; SPA anchor selection and basis fitting
+still use the original algorithms. CD/MU ignore valid SPA projection controls.
+
+`projection_solver="auto"` attempts batched NNLS for at least 32 query rows.
+`"batched"` also attempts it for smaller queries. Both require a nonnegative,
+full-column-rank design with condition number at most 1e4, a conservative
+acceleration guard independent of SPA's existing model condition limit.
+Solutions undergo finite, nonnegative and original-design KKT checks. Failed
+checks, ill-conditioned bases and small explicit iteration caps use public
+SciPy NNLS with the original cap; its errors propagate. Internal batched
+pivot attempts are bounded by the smaller of the supplied cap and three times
+the rank, then fall back. This does not change the NNLS objective. Floating-point
+coefficients need not be bitwise identical. `projection_solver="scipy"` selects
+the historical row-wise solver for every query.
+
+Blocks contain at most `projection_batch_size=256` rows. With
+`projection_workers>1`, queries of at least 512 rows and two full blocks use
+joblib's reusable loky process pool. Smaller queries execute in the caller.
+Compatible calls reuse workers automatically, including across models; no
+pool or cached fitted basis is serialized with an estimator. First use pays
+startup cost, and joblib retires idle workers. `projection_native_threads=1`
+limits numerical threads per projection process and restores previous limits
+afterward. The controller discovers NumPy/SciPy libraries at first projection.
+Thread limits are process-wide; use process workers for concurrent work.
+
+Execution controls may change after fitting, for example
+`model.set_params(projection_workers=8)`, without refitting. Outer CV scheduling
+remains the caller's responsibility: budget approximately
+`CV workers * projection workers * native threads` simultaneous numerical
+threads. For many concurrent CV fits, keep projection workers at one.
+All counts must be positive integers; `-1` is not supported.
+Older serialized models restore the historical SciPy projection setting and
+one-worker defaults.
+
+### Saved decisions
+
+`decision_threshold=None` preserves the final estimator's original prediction
+rule, including KNN ties and logistic decisions whose probabilities round to
+0.5. An explicit threshold uses the strict rule `P(positive_label) > threshold`.
+The default positive label is `classes_[1]`; probabilities always retain the
+order in `classes_`. The cutoff must lie in [0, 1], or be exactly
+`np.nextafter(0.0, -np.inf)` to represent the study's all-positive sentinel.
+Threshold one yields all-negative predictions. Probabilities are unchanged.
+
+The threshold and positive label freeze during fit as `decision_threshold_`
+and `positive_label_` and survive serialization. Set them from training-only
+calibration before fitting the final estimator; the package does not select a
+cutoff from new labels. Changing their constructor settings requires refitting
+to change the fitted decision policy. `predict_with_probabilities` returns
+labels and probabilities with one projection. The shared KNN calibration
+helper honors fixed thresholds, but threshold grids require the general
+`calibration_search` helper.
+
+These execution and decision-policy additions are unreleased source changes.
+They do not revise saved study results or establish an accuracy improvement.
+
+### Screening and anchor details
 
 `BinaryScreening` is a sklearn transformer with `fit`, `transform`, and
 `get_support`. It exposes signed `t_scores_`, squared `scores_`, selected indices,

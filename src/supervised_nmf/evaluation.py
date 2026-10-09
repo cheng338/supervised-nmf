@@ -131,7 +131,7 @@ def data_fingerprint(X, y):
 def provenance(threads=1):
     """Record software, hardware, source, and requested native thread limits."""
     versions = {}
-    for package in ("numpy", "scipy", "scikit-learn", "threadpoolctl", "Pillow"):
+    for package in ("numpy", "scipy", "scikit-learn", "threadpoolctl", "joblib", "Pillow"):
         try:
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:

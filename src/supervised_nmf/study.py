@@ -85,7 +85,8 @@ def _layout(estimator):
         if estimator.classifier != "knn":
             raise TypeError("calibration_knn_grid requires classifier='knn'; use calibration_search for logistic regression.")
         return "nmf", "n_neighbors", {"weights", "classifier", "logistic_C", "logistic_max_iter",
-                                       "logistic_tol", "logistic_class_weight"}
+                                       "logistic_tol", "logistic_class_weight",
+                                       "decision_threshold", "positive_label"}
     if type(estimator) is KNeighborsClassifier:
         return "raw", "n_neighbors", set(estimator.get_params()) - {"n_neighbors"}
     if type(estimator) is Pipeline and type(estimator.steps[-1][1]) is KNeighborsClassifier:
@@ -312,7 +313,11 @@ def _run_representation_fold(estimator, kind, neighbor_parameter, representation
                     result["fit_seconds"] = time.perf_counter() - start
                 start = time.perf_counter()
                 try:
-                    predictions = classifier.predict(validation_coordinates)
+                    if kind == "nmf" and getattr(fitted, "decision_threshold_", None) is not None:
+                        predictions = fitted._labels_from_probabilities(
+                            classifier.predict_proba(validation_coordinates))
+                    else:
+                        predictions = classifier.predict(validation_coordinates)
                 finally:
                     result["prediction_seconds"] = time.perf_counter() - start
                 score = float(balanced_accuracy_score(y[validation], predictions))

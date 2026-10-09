@@ -198,7 +198,10 @@ class SPABlasEquivalenceTests(unittest.TestCase):
             model = FeatureSPA(3, nnls_max_iter=37).fit(X)
             self.assertEqual(observed.call_count, X.shape[1])
             self.assertTrue(all(call.kwargs["maxiter"] == 37 for call in observed.call_args_list))
-            observed.reset_mock()
+        # The transform solver now lives in its guarded projection helper.
+        # Exercise the explicit public-SciPy compatibility path here.
+        model.set_params(projection_solver="scipy")
+        with patch("supervised_nmf._nnls.nnls", wraps=nnls) as observed:
             model.transform(incoming)
             self.assertEqual(observed.call_count, len(incoming))
             self.assertTrue(all(call.kwargs["maxiter"] == 37 for call in observed.call_args_list))

@@ -32,7 +32,7 @@ A distribution license has not yet been selected.
 # Installation
 
 Python 3.10 or later is required. Dependencies are NumPy, SciPy, scikit-learn
-1.6 or later (below 2.0), and threadpoolctl. With access to the repository:
+1.6 or later (below 2.0), threadpoolctl, and joblib 1.3 or later. With access to the repository:
 
 ```shell
 git clone https://github.com/cheng338/supervised-nmf.git
@@ -111,6 +111,14 @@ The default is **SPA with absolute screening**. Use `solver="mu"` for
 multiplicative updates or `solver="cd"` for the dissertation's original
 coordinate-descent implementation.
 
+SPA uses direct BLAS anchor updates and releases anchor-selection workspaces
+before fitting its basis. The current source uses guarded batched NNLS for
+suitable query batches, with public SciPy NNLS as its numerical fallback.
+Use `projection_solver="scipy"` for the original row-wise projection.
+Optional `projection_workers=8` enables reusable processes for large batches;
+the default is one worker. See [projection controls](docs/api.md#spa-projection-execution)
+and the [implementation checks](docs/implementation-improvements.md).
+
 | Solver | Factorization |
 | --- | --- |
 | `"spa"` | Selects feature anchors, then solves nonnegative least-squares problems to fit the basis and encode new observations. |
@@ -135,6 +143,12 @@ coordinate-descent implementation.
 | `tol` | `1e-4` | CD/MU stopping tolerance; SPA's NNLS routine does not use this parameter. |
 | `random_state` | `None` | Set an integer for reproducible CD/MU initialization. |
 | `training_coordinates` | `"fit_transform"` | Uses the factorization's returned training coordinates; `"transform"` re-encodes them against the fitted basis. |
+| `projection_solver` | `"auto"` | SPA query projection: guarded batching; also `"scipy"` or `"batched"`. |
+| `projection_workers` | `1` | Maximum SPA projection processes; independent of outer CV workers. |
+| `projection_batch_size` | `256` | Maximum query rows per NNLS block. |
+| `projection_native_threads` | `1` | Numerical threads per projection process. |
+| `decision_threshold` | `None` | Optional frozen probability cutoff; `None` preserves the classifier's decision rule. |
+| `positive_label` | `None` | Class to threshold; defaults to `classes_[1]`. |
 
 Rank, screening cutoff and the selected classifier's predictive parameters
 require tuning for the data. CD and MU use different stopping criteria, so
@@ -154,8 +168,9 @@ those assumptions. See [solver comparisons](docs/nmf-solver-comparison.md),
 Version 0.1.0a2 adds subject-aware training folds, bounded rank exploration,
 reused fold-local screening statistics, and evaluation summaries with class
 support and numerical-stage diagnostics. Solver, screening, and rank defaults
-are unchanged. SPA retains public SciPy NNLS projection and uses direct BLAS
-anchor updates. See [tuning improvements](docs/tuning-improvements.md) and the
+are unchanged in that release. The current unreleased source additionally
+provides guarded batched projection, saved decision thresholds and lower SPA
+workspace memory. Existing serialized models retain their SciPy projection path. See [tuning improvements](docs/tuning-improvements.md) and the
 [API guide](docs/api.md).
 
 Run `python examples/grouped_tuning.py --output runs/grouped-example` for a

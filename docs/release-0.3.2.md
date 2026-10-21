@@ -1,27 +1,28 @@
 # supervised-nmf 0.3.2
 
-October 20, 2026
+supervised-nmf 0.3.2 simplifies source packaging and updates research
+documentation. Numerical algorithms, classifier options, defaults and runtime
+dependencies are unchanged.
 
-This patch simplifies source packaging and edits the research documentation.
-The source manifest uses directory patterns instead of an explicit list of
-individual files. Distribution verification retains the existing import,
-classifier, metadata, license and source-content checks; the additional
-archive-rebuild and unlisted-file checks introduced in 0.3.1 are removed.
-The separate PC throughput benchmark remains excluded from current source.
+- Use directory patterns for source packaging instead of maintaining a list of
+  individual files.
+- Remove the additional archive-rebuild and unlisted-file checks introduced in
+  0.3.1. Retain import, classifier, metadata, license and required-source checks.
+- Clarify research documentation and use generic interpreter commands in
+  examples. Study decisions, reported results and original-source provenance
+  are preserved.
 
-Research documentation now describes study decisions directly and uses generic
-interpreter commands. The methodological choices, their
-timing, numerical results and original-source provenance are preserved.
-
-The numerical algorithms, classifier options, defaults and runtime dependencies
-are unchanged. Python 3.11 or later is required. Chang Cheng's original work
-remains All Rights Reserved, with separate third-party notices preserved.
-See the [0.3.0 release notes](release-0.3.0.md) for current numerical behavior
-and the SPA training-coordinate migration.
+Python 3.11 or later is required. Chang Cheng's original work remains All Rights
+Reserved, with separate third-party notices preserved. See the
+[0.3.0 release notes](release-0.3.0.md) for numerical behavior and the SPA
+training-coordinate migration.
 
 ```shell
 python -m pip install --upgrade supervised_nmf-0.3.2-py3-none-any.whl
 ```
 
-Build-verification results accompany the GitHub release. No new dataset study
-was run for this patch.
+[GitHub CI](https://github.com/cheng338/supervised-nmf/actions/runs/39535516660)
+passed on Windows and Ubuntu with Python 3.11 and 3.12, with 353 tests passing
+in each environment. Both the wheel and source archive were built and checked.
+Checksums and build evidence accompany the release. No new dataset study was
+run for this patch.

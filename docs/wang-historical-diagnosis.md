@@ -144,11 +144,13 @@ historical-data follow-up has not been executed** following the user's steering
 to investigate direct BLAS performance. It must retain its separate protocol
 and results if subsequently run; it is not part of the results above.
 
-The completed initial workflow can be regenerated into a new directory with:
+The historical local workflow used `scripts/diagnose_historical_nmf.py` with
+the output argument below. That study script and its original machine-specific
+invocation are retained locally, outside the public distribution. This records
+the workflow configuration; it is not an executable example for this checkout.
 
-```powershell
-& 'C:/Users/manea/.conda/envs/py12_df_aocl/python.exe' `
-  scripts/diagnose_historical_nmf.py --output runs/NEW-HISTORICAL-DIAGNOSTIC
+```text
+scripts/diagnose_historical_nmf.py --output runs/NEW-HISTORICAL-DIAGNOSTIC
 ```
 
 Existing output directories are protected from replacement. Measured stage

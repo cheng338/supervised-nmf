@@ -1,6 +1,6 @@
 # API reference
 
-This page describes version 0.3.0. Optional KNN SD scaling and the linear-SVM
+This page describes version 0.3.1. Optional KNN SD scaling and the linear-SVM
 head are included, with completed integration checks on Robust. They are not
 available in the 0.2.0 wheel. Historical release and validation records remain
 separate.

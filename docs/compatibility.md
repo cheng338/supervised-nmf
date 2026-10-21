@@ -9,10 +9,13 @@ validation plans without changing the numerical algorithms or reducing
 performance to accommodate an older runtime.
 
 The declared minimum is an installation requirement, not a claim that a new
-validation run has been completed on every eligible Python version. Confirm
-with Chang Cheng whether to use the local PC or Robust before running tests,
-smoke checks, numerical checks, benchmarks, or studies. Robust's default
-compute budget is 20 total threads across workers and native numerical threads.
+validation run has been completed on every eligible Python version.
+
+For maintainer-managed validation, confirm with Chang Cheng whether to use the
+local PC or Robust before running tests, smoke checks, numerical checks,
+benchmarks, or studies. Robust's default compute budget is 20 total threads
+across workers and native numerical threads. These are maintainer operating
+rules; they do not impose machine or permission requirements on package users.
 
 Existing releases, frozen Python 3.10 bundles, requirements, and receipts remain
 historical records. Their original support declarations and results are not
@@ -90,7 +93,8 @@ python -m pip install --no-deps .
 ```
 
 This command does not install missing dependencies or validate the environment.
-Confirm the validation machine before checking installed behavior and timing.
+Maintainers must confirm the validation machine before checking installed
+behavior and timing for the project.
 Image-loading examples additionally require Pillow, and plotting requires
 Matplotlib.
 
@@ -107,8 +111,9 @@ python -m pip install --no-deps .
 
 These pins do not reproduce the Windows AOCL binaries on Linux. Record the
 actual BLAS libraries and thread configuration, and assess performance in the
-chosen environment after the required location confirmation. Do not replace
-the working `py12_df_aocl` numerical stack merely to match another machine.
+chosen environment. Maintainer validation requires the location confirmation
+above; preserve the working `py12_df_aocl` numerical stack rather than replacing
+it merely to match another machine.
 
 ## Historical version 0.2.0 validation
 
@@ -118,4 +123,4 @@ for the released 0.2.0 source: 370 tests passed on Windows Python 3.12 and
 Python 3.10. Earlier Linux Python 3.12 checks covered projection and thresholds;
 the final workspace-lifetime change was checked on Windows. These are historical
 results, not validation of the current modified source. The current Python
-3.11 minimum and machine-confirmation requirement above remain in force.
+3.11 minimum and maintainer machine-confirmation requirement above remain in force.

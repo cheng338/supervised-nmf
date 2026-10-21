@@ -255,10 +255,14 @@ draws, preserves the original t-interval tables, and changes no fitted models.
 
 ## Reproduction
 
-```powershell
-& 'C:/Users/manea/.conda/envs/py12_df_aocl/python.exe' `
-  scripts/validate_wang_simulations.py --retune --seed-offset 40000000 `
-  --study-id wang-simulations-blas-20261006 `
+The historical local workflow used the script and arguments below. The script
+and original machine-specific invocation are retained locally, outside the
+public distribution. This is a configuration record, not a runnable example
+provided by this checkout.
+
+```text
+scripts/validate_wang_simulations.py --retune --seed-offset 40000000
+  --study-id wang-simulations-blas-20261006
   --output runs/wang-simulations-blas-20261006
 ```
 

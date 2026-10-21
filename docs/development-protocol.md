@@ -4,9 +4,13 @@ Author: Chang Cheng.
 
 ## Current project rules — October 20, 2026
 
-The author added the following rules, also recorded in the repository's
-[AGENTS.md](../AGENTS.md). They govern future work and supersede conflicting
+The author added the following maintainer rules, also recorded in the
+repository's [AGENTS.md](https://github.com/cheng338/supervised-nmf/blob/main/AGENTS.md).
+They govern author-managed development and validation and supersede conflicting
 earlier practices; historical configurations and results remain unchanged.
+The machine-confirmation and hardware-budget rules apply to maintainer work,
+not to a user's installation or use of the package. AGENTS.md is repository
+guidance and is not included in the source distribution.
 
 1. A minor gain or loss in predictive performance or execution speed does not
    automatically determine whether to accept, reject, or offer a proposed fix
@@ -52,10 +56,9 @@ Supervised Nonnegative Matrix Factorization for Classification*. The package
 implements its supervised NMF methodology. Citing the full dissertation title
 does not incorporate the separate DWD methodology into this package.
 
-The author selected GitHub-hosted CI for this publication update, after the
-repository becomes public. Use standard public runners; do not start a private
-repository CI run while the private Actions allowance is exhausted. Future
-validation batches remain subject to the machine-confirmation rule above.
+The public repository uses standard GitHub-hosted runners for CI. New
+maintainer validation batches remain subject to the machine-confirmation rule
+above.
 
 ## Classifier scope decision — October 20, 2026
 

@@ -89,11 +89,11 @@ model evaluation; an unqualified method remains an explicit missing result.
 
 ## Reporting scope
 
-Present accuracy, total final-fit time and total prediction time as three chat
-tables. Timings include preprocessing, exclude tuning and equivalence refits,
-and use one native numerical thread. Retain tuning cost separately. Different
-selected dimensions and ranks make these pipeline workload measurements, not
-an isolated solver-speed benchmark.
+The report presents accuracy, total final-fit time and total prediction time
+in three separate tables. Timings include preprocessing, exclude tuning and
+equivalence refits, and use one native numerical thread. Tuning cost is retained
+separately. Different selected dimensions and ranks make these pipeline workload
+measurements, not an isolated solver-speed benchmark.
 
 Save balanced accuracy, class recalls, confusion counts, AUC, average precision,
 warnings, settings and predictions as supporting evidence. Label-independent

@@ -258,27 +258,25 @@ copies for training and incoming data. Separate stage attribution is therefore
 coarse; the retained per-case total wall times are the appropriate end-to-end
 cost record.
 
-The BLAS review inspected installed DWD 1.3.8 and ensemble-DWD 0.3.3, plus the
-user's [two-stage SGD-DWD native adapter](https://github.com/cheng338/two-stage-sgd-dwd/blob/main/src/two_stage_sgd_dwd/sgd_accel.c).
-That adapter validates the optional SciPy `ddot` capsule and float64 contiguous
-vector contract, preserving NumPy dispatch for unsupported layouts or exceptional
-arithmetic. DWD reuses LAPACK factors and respects the caller's active BLAS thread
-budget in its optional compiled residual arithmetic. These patterns motivate
-targeted kernel calls, layout reuse, numerical equivalence checks and explicit
-thread limits. The successor sNMF implementation uses SciPy's public `dgemv` and
+The successor sNMF implementation uses SciPy's public `dgemv` and
 `dger` wrappers for SPA updates and prepares the fixed NNLS basis layout once;
-it retains the same estimator and prediction conventions.
+it retains the same estimator and prediction conventions at that revision.
+The [BLAS implementation report](blas-optimization.md) records the numerical
+equivalence checks, thread limits and public SciPy references.
 
 ## Reproduction and artifacts
 
-From the repository root in PowerShell:
+The historical workflow used the following local test target, study scripts
+and arguments, with `PYTHONPATH=src`. These study tools are retained locally
+and are not shipped in the public distribution. The original machine-specific
+invocations are preserved with the local study record; this list documents
+their configuration rather than providing runnable checkout examples.
 
-```powershell
-$env:PYTHONPATH = 'src'
-& 'C:/Users/manea/.conda/envs/py12_df_aocl/python.exe' -m unittest discover -s tests -p test_wang_real_validation.py -v
-& 'C:/Users/manea/.conda/envs/py12_df_aocl/python.exe' scripts/validate_wang_real_data.py --output runs/wang-real-blas-20261006 --workers 6 --phase all
-& 'C:/Users/manea/.conda/envs/py12_df_aocl/python.exe' scripts/validate_wang_real_data.py --output runs/wang-real-retuned-blas-20261006 --workers 6 --design fully_retuned --repetitions 10 --phase all
-& 'C:/Users/manea/.conda/envs/py12_df_aocl/python.exe' scripts/report_wang_real_validation.py runs/wang-real-blas-20261006 runs/wang-real-retuned-blas-20261006
+```text
+unittest discover -s tests -p test_wang_real_validation.py -v
+scripts/validate_wang_real_data.py --output runs/wang-real-blas-20261006 --workers 6 --phase all
+scripts/validate_wang_real_data.py --output runs/wang-real-retuned-blas-20261006 --workers 6 --design fully_retuned --repetitions 10 --phase all
+scripts/report_wang_real_validation.py runs/wang-real-blas-20261006 runs/wang-real-retuned-blas-20261006
 ```
 
 Existing compatible checkpoints are reused; changed frozen source is rejected.

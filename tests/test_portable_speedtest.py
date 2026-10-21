@@ -278,7 +278,8 @@ class PortableManifestTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="snmf-manifest-test-")
         self.addCleanup(self.temporary.cleanup)
-        self.bundle = Path(self.temporary.name) / "bundle"
+        # Match benchmark.ROOT, which is resolved when the module is loaded.
+        self.bundle = (Path(self.temporary.name) / "bundle").resolve()
         self.bundle.mkdir()
         self.payloads = {"benchmark.py": b"# runner\n", "compare.py": b"# compare\n",
                          "check_compatibility.py": b"# compatibility\n", "sweep.py": b"# sweep\n",

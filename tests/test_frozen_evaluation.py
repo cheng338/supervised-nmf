@@ -97,7 +97,7 @@ class FrozenEvaluationGates(unittest.TestCase):
                     "source_files": {"attributes": {"path": "old location", "sha256": final._sha(attributes)},
                                      "partitions": {"path": "old location", "sha256": final._sha(partitions)}}}}
         checked = final._data_sources(manifest, self.root, attributes, partitions)
-        self.assertEqual(checked["attributes"]["path"], str(attributes))
+        self.assertEqual(checked["attributes"]["path"], str(attributes.resolve()))
         partitions.write_text("changed split")
         with self.assertRaisesRegex(ValueError, "data definition exactly"):
             final._data_sources(manifest, self.root, attributes, partitions)

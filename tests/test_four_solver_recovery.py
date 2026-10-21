@@ -206,7 +206,7 @@ class RecoveryTests(unittest.TestCase):
             commands = [call.args[0] for call in launch.call_args_list]
             self.assertEqual(len(commands), 5)
             self.assertEqual([commands[index][commands[index].index("--protocol") + 1] for index in range(4)],
-                             [str(fashion), str(celeba), str(fashion), str(celeba)])
+                             [str(path.resolve()) for path in (fashion, celeba, fashion, celeba)])
             self.assertTrue(all(call.kwargs["env"]["PYTHONFAULTHANDLER"] == "1" for call in launch.call_args_list))
             state = recovery.read_record(root / "status.json", {}, envelope=False)
             self.assertEqual(state["error_dialog_policy"], orchestration.ERROR_DIALOG_POLICY)
@@ -239,7 +239,8 @@ class RecoveryTests(unittest.TestCase):
 
     def test_report_binds_inherited_receipt_bytes_and_excludes_bpp(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            # write_report resolves the run before calling this helper.
+            root = Path(directory).resolve()
             destination = root / "fashion/task-cd/c0000/identity.json"
             destination.parent.mkdir(parents=True)
             destination.write_text('{"saved": "original bytes"}', encoding="utf-8")

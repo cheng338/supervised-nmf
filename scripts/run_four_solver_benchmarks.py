@@ -128,7 +128,7 @@ def freeze_run(output, fashion_protocol=DEFAULT_FASHION_PROTOCOL, celeba_protoco
 
 def run(output, fashion_protocol=DEFAULT_FASHION_PROTOCOL, celeba_protocol=DEFAULT_CELEBA_PROTOCOL):
     if Path(sys.prefix).name != "py12_df_aocl":
-        raise RuntimeError("Use the author-requested py12_df_aocl conda environment.")
+        raise RuntimeError("This historical benchmark study requires the py12_df_aocl conda environment.")
     output = Path(output).resolve()
     freeze = freeze_run(output, fashion_protocol, celeba_protocol)
     identity = freeze["files"]

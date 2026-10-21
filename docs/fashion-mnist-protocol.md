@@ -84,7 +84,7 @@ Screened PCA, screening-only KNN and raw KNN are independently tuned on all thre
 rank, cutoff and neighbor values above. They do not enter the NMF solver decision.
 No linear classifier is introduced.
 
-The run uses conda `py12_df_aocl`, up to eight worker processes, and one native
+The run uses Python 3.12 with AOCL, up to eight worker processes, and one native
 numerical thread per fit. CD and SPA retain the existing 20,000-iteration
 allowance; CD retains tolerance 1e-4. MU and ANLS-BPP configuration and their
 inner/outer stopping rules are bound in the executable protocol and source freeze.

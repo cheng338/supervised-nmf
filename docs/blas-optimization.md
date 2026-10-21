@@ -87,7 +87,7 @@ python scripts/benchmark_spa_blas.py `
 
 ## Study provenance
 
-The user requested this investigation while the Wang validation was running.
+This investigation began while the Wang validation was running.
 The old source snapshots, partial runs and protocols are preserved. Their
 timings are measurements of the old implementation. Source-sensitive study
 checkpoints must not be silently resumed or relabeled under the optimized

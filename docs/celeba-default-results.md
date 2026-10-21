@@ -67,7 +67,7 @@ reported above, still within the previously specified one-point tolerance.
 
 ## Time, numerical allowance and imbalance
 
-Runs used conda `py12_df_aocl` and one native numerical thread per fit. CV used up
+Runs used Python 3.12 with AOCL and one native numerical thread per fit. CV used up
 to eight workers. The serial pass ran after CV and audit processes finished, with
 one worker and a recorded randomized method order within each case. Each case's
 cost is the median of three **fit + prediction** sums. The table above then takes

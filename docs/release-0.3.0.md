@@ -89,7 +89,7 @@ and [calibration API](api.md).
 
 ## Validation and limitations
 
-The October 20 integration was validated on Robust under a budget of 20 total
+The October 20 integration was validated on the validation host under a budget of 20 total
 compute threads. The recorded integration includes 260 regression checks,
 original-trigger numerical replays, classifier/serialization checks and
 matched KNN and residual comparisons. A subsequent comparison against the
@@ -140,7 +140,7 @@ future build or every supported dependency combination.
 
 ## Compatibility and installation
 
-Python **3.11 or later** is required. Python 3.12 in `py12_df_aocl` remains the
+Python **3.11 or later** is required. Python 3.12 with AOCL remains the
 primary development environment. Python 3.10 support ended on October 20;
 its previous release assets and test results remain historical records.
 The package wheel is pure Python; the installed NumPy/SciPy distributions

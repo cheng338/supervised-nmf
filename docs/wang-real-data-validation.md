@@ -11,7 +11,7 @@ and tests the choice between KNN and a parametric logistic classifier. It is a
 development validation study; it cannot establish person-independent accuracy or
 the conditional theoretical assumptions of the dissertation.
 
-The initial run was paused at the user's request before validation predictions
+The initial run was paused before validation predictions
 to investigate BLAS acceleration. Its 109 completed CV checkpoints and source
 snapshot remain under `runs/wang-real-20261006/`; it produced no validation
 outcomes. After the numerical implementation passed equivalence tests, fresh

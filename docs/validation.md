@@ -2,7 +2,7 @@
 
 Records through October 6, 2026. Author: Chang Cheng.
 
-Environment: conda `py12_df_aocl`, Python 3.12.14, NumPy 2.5.2,
+Environment: Python 3.12.14, NumPy 2.5.2,
 SciPy 1.18.0, scikit-learn 1.9.0, threadpoolctl 3.5.0, AOCL-BLAS 5.2.0,
 Windows. Comparison execution explicitly limited numerical libraries to one
 thread. These results do not establish compatibility with every allowed version.
@@ -64,7 +64,7 @@ thread. These results do not establish compatibility with every allowed version.
   and checks; build and wheel logs use the `tmp/wang-final-` prefix. These are
   local artifacts, with no package publication.
 - At the initial [SPA BLAS optimization](blas-optimization.md) revision, all **300 tests**
-  passed in `py12_df_aocl` (61.257 seconds) and the exact Python 3.10.12
+  passed in the primary Python 3.12/AOCL environment (61.257 seconds) and the exact Python 3.10.12
   compatibility environment (58.437 seconds). The seven dedicated numerical
   regression tests cover the former NumPy/NNLS algorithm, layouts, ties,
   ill-conditioning, mutation, iteration failures and both final classifiers.
@@ -75,7 +75,7 @@ thread. These results do not establish compatibility with every allowed version.
   and `tmp/blas-full-check-robust.log`.
 - Version **0.1.0a1** adds optional logistic regression while retaining
   SPA, absolute screening and KNN as defaults. The complete suite passed
-  **281 tests in 59.991 seconds** in `py12_df_aocl` and **281 tests in
+  **281 tests in 59.991 seconds** in the primary Python 3.12/AOCL environment and **281 tests in
   57.313 seconds** under Windows 11 with Python 3.10.12, NumPy 2.2.6,
   SciPy 1.15.3, scikit-learn 1.7.0, joblib 1.5.1 and threadpoolctl 3.6.0.
   Pillow 12.3.0 enabled the image-loader fixtures in the latter environment.
@@ -186,7 +186,7 @@ of the 1,000 official-test identities. Training image IDs are fresh relative to
 prior caches; training identities may recur. The historical uncertainty about
 partial in-memory test decoding in an abandoned attempt remains disclosed.
 
-The user's request for broader KNN tuning superseded the first coarse calibration
+Broader KNN tuning superseded the first coarse calibration
 before any new test access. The dense successor offers every integer K from 1 to
 101, plus 125, 151 and 201, to all four methods. Five-fold training-only tuning
 and one local refinement produced 4,690 candidates and 23,450 candidate-fold
@@ -527,7 +527,7 @@ remains `selected_for_audit`; official test data were not evaluated.
 
 ## October 20 approved source integration
 
-The integration batch was authorized on Robust with a total budget of 20 compute
+The integration batch ran on the validation host with a total budget of 20 compute
 threads and Python 3.12. Numerical stages run sequentially; one-thread and
 20-thread measurements are separate. No local numerical checks were run.
 Historical study and release results above retain their original source.

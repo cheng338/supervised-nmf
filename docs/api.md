@@ -1,9 +1,9 @@
 # API reference
 
-This page describes version 0.3.1. Optional KNN SD scaling and the linear-SVM
-head are included, with completed integration checks on Robust. They are not
-available in the 0.2.0 wheel. Historical release and validation records remain
-separate.
+This page describes version 0.3.2. Optional KNN SD scaling and the linear-SVM
+head are included, with completed integration checks on the validation host.
+They are not available in the 0.2.0 wheel. Historical release and validation
+records remain separate.
 
 ## Classifier
 
@@ -452,7 +452,7 @@ For large, low-rank float64 fits, report-only reconstruction norms may use
 rows by 1,024–4,096 features, rank is 1–32, and all detected BLAS pools are
 one-thread MKL. Other cases retain the original full-product expression.
 The blocks affect diagnostics only, not fitting, stopping or the prediction
-map. Their timing qualification is specific to the measured Robust workloads;
+map. Their timing qualification is specific to the measured validation workloads;
 AOCL/BLIS and other backends retain the existing path.
 
 Checksummed fold records can be reused only with matching data, folds, grid,
@@ -492,9 +492,9 @@ small synthetic subject-separated example.
 ## Local CelebA data
 
 ```powershell
-python examples/celeba_classification.py --dir D:/datasets/img_align_celeba `
-  --attributes D:/datasets/list_attr_celeba.txt `
-  --partitions D:/datasets/list_eval_partition.txt `
+python examples/celeba_classification.py --dir PATH/img_align_celeba `
+  --attributes PATH/list_attr_celeba.txt `
+  --partitions PATH/list_eval_partition.txt `
   --attribute Smiling --quick
 ```
 

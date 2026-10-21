@@ -29,7 +29,7 @@ All six evaluations are qualified. Screening uses an absolute feature-score cuto
 
 ## What the dissertation and preserved scripts contain
 
-The local dissertation text (retained locally: `../tmp/reference-docs/dissertation-main.txt`), Section 7.2.2, explicitly includes full-feature unsupervised NMF fitted by coordinate descent, followed by downstream KNN, as one of the simulation comparisons. Section 7.3.2 and Table 7.2 include standard unsupervised NMF in the CelebA comparison alongside raw KNN and supervised NMF. That baseline was not absent from the dissertation or outside the user's requested scientific context.
+Chang Cheng's dissertation, Section 7.2.2, explicitly includes full-feature unsupervised NMF fitted by coordinate descent, followed by downstream KNN, as one of the simulation comparisons. Section 7.3.2 and Table 7.2 include standard unsupervised NMF in the CelebA comparison alongside raw KNN and supervised NMF. The baseline is therefore part of the dissertation's comparison design.
 
 The preserved [CelebA script](../provenance/original/snmf_am.py), in its standard-NMF block at lines 289–313, implements:
 
@@ -38,7 +38,7 @@ The preserved [CelebA script](../provenance/original/snmf_am.py), in its standar
 - A rank inherited as `optimal_K` from the supervised search, followed by three-neighbor KNN.
 - `fit_transform` coordinates for training and fixed-basis `transform` coordinates for the test set.
 
-The preserved [simulation script](../provenance/original/sim.py) likewise includes the standard-NMF comparison; the simulation uses five-neighbor classification. The different K values in the face and simulation sources should not be conflated. The experiment-study draft (retained locally: `../tmp/reference-docs/Supervised-NMF-Experiment-Study-Draft.md`) also expressly calls for independently tuning standard NMF rather than borrowing the supervised rank.
+The preserved [simulation script](../provenance/original/sim.py) likewise includes the standard-NMF comparison; the simulation uses five-neighbor classification. The different K values in the face and simulation sources should not be conflated. The *Supervised NMF Experiment Study Draft* also expressly calls for independently tuning standard NMF rather than borrowing the supervised rank.
 
 The previous face validation focused on screened SPA, screened PCA, screening-only KNN, and raw KNN. Those controls addressed useful comparisons but left the dissertation's unscreened NMF baseline missing. Adding only an unscreened SPA row would still not restore the dissertation's coordinate-descent baseline; the two supplemental rows address different questions.
 

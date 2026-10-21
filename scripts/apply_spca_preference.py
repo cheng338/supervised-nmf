@@ -59,13 +59,10 @@ def amendment_rule():
     return {
         "schema_version": 1, "author": "Chang Cheng", "amendment_id": "supervised-pca-screening-preference-v1",
         "timing_of_preference": "Disclosed after development results; not preregistered. Before official-test predictions or outcomes, per chronology audit.",
-        "user_requests": [
-            {"type": "verbatim author screening preference",
-             "text": "If only a narrow lead, we should be as close to supervised PCA as possible in terms of percentile/absolute value choice."},
-            {"type": "verbatim author theory-review request",
-             "text": "Look at the 4 theoretical proofs I provided in the dissertation. The CD or PCA choice should also look at the difficulties of theoretical validation. Also refer to Wang's comments if necessary."},
-            {"type": "verbatim author solver clarification",
-             "text": "Yes—CD versus SPA"},
+        "decision_context": [
+            "Narrow predictive differences favor alignment with supervised PCA's absolute-score screening, subject to the unchanged accuracy gate.",
+            "The theoretical review considers the dissertation's four proofs, Wang's comments and the difficulty of establishing the required assumptions for each solver and screening choice.",
+            "The solver comparison is coordinate descent (CD) versus successive projection (SPA).",
         ],
         "rule": [
             "Retain original all-case numerical qualification and compute original global accuracy gate against all qualified methods.",
@@ -114,9 +111,10 @@ def markdown(report):
     lines = ["# CelebA default: disclosed screening-preference amendment", "", "Author: Chang Cheng.", "",
              f"**Selected combination: {selector.LABELS.get(winner, 'No qualified method')}.**", "",
              "The original automatic decision selected SPA + percentile. It remains unchanged in its original directory. "
-             "After reviewing development results, the author requested closer alignment with supervised PCA's absolute-score screening "
-             "when predictive differences are narrow, and asked that both theoretical proof routes accommodate the compared estimators. "
-             "This is a disclosed preference amendment, not a preregistered preference or a new experiment.", "",
+             "After development results were reviewed, the screening preference was amended to favor supervised PCA's absolute-score approach "
+             "when predictive differences are narrow. The accompanying theoretical review considers the dissertation's four proofs and Wang's "
+             "comments for the CD-versus-SPA comparison. This preference was disclosed before official-test predictions or outcomes; "
+             "it was not preregistered and introduces no new experiment.", "",
              "The unchanged global gate permits at most 1 percentage point of macro balanced-accuracy regret and 2 points for either "
              "attribute, relative to the best of all operationally qualified methods. Among methods passing that gate, absolute screening "
              "is preferred before the unchanged cost rule. All four methods remain in cost normalization. No accuracy equivalence is claimed.", "",
@@ -201,7 +199,7 @@ def write_amendment(original_path, protocol_path, chronology_path, output):
                   original_decision=str(original_path), original_decision_sha256=sha(original_path),
                   amendment_rule=rule, chronology_audit=str(chronology_path), chronology_sha256=sha(chronology_path),
                   amendment_source_sha256=sha(__file__), original_decision_preserved=True,
-                  interpretation="Author-requested post-development preference amendment; theoretical routes remain conditional.",
+                  interpretation="Disclosed post-development preference amendment before official-test outcomes; theoretical routes remain conditional.",
                   test_outcomes_used_for_selection=False, final_test_evaluated=False, package_defaults_modified=False)
     output.mkdir(parents=True, exist_ok=True)
     rule_path = output / "amendment-rule.json"

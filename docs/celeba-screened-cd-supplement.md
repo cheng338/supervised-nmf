@@ -29,7 +29,7 @@ The complete comparison figure is available as PNG (retained locally: `../runs/c
 
 ## Why screened CD belongs in the comparison
 
-The local dissertation text (retained locally: `../tmp/reference-docs/dissertation-main.txt`), Chapter 7's methodology and Section 7.3.2, describes CD with NNDSVDa initialization for the supervised NMF experiments, followed by Euclidean KNN on the fitted nonnegative coefficients. It also says that both the supervised and standard unsupervised NMF face pipelines used CD. Thus screened CD is directly relevant to the dissertation's method, not just another arbitrary benchmark.
+Chang Cheng's dissertation, Chapter 7's methodology and Section 7.3.2, describes CD with NNDSVDa initialization for the supervised NMF experiments, followed by Euclidean KNN on the fitted nonnegative coefficients. It also says that both the supervised and standard unsupervised NMF face pipelines used CD. Thus screened CD is directly relevant to the dissertation's method, not just another arbitrary benchmark.
 
 The [preserved CelebA implementation](../provenance/original/snmf_am.py), lines 193–206 and 255–275, confirms this: its training pipeline uses `SelectPercentile(score_func=f_classif)`, CD NMF with NNDSVDa initialization, and KNN with three neighbors. The final supervised fit uses the selected percentile and rank, `max_iter=400`, and seed 42. The current package's primary face result instead uses FeatureSPA and an absolute feature-score cutoff. The earlier unscreened CD supplement restored the dissertation's standard unsupervised baseline; the present addition separately restores its supervised factorization family.
 

@@ -1,6 +1,6 @@
 """Report a completed explicit CelebA study without fitting or selecting models.
 
-Author: Chang Cheng. Run in the py12_df_aocl environment. Matplotlib and
+Author: Chang Cheng. Matplotlib and
 scikit-learn are used only to draw and verify saved development predictions.
 """
 
@@ -557,7 +557,7 @@ def markdown_report(summary, figures):
               "No algorithmic speed advantage is inferred from these timings.", "",
               "`summary.json` records all input SHA-256 hashes, the reporter hash, reporting software versions, "
               "the declared grid, selected parameters, full refinement diagnostics, and numerical warning counts. "
-              "Regenerate with `python scripts/report_celeba_study.py RUN_DIRECTORY --scan-folds` in `py12_df_aocl`. "
+              "Regenerate with `python scripts/report_celeba_study.py RUN_DIRECTORY --scan-folds`. "
               "The script reads saved results and does not fit models, load images, or alter the study.", ""]
     transition = summary["execution_transition"]
     if transition:

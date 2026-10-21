@@ -29,9 +29,9 @@ See [CITATION.cff](CITATION.cff) for citation details and
 Version **0.3.0** adds a common SPA training/prediction coordinate map,
 optional SD-scaled KNN and linear SVM, and numerical and execution safeguards.
 See the [0.3.0 release notes](docs/release-0.3.0.md) for migration and validation limits.
-The current release, **0.3.1**, removes the separate PC speedtest and its tests
-from the source distribution. The classification implementation is unchanged;
-see the [0.3.1 release notes](docs/release-0.3.1.md).
+The current release, **0.3.2**, simplifies packaging and edits the research
+documentation. The classification implementation is unchanged;
+see the [0.3.2 release notes](docs/release-0.3.2.md).
 
 **Copyright (c) 2026 Chang Cheng. All Rights Reserved.** A distribution license
 has not yet been selected. Public availability of this repository does not
@@ -40,20 +40,20 @@ applicable [third-party notices](THIRD_PARTY_NOTICES).
 
 # Installation
 
-Python 3.11 or later is required for version 0.3.1. Python 3.10 support
+Python 3.11 or later is required for version 0.3.2. Python 3.10 support
 ended on October 20, 2026. Dependencies are NumPy, SciPy, scikit-learn
 1.6 or later (below 2.0), threadpoolctl, and joblib 1.3 or later.
 Download the wheel from the [GitHub releases](https://github.com/cheng338/supervised-nmf/releases)
 and install it:
 
 ```shell
-python -m pip install --upgrade supervised_nmf-0.3.1-py3-none-any.whl
+python -m pip install --upgrade supervised_nmf-0.3.2-py3-none-any.whl
 ```
 
 To install the release from source:
 
 ```shell
-git clone --branch v0.3.1 https://github.com/cheng338/supervised-nmf.git
+git clone --branch v0.3.2 https://github.com/cheng338/supervised-nmf.git
 cd supervised-nmf
 python -m pip install .
 ```
@@ -69,7 +69,7 @@ python -m pip install ".[study]"
 The study extra also includes Matplotlib. Use `python -m pip install -e .`
 for an editable development installation. Tested environments and remaining
 compatibility checks are listed in [validation](docs/validation.md).
-Python 3.12 in `py12_df_aocl` remains the primary development environment.
+Python 3.12 with AOCL remains the primary development environment.
 See [runtime compatibility](docs/compatibility.md) for the current setup policy
 and historical numerical profiles. Earlier Python 3.10 test results describe
 their recorded revisions, not support for current development.
@@ -384,7 +384,7 @@ are outside this release.
 
 # Tests and local builds
 
-From the version 0.3.1 source checkout, with dependencies and build tools installed:
+From the version 0.3.2 source checkout, with dependencies and build tools installed:
 
 ```shell
 python scripts/check.py
@@ -392,12 +392,7 @@ python scripts/build_release.py
 python -I scripts/check_wheel.py
 ```
 
-The build produces `dist/supervised_nmf-0.3.1-py3-none-any.whl` and a source
+The build produces `dist/supervised_nmf-0.3.2-py3-none-any.whl` and a source
 archive. The wheel check verifies
 imports, authorship metadata, SPA/MU/CD fitting and prediction, and archive
 contents. It does not publish a release.
-
-Source releases use the explicit file list in `MANIFEST.in`. When maintaining
-the package, add new public source or supporting files to that list. The
-distribution check also rebuilds from the source archive without Git metadata
-and checks that unlisted local files stay excluded.

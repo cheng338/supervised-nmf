@@ -45,7 +45,7 @@ predictions and factors are preserved in
 `runs/wang-historical-20261006/`. The initial source snapshot is
 `diagnostic-source.py` within that directory.
 
-The current environment is `py12_df_aocl`: NumPy 2.5.2, SciPy 1.18.0 and
+The diagnostic used the primary Python 3.12/AOCL environment: NumPy 2.5.2, SciPy 1.18.0 and
 scikit-learn 1.9.0. One process and one numerical thread were used. The original
 script allowed all KNN threads and did not pin its historical libraries or
 BLAS. Historical raw predictions, arrays, CV receipts and exact versions are
@@ -140,8 +140,8 @@ A disclosed exact rank-two NNLS follow-up is implemented behind
 `--exact-fixed-basis`. Its active-set solver passed 75 synthetic comparisons
 against `scipy.optimize.nnls`, including zero and boundary solutions, with
 maximum per-row relative projected-gradient residual below 1.3e-16. **The
-historical-data follow-up has not been executed** following the user's steering
-to investigate direct BLAS performance. It must retain its separate protocol
+historical-data follow-up has not been executed** because the investigation
+shifted to direct BLAS performance. It must retain its separate protocol
 and results if subsequently run; it is not part of the results above.
 
 The historical local workflow used `scripts/diagnose_historical_nmf.py` with

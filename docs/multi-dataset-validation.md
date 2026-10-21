@@ -104,8 +104,7 @@ avoid treating CV folds or multiple methods as independent dataset replications.
 
 FEI is research-only and its images must not be redistributed. The University
 of Stirling provides an [authorized mirror](https://pics.stir.ac.uk/Other_face_databases.htm).
-Source images stay in the ignored local data cache; neither report panels nor
-face-image galleries are opened automatically.
+Source images stay in the ignored local data cache.
 
 ## Implementation evidence
 

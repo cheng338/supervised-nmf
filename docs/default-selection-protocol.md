@@ -114,7 +114,7 @@ history and does not enter that decision's averages.
 
 ## Measuring time
 
-Use `py12_df_aocl`, one native numerical thread per fit, the same machine and package
+Use Python 3.12 with AOCL, one native numerical thread per fit, the same machine and package
 versions. The CV pool may use up to eight workers. Preserve unique representation
 attempts, successful and failed committed costs, KNN costs, and interruption history.
 Summed CV worker wall time is **recorded tuning compute**, not isolated elapsed time

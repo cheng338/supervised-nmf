@@ -1,7 +1,8 @@
 """Build a local wheel and source archive with the current environment.
 
 This does not install packages or publish anything. Build dependencies must
-already be available, or use `python -m pip wheel .` in an authorized environment.
+already be available, or use `python -m pip wheel .` to install them in an isolated
+build environment.
 """
 
 import os

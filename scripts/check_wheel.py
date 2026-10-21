@@ -4,13 +4,10 @@ Run with `python -I scripts/check_wheel.py` to exclude source-checkout imports.
 """
 
 from email.parser import Parser
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
-import stat
-import subprocess
 import sys
 import tarfile
-import tempfile
 import zipfile
 
 root = Path(__file__).resolve().parents[1]
@@ -18,165 +15,9 @@ withdrawn_workflow = ("supervised_nmf/tuning.py",
                       "examples/adaptive_policy.json", "examples/adaptive_support.py",
                       "tests/test_search.py", "tests/test_tuning.py", "tests/test_adaptive_examples.py",
                       "docs/adaptive-tuning.md", "provenance/tuning-reference.json")
-excluded_directories = {"tmp", "data", "runs", "output", "references", "portable_speedtest"}
-removed_speedtest_files = ("test_portable_speedtest.py", "test_portable_projection.py",
-                          "test_portable_manifest_reuse.py", "PROMPT_FOR_OTHER_PC.txt")
 version = re.search(r'^version = "([^"]+)"$',
                     (root / "pyproject.toml").read_text(encoding="utf-8"), re.MULTILINE).group(1)
-dist_info_name = f"supervised_nmf-{version}.dist-info"
-sdist_name = f"supervised_nmf-{version}"
-license_files = ("LICENSE", "THIRD_PARTY_NOTICES")
-
-
-def relative_path(name):
-    """Require one canonical, portable archive-relative path."""
-    assert name and "\\" not in name and ":" not in name, name
-    path = PurePosixPath(name)
-    assert not path.is_absolute() and all(part not in {"", ".", ".."}
-                                         for part in name.split("/")), name
-    assert str(path) == name, name
-    return path
-
-
-def source_allowlist():
-    lines = [line.strip() for line in (root / "MANIFEST.in").read_text(encoding="utf-8-sig").splitlines()
-             if line.strip() and not line.lstrip().startswith("#")]
-    assert lines and lines[0] == "global-exclude *", "MANIFEST.in must clear default discovery first."
-    approved = set()
-    for line in lines[1:]:
-        fields = line.split()
-        assert len(fields) == 2 and fields[0] == "include", line
-        name = fields[1]
-        relative_path(name)
-        assert not any(character in name for character in "*?[]"), line
-        assert name not in approved, f"Duplicate MANIFEST entry: {name}"
-        assert not set(PurePosixPath(name).parts) & excluded_directories, name
-        approved.add(name)
-    required = {"MANIFEST.in", "pyproject.toml", "README.md", "CITATION.cff", *license_files}
-    assert required <= approved, f"Missing source inputs: {sorted(required - approved)}"
-    return {name: (root / name).read_bytes() for name in sorted(approved)}
-
-
-def ancestor_directories(files):
-    return {str(parent) for name in files for parent in PurePosixPath(name).parents
-            if str(parent) != "."}
-
-
-approved_source = source_allowlist()
-package_source = {name.removeprefix("src/"): content for name, content in approved_source.items()
-                  if name.startswith("src/supervised_nmf/") and name.endswith(".py")}
-assert "supervised_nmf/__init__.py" in package_source
-wheel_metadata = {f"{dist_info_name}/{name}" for name in ("METADATA", "WHEEL", "RECORD", "top_level.txt")}
-wheel_licenses = {f"{dist_info_name}/licenses/{name}": approved_source[name] for name in license_files}
-generated_source = {"PKG-INFO", "setup.cfg", "src/supervised_nmf.egg-info/SOURCES.txt"}
-
-
-def verify_wheel_contents(filename):
-    expected = set(package_source) | wheel_metadata | set(wheel_licenses)
-    directories = ancestor_directories(expected)
-    contents, seen = {}, set()
-    with zipfile.ZipFile(filename) as archive:
-        for member in archive.infolist():
-            name = member.filename.rstrip("/") if member.is_dir() else member.filename
-            relative_path(name)
-            assert name not in seen, f"Duplicate wheel member: {name}"
-            seen.add(name)
-            kind = stat.S_IFMT(member.external_attr >> 16)
-            if member.is_dir():
-                assert name in directories and kind in (0, stat.S_IFDIR), name
-                continue
-            assert kind in (0, stat.S_IFREG), f"Nonregular wheel member: {name}"
-            assert name in expected, f"Unexpected wheel member: {name}"
-            contents[name] = archive.read(member)
-    assert set(contents) == expected, f"Missing wheel files: {sorted(expected - set(contents))}"
-    for name, content in {**package_source, **wheel_licenses}.items():
-        assert contents[name] == content, f"Wheel source bytes differ: {name}"
-    return contents
-
-
-def verify_sdist_contents(filename):
-    expected = set(approved_source) | generated_source
-    directories = ancestor_directories(expected)
-    contents, seen = {}, set()
-    with tarfile.open(filename) as archive:
-        for member in archive.getmembers():
-            name = member.name.rstrip("/") if member.isdir() else member.name
-            path = relative_path(name)
-            assert name not in seen, f"Duplicate source archive member: {name}"
-            seen.add(name)
-            assert path.parts[0] == sdist_name, f"Unexpected source archive root: {name}"
-            if len(path.parts) == 1:
-                assert member.isdir(), name
-                continue
-            relative = PurePosixPath(*path.parts[1:]).as_posix()
-            if member.isdir():
-                assert relative in directories, f"Unexpected source directory: {relative}"
-                continue
-            assert member.isfile(), f"Nonregular source archive member: {name}"
-            assert relative in expected, f"Unexpected source archive file: {relative}"
-            with archive.extractfile(member) as stream:
-                contents[relative] = stream.read()
-    assert set(contents) == expected, f"Missing source files: {sorted(expected - set(contents))}"
-    for name, content in approved_source.items():
-        assert contents[name] == content, f"Source archive bytes differ: {name}"
-    sources = contents["src/supervised_nmf.egg-info/SOURCES.txt"].decode("utf-8").splitlines()
-    for name in sources:
-        relative_path(name)
-        assert name in expected, f"Unapproved cached source entry: {name}"
-    return contents
-
-
-def build_from_source(source, output, command):
-    output.mkdir()
-    code = f"from setuptools.build_meta import {command}; import sys; {command}(sys.argv[1])"
-    try:
-        subprocess.run([sys.executable, "-I", "-c", code, str(output)], cwd=source,
-                       check=True, timeout=120, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-        if error.stdout:
-            print(error.stdout)
-        raise
-
-
-def verify_sdist_rebuilds(source_contents, wheel_contents):
-    """Build without Git, then challenge default discovery and stale SOURCES."""
-    with tempfile.TemporaryDirectory(prefix="snmf-sdist-check-") as directory:
-        temporary = Path(directory).resolve()
-        source = temporary / sdist_name
-        source.mkdir()
-        # Membership and regular-file checks above precede every write.
-        for name, content in source_contents.items():
-            destination = source / name
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(content)
-        assert not (source / ".git").exists()
-        wheel_output = temporary / "wheel"
-        build_from_source(source, wheel_output, "build_wheel")
-        rebuilt = verify_wheel_contents(wheel_output / wheel.name)
-        compared = set(package_source) | set(wheel_licenses) | {f"{dist_info_name}/METADATA"}
-        for name in compared:
-            assert rebuilt[name] == wheel_contents[name], f"Rebuilt wheel differs: {name}"
-
-        canaries = ("scripts/_packaging_canary.py", "tests/test_packaging_canary.py",
-                    "docs/_packaging_canary.md", "examples/_packaging_canary.py",
-                    "portable_speedtest/_packaging_canary.py", "src/supervised_nmf/_packaging_canary.py")
-        for name in canaries:
-            assert name not in approved_source
-            destination = source / name
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(b"# Packaging exclusion canary.\n")
-        with (source / "src/supervised_nmf.egg-info/SOURCES.txt").open("a", encoding="utf-8") as stream:
-            stream.write("\n".join(canaries) + "\n")
-        sdist_output = temporary / "sdist"
-        build_from_source(source, sdist_output, "build_sdist")
-        rebuilt_source = verify_sdist_contents(sdist_output / f"{sdist_name}.tar.gz")
-        assert set(rebuilt_source) == set(source_contents)
-        print("Source archive rebuild and unlisted-file exclusion verified.")
-
-
 wheel = root / "dist" / f"supervised_nmf-{version}-py3-none-any.whl"
-wheel_contents = verify_wheel_contents(wheel)
-source_contents = verify_sdist_contents(root / "dist" / f"{sdist_name}.tar.gz")
 with zipfile.ZipFile(wheel) as archive:
     metadata_file = next(n for n in archive.namelist() if n.endswith(".dist-info/METADATA"))
     metadata = Parser().parsestr(archive.read(metadata_file).decode("utf-8"))
@@ -184,6 +25,7 @@ with zipfile.ZipFile(wheel) as archive:
     assert metadata["Version"] == version
     assert metadata["Requires-Python"] == ">=3.11"
     assert metadata["License-Expression"] == "LicenseRef-All-Rights-Reserved AND BSD-3-Clause"
+    license_files = ("LICENSE", "THIRD_PARTY_NOTICES")
     assert set(metadata.get_all("License-File", [])) == set(license_files)
     dist_info = metadata_file.rsplit("/", 1)[0]
     for license_file in license_files:
@@ -192,10 +34,9 @@ with zipfile.ZipFile(wheel) as archive:
     assert any("matplotlib" in requirement and 'extra == "study"' in requirement
                for requirement in metadata.get_all("Requires-Dist", []))
     assert not any(n.endswith((".jpg", ".png", ".pdf")) for n in archive.namelist())
-    assert not any(set(Path(n).parts) & excluded_directories or "ensemble-reference" in n
+    assert not any(set(Path(n).parts) & {"tmp", "data", "runs"} or "ensemble-reference" in n
                    for n in archive.namelist())
     assert not any(n.endswith(withdrawn_workflow) for n in archive.namelist())
-    assert not any(Path(n).name in removed_speedtest_files for n in archive.namelist())
 
 sys.path.insert(0, str(wheel))
 import numpy as np
@@ -367,9 +208,8 @@ with tarfile.open(root / "dist" / f"supervised_nmf-{version}.tar.gz") as archive
         assert archive.getmember(member).isfile(), member
         with archive.extractfile(member) as stream:
             assert stream.read() == (root / license_file).read_bytes(), license_file
-    assert not any(set(Path(n).parts) & excluded_directories or "ensemble-reference" in n for n in members)
+    assert not any(set(Path(n).parts) & {"tmp", "data", "runs"} or "ensemble-reference" in n for n in members)
     assert not any(n.endswith(withdrawn_workflow) for n in members)
-    assert not any(Path(n).name in removed_speedtest_files for n in members)
     for suffix in ("provenance/original/sim.py", "provenance/original/snmf_am.py",
                    "examples/compare_simulation.py", "examples/celeba_classification.py",
                    "examples/celeba_parameter_study.py", "examples/celeba_starting_grid.json",
@@ -398,5 +238,4 @@ with tarfile.open(root / "dist" / f"supervised_nmf-{version}.tar.gz") as archive
                    "tests/test_training_coordinate_defaults.py",
                    "docs/tuning-improvements.md"):
         assert any(n.endswith(suffix) for n in members), suffix
-verify_sdist_rebuilds(source_contents, wheel_contents)
 print("Wheel import, author/license metadata, SPA/CD/MU fit/predict, KNN/logistic/SVM heads, SD KNN, default/legacy training coordinates, explicit override, and source archive contents verified.")

@@ -220,7 +220,7 @@ def migrate_checkpoints(parent_fashion, child_fashion, parent, child, inputs):
 
 
 def prepare(parent_run, output, fashion_protocol, celeba_protocol, reason):
-    require(Path(sys.prefix).name == "py12_df_aocl", "Use the author-requested py12_df_aocl environment.")
+    require(Path(sys.prefix).name == "py12_df_aocl", "This historical recovery study requires the py12_df_aocl environment.")
     parent_run, output = Path(parent_run).resolve(), Path(output).resolve()
     require(parent_run != output and not output.is_relative_to(parent_run) and not parent_run.is_relative_to(output),
             "Parent and child runs must be separate nonnested directories.")

@@ -222,7 +222,7 @@ analysis and final-test evaluation remain open.
 
 ## Running the study, profiling and reporting
 
-Use conda environment `py12_df_aocl` from the repository root. The source checkout
+Activate the intended Python environment and run from the repository root. The source checkout
 or source archive includes these scripts; the library wheel does not. The optional
 `study` dependencies can be installed with `python -m pip install -e ".[study]"`
 when setting up a new environment. Only the recorded local dependency versions
@@ -230,7 +230,7 @@ have been verified. With the existing
 fingerprinted local cache, a new explicit-grid run can be started with:
 
 ```powershell
-conda run --no-capture-output -n py12_df_aocl python examples/celeba_parameter_study.py `
+python examples/celeba_parameter_study.py `
   --data-cache data/celeba-development-4000-seed42 `
   --grid-json examples/celeba_starting_grid.json `
   --max-train 4000 --max-validation 4000 --seed 42 `
@@ -249,10 +249,10 @@ optional logistic development comparison, use the general example with local
 data paths:
 
 ```powershell
-conda run --no-capture-output -n py12_df_aocl python examples/celeba_classification.py `
-  --dir D:/datasets/img_align_celeba `
-  --attributes D:/datasets/list_attr_celeba.txt `
-  --partitions D:/datasets/list_eval_partition.txt `
+python examples/celeba_classification.py `
+  --dir PATH/img_align_celeba `
+  --attributes PATH/list_attr_celeba.txt `
+  --partitions PATH/list_eval_partition.txt `
   --attribute Smiling --classifier logistic --quick --output runs
 ```
 
@@ -269,7 +269,7 @@ printed run directory. Review training-only evidence before inspecting validatio
 performance or choosing a follow-up grid:
 
 ```powershell
-conda run -n py12_df_aocl python scripts/review_celeba_cv.py RUN_DIRECTORY
+python scripts/review_celeba_cv.py RUN_DIRECTORY
 ```
 
 This review requires the complete declared CV grid. It checks tied winners,
@@ -282,7 +282,7 @@ the saved selected settings, with one worker and one native thread. Run it alone
 to avoid overlap with the main worker pool:
 
 ```powershell
-conda run --no-capture-output -n py12_df_aocl python scripts/profile_celeba_stages.py `
+python scripts/profile_celeba_stages.py `
   --run RUN_DIRECTORY --data-cache data/celeba-development-4000-seed42 --repeats 1
 ```
 
@@ -301,7 +301,7 @@ the profiler's printed directory, or omit `--profile` to report the main study
 without the additional timing fits:
 
 ```powershell
-conda run -n py12_df_aocl python scripts/report_celeba_study.py RUN_DIRECTORY `
+python scripts/report_celeba_study.py RUN_DIRECTORY `
   --scan-folds --profile PROFILE_DIRECTORY/profiling.json
 ```
 

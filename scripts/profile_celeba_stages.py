@@ -5,7 +5,7 @@ The script calls the original fit/fit_transform/transform methods once, times
 them with reversible wrappers, and requires exact saved validation predictions.
 It never tunes parameters or opens the official test partition. Run alone:
 
-    conda run -n py12_df_aocl python scripts/profile_celeba_stages.py \
+    python scripts/profile_celeba_stages.py \
         --run runs/COMPLETED_RUN --data-cache data/CACHE --repeats 1
 
 Authorship: Chang Cheng; instrumentation supports the classification package

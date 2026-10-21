@@ -1,6 +1,6 @@
 # supervised-nmf 0.3.2
 
-October 20, 2026 (America/Indianapolis). Author: Chang Cheng.
+October 20, 2026
 
 This patch simplifies source packaging and edits the research documentation.
 The source manifest uses directory patterns instead of an explicit list of

@@ -78,18 +78,21 @@ and posterior smoothness; a small training objective does not establish either.
 
 SPA has a direct recovery argument in the restricted noiseless,
 normalized, feature-separable model discussed on page 136. The package normalizes
-training feature columns for anchor selection and retains original-scale anchor
-coordinates for classification. Extending recovery claims to noisy data requires
-the relevant geometry, rank, conditioning and noise bounds, as well as consistent
+training feature columns for anchor selection. The standalone transformer and
+historical `fit_transform` classifier policy retain original-scale anchor
+coordinates; the current SPA classifier default instead projects training
+observations against the fitted basis. Extending recovery claims to noisy data
+requires the relevant geometry, rank, conditioning and noise bounds, as well as consistent
 component scaling. Recovery alone also does not establish posterior sufficiency.
 These conditions have not been established on CelebA. This specialized result
 therefore provides no additional theoretical justification for choosing SPA in
 the current classification study. Selecting SPA does not remove the main
 assumptions of Theorem 7.4.4.
 
-The SPA prediction implementation solves NNLS separately for each observation,
-giving a direct pointwise coefficient map. The current sklearn CD transform uses
-a shared stopping criterion across a query batch. A deterministic synthetic probe
+The mathematical SPA prediction map comprises independent fixed-basis NNLS
+problems. Its original SciPy execution solved one observation at a time.
+The sklearn CD transform uses a shared stopping criterion across a query batch.
+A deterministic synthetic probe
 in the tested environment found a maximum batch-versus-single-row CD coefficient
 difference of `2.2843480110168457e-05`, with **no changed labels or probabilities**;
 SPA coefficients were identical in that probe. All fits and transforms qualified.
@@ -98,8 +101,13 @@ proofs or evidence of an observed classification error. A strict pointwise CD
 theory-to-code statement should account for its numerical/batch context, or
 specify pointwise encoding. The package retains the original CD implementation.
 The same batch coupling needs attention before using an independent-residual
-Hoeffding bound unchanged. SPA's separate per-observation solves avoid this
-particular implementation qualification.
+Hoeffding bound unchanged. The current guarded batched SPA execution preserves
+independent NNLS objectives, but its kernel shape and acceleration/fallback
+choices can depend on the query batch. That code should not be described as
+bitwise pointwise merely because the mathematical objective separates. The
+historical probe describes its saved implementation, not every current execution
+configuration. A proof-to-code statement must specify the numerical map or
+account for its approximation.
 
 ## What empirical checks do and do not establish
 
@@ -119,9 +127,14 @@ The separate KNN corollary on pages 137–138 analyzes an explicit sample-splitt
 variant: representation fitting and classifier fitting use independent samples,
 all classifier observations use the same fixed-basis map, and smoothness/local-mass
 conditions hold. Its consistency conclusion also requires an appropriate growing
-neighbor count. The current pipeline reuses observations, preserves original
-`fit_transform` training coordinates, and tunes finite neighbor counts. Changing
-the factorization solver does not make that corollary apply. The general pipeline
+neighbor count. The current SPA classifier default uses fixed-basis projection
+for both training and query coordinates; CD/MU defaults retain their fitted
+training coordinates. Older SPA models and generic `FeatureSPA` pipelines may
+retain anchor-derived training coordinates. The classifier still reuses
+observations across fitting stages and tunes finite neighbor counts. A common
+coordinate map by itself does not make the sample-split corollary apply, nor is
+it a separate requirement imposed by the general decomposition in Theorem 7.4.3.
+The general pipeline
 decomposition still applies conditionally, with classifier estimation error left
 explicit.
 
@@ -165,3 +178,42 @@ using the stated accuracy tolerance and measured time, and by the subsequent
 four-solver comparison. Its specialized recovery assumptions have not been
 validated on CelebA; the general reconstruction-based risk bound also retains
 unresolved population reconstruction, smoothness and classifier-error terms.
+
+## October 20 numerical and classifier extensions
+
+Subtracting a training feature's minimum before computing pooled t statistics
+preserves the exact statistic under translation. Scaling the remaining spread
+avoids losing represented variation behind a large common offset. This repair
+does not center the feature matrix supplied to NMF or change the screening
+theorem's retention assumptions.
+
+For fixed-basis NNLS, multiplying both the design and one RHS by the same positive
+power of two multiplies its squared objective by a positive constant, preserving
+its minimizers. The implementation checks that scaling is exactly reversible and
+uses independent RHS scale groups; a row's admissible scaling interval depends
+on that row and the shared design, not on unrelated query magnitudes. This does
+not imply batch-independent acceleration or identical floating-point output.
+Scaling does not reduce the condition number, establish
+uniqueness, or repair the separate experimental alternating ANLS-BPP solver.
+
+The optional noncentering SD map for KNN is fitted on training coordinates.
+When each fitted scale is its strictly positive empirical standard deviation,
+with no constant or near-constant fallback, it removes positive coordinate-scale
+dependence from Euclidean neighbor distances in exact arithmetic. Constant and
+near-constant columns follow the fitted scaler's numerical policy and do not
+have that general invariance guarantee. This is a different metric from
+raw-coordinate KNN, so its statistical assumptions and empirical comparisons
+must be assessed separately.
+
+The optional linear SVM introduces a linear-margin approximation and a
+regularized squared-hinge estimation problem in the learned coordinates.
+The general pipeline risk decomposition can retain its classifier-error term,
+but the KNN corollary is not an SVM theorem. Margin calibration arguments also
+require their own assumptions. Convergence of the primal optimization does not
+prove ordinary-risk consistency or a balanced-accuracy guarantee. This extension
+remains within the NMF classification part of the dissertation.
+
+Stable factor-recovery cosines and blocked training residuals are reporting
+calculations. They supply neither a population reconstruction bound nor a
+numerical optimality certificate. Their implementation changes do not strengthen
+the proof assumptions described above.

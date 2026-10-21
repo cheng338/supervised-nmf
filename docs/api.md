@@ -1,5 +1,10 @@
 # API reference
 
+This page describes current source. Optional KNN SD scaling and the linear-SVM
+head are **unreleased additions with completed integration checks on Robust**.
+They are not available in the released 0.2.0 wheel. Historical release and
+validation records remain separate.
+
 ## Classifier
 
 ```python
@@ -11,23 +16,28 @@ classifier = NMFClassifier(
     screening="absolute",        # default; also "percentile" or "none"
     score_threshold=2.0,         # absolute pooled-t units, inclusive comparison
     percentile=10.0,             # used only by percentile screening
-    classifier="knn",            # also "logistic"
+    classifier="knn",            # also "logistic" or "linear_svm"
     n_neighbors=5,
     weights="uniform",           # sklearn KNN weighting choice
+    knn_normalization="none",    # optional "sd", fitted on training coordinates
     logistic_C=1.0,              # inverse L2 regularization strength
     logistic_max_iter=1000,
     logistic_tol=1e-4,
     logistic_class_weight=None,  # also "balanced" or a class-weight dictionary
+    svm_C=1.0,                  # linear SVM only; coordinates remain unscaled
+    svm_max_iter=20000,
+    svm_tol=1e-5,
+    svm_class_weight=None,
     max_iter=20000,
     tol=1e-4,
     random_state=42,
-    training_coordinates="fit_transform",
+    training_coordinates="auto",  # SPA: transform; CD/MU: fit_transform
     projection_solver="auto",   # SPA only: "auto", "scipy", or "batched"
     projection_workers=1,        # maximum process count for large queries
     projection_batch_size=256,
     projection_native_threads=1,
-    decision_threshold=None,    # optional fixed, training-selected cutoff
-    positive_label=None,        # defaults to classes_[1]
+    decision_threshold=None,    # probability cutoff: KNN/logistic only
+    positive_label=None,        # thresholded class; does not reverse margins
 )
 classifier.fit(X_train, y_train)
 W_new = classifier.transform(X_new)
@@ -54,7 +64,15 @@ initialization of plain NNDSVD under MU. Features and factors retain their
 original scales during factorization. The fitted screening mask and basis are
 reused for prediction.
 
-`classifier="knn"` preserves Euclidean KNN on unscaled NMF coordinates.
+`classifier="knn"` with `knn_normalization="none"` preserves Euclidean KNN on
+unscaled NMF coordinates. Optional `knn_normalization="sd"` fits
+`StandardScaler(with_mean=False)` on the training coefficients and divides
+query coefficients by those same scales. It changes the head's distance
+metric, not the factorization, `transform` output or `training_coordinates_`.
+Constant and nearconstant coordinates use scikit-learn's scale fallback;
+there is no row normalization or added variance floor. The option is validated
+but unused by logistic regression and linear SVM.
+
 `classifier="logistic"` uses a pipeline containing `StandardScaler` and
 L2-regularized scikit-learn `LogisticRegression` with the `lbfgs` solver.
 Means and scales are learned only from the training coordinates. The same
@@ -72,6 +90,43 @@ The logistic iteration limit and tolerance are separate from the NMF
 numerical controls to obtain qualified fits. KNN's `n_neighbors` and `weights`
 do not tune logistic regression.
 
+`classifier="linear_svm"` fits scikit-learn `LinearSVC` directly on the unscaled
+training coefficients, with `penalty="l2"`, `loss="squared_hinge"` and
+`dual=False`. There is no hidden standardization or probability calibration.
+`svm_C=1.0` is the positive inverse regularization strength and interacts with
+the coordinate units. `svm_max_iter=20000` and `svm_tol=1e-5` control the head's
+primal solve independently of `max_iter` and `tol` for factorization.
+`svm_class_weight` accepts `None`, `"balanced"` or finite nonnegative weights
+keyed by training class labels. Weighting changes the SVM loss, not screening
+or the representation.
+
+```python
+svm = NMFClassifier(
+    classifier="linear_svm", svm_C=0.1, random_state=42,
+).fit(X_train, y_train)
+labels, margins = svm.predict_with_decision_function(X_new)
+```
+
+The binary margin is oriented toward `classes_[1]`: a margin strictly greater
+than zero selects that class, and equality selects `classes_[0]`. Arbitrary
+numeric or string labels are preserved. `positive_label` does not change
+margin orientation or the SVM decision rule. A non-`None` `decision_threshold`
+with SVM is rejected before factorization.
+
+| Method | KNN | Logistic | Linear SVM |
+| --- | --- | --- | --- |
+| `predict`, `transform` | Available | Available | Available |
+| `predict_proba`, `predict_with_probabilities` | Available | Available | Unavailable |
+| `decision_function`, `predict_with_decision_function` | Unavailable | Available | Available |
+
+The combined methods return `(labels, scores)` with one NMF projection and
+one application of any fitted head scaler. `predict_with_probabilities` returns
+class-probability columns; `predict_with_decision_function` returns genuine
+one-dimensional margins. Logistic labels still obey an explicit fitted
+probability threshold when requesting margins. Margins are not converted to
+probabilities. Method availability follows the fitted head until refit, even
+if `set_params(classifier=...)` has changed the constructor setting.
+
 Inputs are dense finite nonnegative matrices. Binary labels can be strings or
 numbers; `classes_[1]` is the positive class in evaluation reports. Each training
 class needs at least two observations for screening, and each class needs at
@@ -81,23 +136,41 @@ classification are not supported.
 `selected_features_` maps back to the original columns. `selected_components_`
 is the learned basis in retained-feature coordinates; `components_` pads that
 basis with zeros in discarded columns. `training_coordinates_` contains the
-unscaled coordinates supplied to the final classifier. `get_support()` returns
-the original feature mask. `classifier_` is the fitted KNN estimator or the
-pipeline with steps named `scale` and `logistic`.
+unscaled coordinates supplied to the final classifier; `training_coordinates_mode_`
+records the fitted policy as `"transform"` or `"fit_transform"`. `get_support()` returns
+the original feature mask. `classifier_` is a bare KNN for unscaled KNN, a
+pipeline named `scale`/`knn` for SD KNN, a pipeline named `scale`/`logistic` for
+logistic regression, or a bare `LinearSVC` for SVM. `knn_normalization_` records
+the fitted KNN metric and is `None` for other heads.
 `fit_times_`, `n_iter_`, `converged_`, and `convergence_warnings_` expose fit
 diagnostics. `n_iter_` remains the factorization iteration count.
 `classifier_n_iter_`, `classifier_converged_`, and
 `classifier_convergence_warnings_` report the final classifier separately;
 `classifier_n_iter_` is `None` for KNN. The overall convergence flag and warning
-list include both stages. Classifier
-fit timing includes scaler fitting when logistic regression is selected.
+list include factorization, any training reprojection and classifier fitting.
+Classifier fit timing includes scaler fitting for SD KNN or logistic regression.
 `last_transform_converged_` and `last_transform_warnings_` concern
 the most recent transform. Convergence here means the numerical routine did not
 report nonconvergence; it is not a certificate of global optimality or consistency.
 
-`training_coordinates="transform"` explicitly re-encodes training observations
-against the fitted basis. The default `"fit_transform"` preserves the scripts'
-coefficient convention. Report this choice when comparing CD, MU and SPA fits.
+### Training coordinates
+
+The current unreleased source defaults to `training_coordinates="auto"`.
+The released 0.2.0 wheel still defaults to `"fit_transform"`.
+For SPA, this resolves to `"transform"`: after fitting the nonnegative basis,
+the classifier re-encodes its training observations by fixed-basis NNLS.
+Training and prediction therefore use the same fitted basis and projection map.
+For CD and MU, `"auto"` resolves to `"fit_transform"`, retaining the coordinates
+returned by factorization.
+
+An explicit `"transform"` re-encodes training observations for any solver.
+An explicit `"fit_transform"` retains the previous convention, including SPA's
+anchor-derived training coordinates. Training reprojection adds computation to
+`fit_times_["training_projection"]` and total fit time. It can change a retrained
+classifier's predictions and accuracy; this correction does not guarantee an
+accuracy improvement. Report the coordinate policy alongside the solver when
+comparing fits or reproducing historical results.
+
 `reconstruction_err_` refers to the classifier's actual training coordinates;
 `factorization_reconstruction_err_` preserves the initial factorization diagnostic.
 
@@ -107,8 +180,9 @@ coefficient convention. Report this choice when comparing CD, MU and SPA fits.
 
 These controls apply to both `FeatureSPA` and `NMFClassifier(solver="spa")`.
 They affect fixed-basis projection, including training reprojection when
-`training_coordinates="transform"`; SPA anchor selection and basis fitting
-still use the original algorithms. CD/MU ignore valid SPA projection controls.
+`training_coordinates="transform"` or when `"auto"` resolves to it. SPA anchor
+selection and basis fitting still use the original algorithms. CD/MU ignore
+valid SPA projection controls.
 
 `projection_solver="auto"` attempts batched NNLS for at least 32 query rows.
 `"batched"` also attempts it for smaller queries. Both require a nonnegative,
@@ -120,7 +194,17 @@ SciPy NNLS with the original cap; its errors propagate. Internal batched
 pivot attempts are bounded by the smaller of the supplied cap and three times
 the rank, then fall back. This does not change the NNLS objective. Floating-point
 coefficients need not be bitwise identical. `projection_solver="scipy"` selects
-the historical row-wise solver for every query.
+the public row-wise solver for every query.
+
+Current unreleased source also guards input magnitude before either solver.
+Ordinary-range inputs retain their solver path. Extreme inputs use exactly
+reversible common binary scaling of the design and each independent RHS;
+rows with the same scale share execution. The scale preserves the NNLS
+minimizers and does not change conditioning. Nonzero scaled values must have
+binary exponents within [-450, 450]; an input span that cannot meet this
+conservative bound raises `FloatingPointError` before solving any scale group.
+Unsupported range does not mean the mathematical problem has no solution.
+Original iteration caps and reference-solver errors still propagate.
 
 Blocks contain at most `projection_batch_size=256` rows. With
 `projection_workers>1`, queries of at least 512 rows and two full blocks use
@@ -145,7 +229,8 @@ one-worker defaults.
 
 `decision_threshold=None` preserves the final estimator's original prediction
 rule, including KNN ties and logistic decisions whose probabilities round to
-0.5. An explicit threshold uses the strict rule `P(positive_label) > threshold`.
+0.5. For KNN and logistic regression, an explicit threshold uses the strict rule
+`P(positive_label) > threshold`.
 The default positive label is `classes_[1]`; probabilities always retain the
 order in `classes_`. The cutoff must lie in [0, 1], or be exactly
 `np.nextafter(0.0, -np.inf)` to represent the study's all-positive sentinel.
@@ -160,15 +245,19 @@ labels and probabilities with one projection. The shared KNN calibration
 helper honors fixed thresholds, but threshold grids require the general
 `calibration_search` helper.
 
-These execution and decision-policy additions are included in version 0.2.0.
+These execution and decision-policy additions were released in version 0.2.0.
 They do not revise saved study results or establish an accuracy improvement.
 
 ### Screening and anchor details
 
 `BinaryScreening` is a sklearn transformer with `fit`, `transform`, and
 `get_support`. It exposes signed `t_scores_`, squared `scores_`, selected indices,
-class counts and constant/infinite-score counts. Statistical rescaling is recorded
-by `statistic_scales_`; scaled variance/standard-error diagnostics are provided.
+class counts and constant/infinite-score counts. In current unreleased source,
+statistics subtract each training feature's minimum before dividing by the
+remaining spread. This preserves represented small variation behind a large
+offset. `statistic_offsets_` and `statistic_scales_` record these operations;
+scaled variance/standard-error diagnostics are provided. Older fitted objects
+can lack `statistic_offsets_`; transforming them requires only their saved mask.
 The returned data are never multiplied by the screening scores.
 
 Absolute thresholds must be finite and nonnegative. Globally constant columns
@@ -182,6 +271,15 @@ regularized.
 `anchor_indices_`, conditioning diagnostics, and a fixed `components_` basis.
 Its `normalize=True` option normalizes training feature columns only during
 anchor selection. See [the mathematical specification](methodology.md).
+
+The standalone `FeatureSPA` API is unchanged: `fit_transform(X)` returns
+anchor-derived training coordinates, whereas `transform(X)` projects against
+the fitted basis. A generic sklearn `Pipeline` containing `FeatureSPA` still
+uses `fit_transform` to train its next step. To use consistent fixed-basis
+coordinates for classification, use `NMFClassifier(solver="spa")`, an adapter
+that explicitly projects training data, or call `spa.fit(X_train)` followed by
+`spa.transform(X_train)` before fitting the classifier. The classifier's new
+default does not change generic pipelines automatically.
 
 ## Calibration and reporting
 
@@ -209,6 +307,10 @@ For logistic regression, pass `NMFClassifier(classifier="logistic")` and replace
 Each fold fits its own screening, NMF, scaler and classifier. A logistic
 convergence warning disqualifies a candidate just as a factorization warning
 does; raising the logistic cap requires a recorded numerical configuration.
+For linear SVM, use `NMFClassifier(classifier="linear_svm")` and the grid key
+`svm_C`. Its cap and tolerance qualify the primal solve; they are not substitutes
+for tuning C. SVM warnings are retained and disqualify candidates in the same
+way. Optional KNN SD scaling is fitted separately within each training fold.
 
 Checkpoints can resume only when data, parameters, versions, folds and package
 source hashes match. Changing code or settings requires a new run. The source
@@ -246,6 +348,15 @@ Numerical-phase diagnostics on `NMFClassifier` now include
 `factorization_converged_` and `training_projection_converged_`, with their
 corresponding `*_convergence_warnings_` attributes.
 
+For SVM, `evaluate_classifier` uses real decision margins for AUROC and average
+precision. The report sets `ranking_score_type="decision_margin"`, stores the
+scores in `predictions["positive_class_decision_margin"]` and leaves
+`predictions["positive_class_probability"]` as `None`. With a probability head,
+the score type is `"probability"` and the margin field is `None`. Ranking
+scores always refer to `classes_[1]`; class weights do not make SVM margins
+calibrated probabilities. The summary states when ranking metrics use margins
+rather than probabilities.
+
 The commands below exercise a paired development comparison:
 
 ```powershell
@@ -273,6 +384,12 @@ is `[0.01, 0.1, 1.0, 10.0, 100.0]`; the quick grid is `[1.0]` and is only a
 smoke check. Logistic model names have a `_logistic` suffix; the raw-feature
 model is `raw_logistic`. NMF estimators use the grid key `logistic_C`, while
 the standard sklearn baseline pipelines use `logistic__C`.
+`comparison_models(classifier="linear_svm")` provides the same representation
+paths with unscaled primal squared-hinge SVMs and a separate C grid.
+Names use `_linear_svm`, including `raw_linear_svm`. The grid keys are
+`svm_C` for `NMFClassifier` and `linear_svm__C` for baseline pipelines.
+The ordinary and quick C grids match those listed above; `svm_max_iter`,
+`svm_tol` and `svm_class_weight` configure the SVM numerical/risk policy.
 `comparison_models()` retains the original KNN choices.
 Set `max_iter` and `tol` to numerically qualify
 the intended method; do not select them to exploit unconverged fits.
@@ -310,8 +427,33 @@ candidate. Computational accounting counts the shared fit once. Representation
 random states must be fixed integers. Supported estimators are `NMFClassifier`,
 raw `KNeighborsClassifier`, and standard sklearn pipelines ending in KNN;
 other KNN settings stay fixed within this grid.
-An `NMFClassifier` using logistic regression is not supported by this helper;
-use `calibration_search` instead.
+An `NMFClassifier` using logistic regression or linear SVM is not supported by
+this helper; use `calibration_search` instead. For SD KNN, the fitted training-fold
+scaler is reused across K values and applied once to each validation representation.
+`knn_normalization` stays fixed within one shared grid; changing the metric
+requires a separate declared comparison.
+
+Current unreleased source also shares Euclidean neighbor queries among
+compatible fitted KNN heads. Callable weights, other metrics, sparse inputs,
+unknown backends and uncertain distance/vote boundaries use each selected-k
+public estimator on the whole original query batch. This internal adapter
+does not add a user setting or change tie rules. Its sklearn fitted-state
+compatibility is checked conservatively.
+
+Report schema 3 adds `knn_reuse_setup_seconds` and `knn_shared_query_seconds`
+to `compute_seconds`. Shared queries are charged once per fold/backend group;
+per-head `prediction_seconds` records voting, guards and any public fallback.
+A completed resume retains historical compute totals and performs no new
+representation fits or neighbor queries. Those totals are not resume runtime.
+Source and schema identities prevent reuse of old checkpoints under this change.
+
+For large, low-rank float64 fits, report-only reconstruction norms may use
+128-row blocks when all arrays are C/F-contiguous, the shape is 8,192–32,768
+rows by 1,024–4,096 features, rank is 1–32, and all detected BLAS pools are
+one-thread MKL. Other cases retain the original full-product expression.
+The blocks affect diagnostics only, not fitting, stopping or the prediction
+map. Their timing qualification is specific to the measured Robust workloads;
+AOCL/BLIS and other backends retain the existing path.
 
 Checksummed fold records can be reused only with matching data, folds, grid,
 estimator, source and runtime identity. A report describes the declared grid and

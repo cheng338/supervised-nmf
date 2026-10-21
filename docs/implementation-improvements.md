@@ -54,3 +54,19 @@ the exploratory normalization results did not support a universal change.
 Run the source tests with `python -m unittest discover -s tests -q` after
 installing the optional study dependencies. These changes are included in
 formal release 0.2.0; the historical 0.1.0 release tag remains unchanged.
+
+## October 20 source changes
+
+The retrospective review led to a further approved integration, separate from
+the released implementation above. It repairs offset-sensitive screening,
+extreme-range fixed-basis NNLS and factor-recovery arithmetic; adds guarded
+KNN query reuse, optional fitted SD KNN scaling and an optional linear SVM head;
+and evaluates a bounded report-only residual optimization.
+
+The original and revised source snapshots, failure records and validation
+receipts are preserved in `output/implementation-20261020/`. The current
+integration is validated on Robust under the agreed 20-total-thread budget.
+Its results do not replace historical accuracy, timing or compatibility records.
+Python 3.10 results above remain historical; current source requires Python 3.11
+or later. See [the protocol](development-protocol.md#approved-october-20-implementation)
+for the mathematical scope and adoption requirements.

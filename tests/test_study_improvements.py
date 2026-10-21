@@ -17,6 +17,7 @@ from supervised_nmf.decomposition import FeatureSPA
 from supervised_nmf.evaluation import calibration_search
 from supervised_nmf.screening import BinaryScreening
 from supervised_nmf.study import calibration_knn_grid
+from supervised_nmf._neighbors import _KNNQueryReuse
 
 
 class StudyImprovementTests(unittest.TestCase):
@@ -107,6 +108,7 @@ class StudyImprovementTests(unittest.TestCase):
             ("knn", KNeighborsClassifier())]),
             {"pca__n_components": [1, 2], "screen__score_threshold": [0, 1], "knn__n_neighbors": [1, 3]}))
         original_predict = KNeighborsClassifier.predict
+        original_shared_predict = _KNNQueryReuse.predict
         for name, estimator, grid in models:
             observed = []
 
@@ -120,7 +122,14 @@ class StudyImprovementTests(unittest.TestCase):
                                                seed=11, refit=False).report
             expected = observed
             observed = []
-            with patch.object(KNeighborsClassifier, "predict", capture):
+
+            def capture_shared(reuse, k, **kwargs):
+                result = original_shared_predict(reuse, k, **kwargs)
+                observed.append((k, reuse.models[k]._fit_X.copy(),
+                                 reuse.query.copy(), result[0].copy()))
+                return result
+
+            with patch.object(_KNNQueryReuse, "predict", capture_shared):
                 shared = self.run_grid(estimator, grid, name=name)
             # Shared iteration is representation/fold/k instead of candidate/fold.
             def keyed(rows):

@@ -12,10 +12,11 @@ and `examples/`. Their existence does not establish reproduction of any publishe
 numerical result. The historical software environment and complete run records
 were not available at initial development.
 
-The source methodology is Chapter 7 of *Overcoming the Curses of Dimensionality
-and Kernelization: Scalable DWD and Supervised NMF*, Chang Cheng's October 1,
-2026 dissertation version. The study draft updated October 2 and Wang's earlier
-committee review are supporting references.
+The source methodology is Chapter 7 of Chang Cheng's dissertation, now titled
+*Ensemble Kernel Distance-Weighted Discrimination and Supervised Nonnegative
+Matrix Factorization for Classification*. The original methodological reference
+was the October 1, 2026 dissertation version. The study draft updated October 2
+and Wang's earlier committee review are supporting references.
 
 Current studies use explicit parameter grids for the package's NMF/PCA,
 screening and KNN methods. Supplementary planning archives are excluded from

@@ -33,6 +33,7 @@ from sklearn.metrics import (
 from sklearn.model_selection import ParameterGrid
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
+from sklearn.svm import LinearSVC
 from sklearn.utils.validation import check_X_y
 from threadpoolctl import threadpool_info, threadpool_limits
 
@@ -48,6 +49,22 @@ class _TrackedLogisticRegression(LogisticRegression):
         for attribute in ("convergence_warnings_", "converged_"):
             if hasattr(self, attribute):
                 delattr(self, attribute)
+        fit = super().fit
+        try:
+            result, messages = _record_warnings(lambda: fit(X, y, sample_weight=sample_weight))
+        except BaseException:
+            _clear_fitted_attributes(self)
+            raise
+        self.convergence_warnings_ = messages
+        self.converged_ = not messages
+        return result
+
+
+class _TrackedLinearSVC(LinearSVC):
+    """Retain linear-SVM convergence evidence for standalone evaluation."""
+
+    def fit(self, X, y, sample_weight=None):
+        _clear_fitted_attributes(self)
         fit = super().fit
         try:
             result, messages = _record_warnings(lambda: fit(X, y, sample_weight=sample_weight))
@@ -165,9 +182,18 @@ def _diagnostics(estimator):
                       "factorization_converged_", "factorization_convergence_warnings_",
                       "training_projection_converged_", "training_projection_convergence_warnings_", "training_projection_performed_",
                       "classifier_n_iter_", "classifier_converged_", "classifier_convergence_warnings_",
+                      "knn_normalization_", "training_coordinates_mode_",
                       "fit_times_", "n_features_in_"):
         if hasattr(estimator, attribute):
             result[attribute.rstrip("_")] = _jsonable(getattr(estimator, attribute))
+    # Constructor settings may have changed since fit. Identify the actual
+    # fitted head, including an NMF head's optional scaler pipeline.
+    head = estimator.steps[-1][1] if isinstance(estimator, Pipeline) and estimator.steps else estimator
+    head = getattr(head, "classifier_", head)
+    if isinstance(head, Pipeline) and head.steps:
+        head = head.steps[-1][1]
+    if hasattr(head, "classes_"):
+        result["fitted_classifier_type"] = f"{type(head).__module__}.{type(head).__qualname__}"
     # Estimators and comparison Pipelines expose their selectors differently.
     selector = getattr(estimator, "selector_", None)
     if selector is None:
@@ -522,6 +548,9 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
     explicit evaluation ``sample_ids`` and reject shared rows. Metadata is
     checked before prediction. Support thresholds add descriptive flags only;
     they do not alter predictions, scores, numerical status or model selection.
+    Ranking metrics use probabilities when available, otherwise genuine binary
+    decision margins oriented toward ``classes_[1]``. Margins are recorded
+    separately and are never converted into purported probabilities.
     """
     X, y = check_X_y(X, y)
     classes = np.asarray(estimator.classes_)
@@ -538,10 +567,15 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
     with threadpool_limits(limits=threads), warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         try:
+            probability = margin = None
             if hasattr(estimator, "predict_with_probabilities"):
                 predicted, all_probabilities = estimator.predict_with_probabilities(X)
                 probability = all_probabilities[:, 1]
                 prediction_operation = "joint_label_and_probability_prediction_one_projection"
+            elif (hasattr(estimator, "predict_with_decision_function")
+                  and not hasattr(estimator, "predict_proba")):
+                predicted, margin = estimator.predict_with_decision_function(X)
+                prediction_operation = "joint_label_and_margin_prediction_one_projection"
             elif isinstance(estimator, Pipeline) and isinstance(estimator.steps[-1][1], KNeighborsClassifier):
                 projected = estimator[:-1].transform(X) if len(estimator.steps) > 1 else X
                 knn = estimator.steps[-1][1]
@@ -562,12 +596,28 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
                 predicted = logistic.predict(projected)
                 probability = logistic.predict_proba(projected)[:, 1]
                 prediction_operation = "joint_label_and_probability_prediction_one_projection"
+            elif isinstance(estimator, Pipeline) and isinstance(estimator.steps[-1][1], LinearSVC):
+                projected = estimator[:-1].transform(X) if len(estimator.steps) > 1 else X
+                svm = estimator.steps[-1][1]
+                margin = svm.decision_function(projected)
+                predicted = svm.classes_[(margin > 0).astype(int)]
+                prediction_operation = "joint_label_and_margin_prediction_one_projection"
             else:
                 predicted = estimator.predict(X)
-                probability = estimator.predict_proba(X)[:, 1] if hasattr(estimator, "predict_proba") else None
-                prediction_operation = "predict_plus_predict_proba_calls"
+                if hasattr(estimator, "predict_proba"):
+                    probability = estimator.predict_proba(X)[:, 1]
+                    prediction_operation = "predict_plus_predict_proba_calls"
+                elif hasattr(estimator, "decision_function"):
+                    margin = estimator.decision_function(X)
+                    prediction_operation = "predict_plus_decision_function_calls"
+                else:
+                    prediction_operation = "predict_only"
             if probability is not None and (not np.all(np.isfinite(probability)) or np.any((probability < 0) | (probability > 1))):
                 raise ValueError("Nonfinite or invalid predicted probabilities.")
+            if margin is not None:
+                margin = np.asarray(margin)
+                if margin.shape != (len(y),) or not np.all(np.isfinite(margin)):
+                    raise ValueError("Decision margins must be a finite one-dimensional binary score.")
         except Exception as error:
             return {"status": "failed", "error_type": type(error).__name__, "error": str(error),
                     "prediction_seconds": time.perf_counter() - start,
@@ -579,10 +629,12 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
                                                                  zero_division=0)
     both_classes = len(np.unique(y)) == 2
     auc = ap = None
-    if probability is not None:
+    ranking_score = probability if probability is not None else margin
+    score_type = "probability" if probability is not None else "decision_margin" if margin is not None else None
+    if ranking_score is not None:
         if both_classes:
-            auc = float(roc_auc_score(y == positive, probability))
-            ap = float(average_precision_score(y == positive, probability))
+            auc = float(roc_auc_score(y == positive, ranking_score))
+            ap = float(average_precision_score(y == positive, ranking_score))
     metrics = {"accuracy": float(accuracy_score(y, predicted)),
                "balanced_accuracy": float(balanced_accuracy_score(y, predicted)) if both_classes else None,
                "roc_auc": auc, "average_precision": ap,
@@ -597,13 +649,15 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
         metrics["undefined_reason"] = "Evaluation split contains only one class; balanced accuracy and ranking metrics omitted."
     return {"status": "provisional_nonconvergence" if _nonconverged(estimator, caught) else "valid",
             "metrics": metrics, "prediction_seconds": elapsed, "prediction_operation": prediction_operation,
+            "ranking_score_type": score_type,
             "warnings": _warning_records(caught),
             "diagnostics": _diagnostics(estimator), "data_sha256": data_fingerprint(X, y),
             "support_diagnostics": support_diagnostics, "training_majority_reference": majority_reference,
             "evaluation_groups": _jsonable(groups),
             "predictions": {"sample_ids": _jsonable(np.arange(len(y)) if sample_ids is None else sample_ids),
                             "true_labels": _jsonable(y), "predicted_labels": _jsonable(predicted),
-                            "positive_class_probability": _jsonable(probability)}}
+                            "positive_class_probability": _jsonable(probability),
+                            "positive_class_decision_margin": _jsonable(margin)}}
 
 
 def format_evaluation_summary(report):
@@ -625,6 +679,8 @@ def format_evaluation_summary(report):
         lines += ["", "| Metric | Value |", "| --- | --- |"]
         for key in ("accuracy", "balanced_accuracy", "roc_auc", "average_precision"):
             lines.append(f"| {key.replace('_', ' ').capitalize()} | {number(metrics.get(key))} |")
+        if evaluation.get("ranking_score_type") == "decision_margin":
+            lines += ["", "Ranking metrics use decision margins; probabilities are unavailable."]
         lines += ["", "| Class | Recall | Support |", "| --- | --- | --- |"]
         for row in metrics.get("per_class", []):
             label = str(row["label"]).replace("|", "\\|").replace("\n", " ")
@@ -678,7 +734,8 @@ def format_evaluation_summary(report):
 
 def comparison_models(*, random_state=0, quick=False, max_iter=20000, tol=1e-4,
                       classifier="knn", logistic_max_iter=1000,
-                      logistic_tol=1e-4, logistic_class_weight=None):
+                      logistic_tol=1e-4, logistic_class_weight=None,
+                      svm_max_iter=20000, svm_tol=1e-5, svm_class_weight=None):
     """Create independent CD/SPA/MU, PCA, screening-only and original baseline grids.
 
     Grids are deliberately modest starting grids. Caller-supplied JSON can expand
@@ -688,6 +745,8 @@ def comparison_models(*, random_state=0, quick=False, max_iter=20000, tol=1e-4,
     ``classifier='logistic'`` uses standardized representations and L2 logistic
     regression, with distinct names so both mappings can be combined. Scaling,
     screening and decompositions are fitted independently within each CV fold.
+    ``classifier='linear_svm'`` uses primal squared-hinge L2 linear SVMs and
+    genuine margins. It introduces no implicit coordinate scaling.
     """
     from sklearn.decomposition import PCA
     from sklearn.neighbors import KNeighborsClassifier
@@ -696,26 +755,35 @@ def comparison_models(*, random_state=0, quick=False, max_iter=20000, tol=1e-4,
     from .classifier import NMFClassifier
     from .screening import BinaryScreening
 
-    if classifier not in {"knn", "logistic"}:
-        raise ValueError("classifier must be 'knn' or 'logistic'.")
+    if classifier not in {"knn", "logistic", "linear_svm"}:
+        raise ValueError("classifier must be 'knn', 'logistic', or 'linear_svm'.")
     ranks = [2] if quick else [2, 4]
     neighbors = [3] if quick else [3, 5, 7]
     percentages = [25.0] if quick else [10.0, 25.0]
     thresholds = [1.0] if quick else [1.0, 2.0]
     regularization = [1.0] if quick else [0.01, 0.1, 1.0, 10.0, 100.0]
-    suffix = "" if classifier == "knn" else "_logistic"
-    nmf_options = {} if classifier == "knn" else {
-        "classifier": "logistic", "logistic_max_iter": logistic_max_iter,
-        "logistic_tol": logistic_tol, "logistic_class_weight": logistic_class_weight,
-    }
+    suffix = "" if classifier == "knn" else f"_{classifier}"
+    if classifier == "logistic":
+        nmf_options = {"classifier": classifier, "logistic_max_iter": logistic_max_iter,
+                       "logistic_tol": logistic_tol, "logistic_class_weight": logistic_class_weight}
+    elif classifier == "linear_svm":
+        nmf_options = {"classifier": classifier, "svm_max_iter": svm_max_iter,
+                       "svm_tol": svm_tol, "svm_class_weight": svm_class_weight}
+    else:
+        nmf_options = {}
+    regularization_parameter = "logistic_C" if classifier == "logistic" else "svm_C"
     nmf_classifier_grid = ({"n_neighbors": neighbors} if classifier == "knn"
-                           else {"logistic_C": regularization})
+                           else {regularization_parameter: regularization})
     pipeline_classifier_grid = ({"knn__n_neighbors": neighbors} if classifier == "knn"
-                                else {"logistic__C": regularization})
+                                else {f"{classifier}__C": regularization})
 
     def classifier_steps():
         if classifier == "knn":
             return [("knn", KNeighborsClassifier(n_jobs=1))]
+        if classifier == "linear_svm":
+            return [("linear_svm", _TrackedLinearSVC(
+                loss="squared_hinge", penalty="l2", dual=False, max_iter=svm_max_iter,
+                tol=svm_tol, class_weight=svm_class_weight, random_state=random_state))]
         return [("scale", StandardScaler()),
                 ("logistic", _TrackedLogisticRegression(solver="lbfgs", max_iter=logistic_max_iter,
                                                          tol=logistic_tol, class_weight=logistic_class_weight,
@@ -741,8 +809,10 @@ def comparison_models(*, random_state=0, quick=False, max_iter=20000, tol=1e-4,
             {f"screen__{screen_parameter}": screen_values, **pipeline_classifier_grid})
     if classifier == "knn":
         models["raw_knn"] = (KNeighborsClassifier(n_jobs=1), {"n_neighbors": neighbors})
-    else:
+    elif classifier == "logistic":
         models["raw_logistic"] = (Pipeline(classifier_steps()), {"logistic__C": regularization})
+    else:
+        models["raw_linear_svm"] = (Pipeline(classifier_steps()), {"linear_svm__C": regularization})
     models[f"majority_class{suffix}"] = (DummyClassifier(strategy="most_frequent"), {})
     models[f"unscreened_cd_nmf{suffix}"] = (
         NMFClassifier(solver="cd", screening="none", random_state=random_state,

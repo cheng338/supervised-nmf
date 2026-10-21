@@ -26,10 +26,12 @@ from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import ParameterGrid
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_X_y
 from threadpoolctl import threadpool_info, threadpool_limits
 
 from .classifier import NMFClassifier
+from ._neighbors import _KNNQueryReuse
 from .screening import BinaryScreening
 from .validation import build_cv_folds, validate_metadata
 from .evaluation import (
@@ -83,9 +85,11 @@ def _checkpoint_lock(directory):
 def _layout(estimator):
     if type(estimator) is NMFClassifier:
         if estimator.classifier != "knn":
-            raise TypeError("calibration_knn_grid requires classifier='knn'; use calibration_search for logistic regression.")
+            raise TypeError("calibration_knn_grid requires classifier='knn'; use calibration_search for other classifiers.")
         return "nmf", "n_neighbors", {"weights", "classifier", "logistic_C", "logistic_max_iter",
                                        "logistic_tol", "logistic_class_weight",
+                                       "knn_normalization", "svm_C", "svm_max_iter",
+                                       "svm_tol", "svm_class_weight",
                                        "decision_threshold", "positive_label"}
     if type(estimator) is KNeighborsClassifier:
         return "raw", "n_neighbors", set(estimator.get_params()) - {"n_neighbors"}
@@ -130,6 +134,13 @@ def _stored_training_representation(fitted, kind):
     Equivalence tests cover CD/MU float32, SPA, PCA, screening-only and raw KNN.
     """
     if kind == "nmf":
+        if type(fitted.classifier_) is Pipeline:
+            steps = fitted.classifier_.steps
+            if (len(steps) != 2 or type(steps[0][1]) is not StandardScaler
+                    or type(steps[-1][1]) is not KNeighborsClassifier):
+                raise RuntimeError("Unsupported fitted KNN coordinate pipeline.")
+            knn = steps[-1][1]
+            return knn._fit_X, knn
         return fitted.training_coordinates_, fitted.classifier_
     knn = fitted.steps[-1][1] if kind == "pipeline" else fitted
     if not hasattr(knn, "_fit_X"):
@@ -139,7 +150,10 @@ def _stored_training_representation(fitted, kind):
 
 def _validation_representation(fitted, kind, X):
     if kind == "nmf":
-        return fitted.transform(X)
+        coordinates = fitted.transform(X)
+        if type(fitted.classifier_) is Pipeline:
+            return fitted.classifier_[:-1].transform(coordinates)
+        return coordinates
     if kind == "pipeline" and len(fitted.steps) > 1:
         return fitted[:-1].transform(X)
     return X
@@ -239,6 +253,8 @@ def _run_representation_fold(estimator, kind, neighbor_parameter, representation
     caught = []
     record.update(representation_fit_seconds=0.0, projection_seconds=0.0,
                   representation_fit_performed=False, neighbors={},
+                  neighbor_reuse_setup_seconds=0.0, neighbor_query_seconds=0.0,
+                  neighbor_queries=[],
                   screening_statistics_seconds=0.0, screening_selection_seconds=0.0,
                   screening_statistics_fit_performed=False, preflight_rejected=False)
     try:
@@ -298,6 +314,7 @@ def _run_representation_fold(estimator, kind, neighbor_parameter, representation
             record["diagnostics"] = _diagnostics(fitted)
     if record["status"] != "valid":
         return
+    models, fit_warnings = {}, {}
     for neighbors_count in neighbors:
         result = {"n_neighbors": neighbors_count, "fit_seconds": 0.0, "prediction_seconds": 0.0}
         with warnings.catch_warnings(record=True) as caught:
@@ -311,24 +328,48 @@ def _run_representation_fold(estimator, kind, neighbor_parameter, representation
                     classifier.fit(training_coordinates, y[train])
                 finally:
                     result["fit_seconds"] = time.perf_counter() - start
+                models[neighbors_count] = classifier
+            except Exception as error:
+                result.update(status="failed", error_type=type(error).__name__, error=str(error))
+        fit_warnings[neighbors_count] = list(caught)
+        result["warnings"] = _warning_records(caught)
+        record["neighbors"][str(neighbors_count)] = result
+    start = time.perf_counter()
+    reuse = _KNNQueryReuse(models, validation_coordinates)
+    record["neighbor_reuse_setup_seconds"] = time.perf_counter() - start
+    for neighbors_count, classifier in models.items():
+        result = record["neighbors"][str(neighbors_count)]
+        shared_warnings = []
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            try:
+                threshold = getattr(fitted, "decision_threshold_", None) if kind == "nmf" else None
+                positive_index = getattr(fitted, "positive_class_index_", None) if threshold is not None else None
+                before_shared = reuse.query_seconds
                 start = time.perf_counter()
                 try:
-                    if kind == "nmf" and getattr(fitted, "decision_threshold_", None) is not None:
-                        predictions = fitted._labels_from_probabilities(
-                            classifier.predict_proba(validation_coordinates))
-                    else:
-                        predictions = classifier.predict(validation_coordinates)
+                    predictions, metadata, shared_warnings = reuse.predict(
+                        neighbors_count, probabilities=threshold is not None,
+                        decision_threshold=threshold, positive_index=positive_index)
+                    result["neighbor_query_reuse"] = metadata
+                    if threshold is not None:
+                        predictions = fitted._labels_from_probabilities(predictions)
                 finally:
-                    result["prediction_seconds"] = time.perf_counter() - start
+                    # Shared queries are charged once at fold level, not to the
+                    # first k visited or repeatedly to each candidate.
+                    result["prediction_seconds"] = max(
+                        0.0, time.perf_counter() - start - (reuse.query_seconds - before_shared))
                 score = float(balanced_accuracy_score(y[validation], predictions))
                 if not np.isfinite(score):
                     raise ValueError("The calibration score is not finite.")
-                result.update(status="nonconverged" if _nonconverged(classifier, caught) else "valid",
+                all_warnings = fit_warnings[neighbors_count] + list(caught) + shared_warnings
+                result.update(status="nonconverged" if _nonconverged(classifier, all_warnings) else "valid",
                               balanced_accuracy=score)
             except Exception as error:
                 result.update(status="failed", error_type=type(error).__name__, error=str(error))
-        result["warnings"] = _warning_records(caught)
-        record["neighbors"][str(neighbors_count)] = result
+        result["warnings"] = _warning_records(fit_warnings[neighbors_count] + list(caught) + shared_warnings)
+    record["neighbor_query_seconds"] = reuse.query_seconds
+    record["neighbor_queries"] = reuse.query_records()
 
 
 def calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=1,
@@ -341,7 +382,7 @@ def calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=1
     including them in the grid is rejected. Representation random_state settings
     must be fixed integer seeds. Only standard supported estimator types are
     accepted because representation independence from k is essential.
-    Logistic regression uses the general-purpose ``calibration_search`` instead.
+    Other classifiers use the general-purpose ``calibration_search`` instead.
     ``groups`` keeps subjects together; ``folds`` supplies a validated complete
     CV partition. Optional unique ``data_ids`` bind checkpoints to sample IDs.
     Standard NMFClassifier and screen/PCA/KNN layouts reuse screening statistics
@@ -355,6 +396,9 @@ def calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=1
     its earlier attempt remains recorded. Shared computation appears once in
     compute_seconds, never once per neighbor candidate. Candidate fit_seconds
     accounts for its KNN fit only; its shared_representation_key links the rest.
+    Supported Euclidean heads also reuse neighbor queries across k. Uncertain
+    batches and unsupported metrics/weights retain the public selected-k path.
+    Shared query/setup costs are separate from each head's voting/fallback time.
     """
     start_call = time.perf_counter()
     if isinstance(cv, (bool, np.bool_)) or not isinstance(cv, Integral) or cv < 2:
@@ -397,7 +441,7 @@ def calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=1
     data_ids = validate_metadata(data_ids, len(y), name="data_ids", unique=True)
     folds = build_cv_folds(X, y, cv=cv, seed=seed, groups=groups, folds=folds)
     runtime = _runtime_identity(estimator, threads)
-    identity = _jsonable({"schema_version": 2, "method": "explicit_grid_shared_knn_representation",
+    identity = _jsonable({"schema_version": 3, "method": "explicit_grid_shared_knn_representation",
                          "calibration": _search_identity(estimator, candidates, X, y, cv, seed, threads,
                                                          refit=False, groups=groups, folds=folds, data_ids=data_ids),
                          "runtime": runtime, "folds": [{"training_indices": a, "validation_indices": b} for a, b in folds],
@@ -487,8 +531,10 @@ def calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=1
                  "representation_fit_seconds": sum(row["representation_fit_seconds"] for row in receipts),
                  "validation_projection_seconds": sum(row["projection_seconds"] for row in receipts),
                  "knn_fit_seconds": sum(item["fit_seconds"] for row in receipts for item in row["neighbors"].values()),
+                 "knn_reuse_setup_seconds": sum(row["neighbor_reuse_setup_seconds"] for row in receipts),
+                 "knn_shared_query_seconds": sum(row["neighbor_query_seconds"] for row in receipts),
                  "knn_prediction_seconds": sum(item["prediction_seconds"] for row in receipts for item in row["neighbors"].values())}
-        report = {"schema_version": 2, "author": "Chang Cheng", "state": "cv_completed", "fingerprint": fingerprint,
+        report = {"schema_version": 3, "author": "Chang Cheng", "state": "cv_completed", "fingerprint": fingerprint,
                   "identity": identity, "active_threadpools": active_pools, "candidates": candidate_reports,
                   "ranked_candidate_indices": ranked, "selected_parameters": selected,
                   "selection_role": "provisional_highest_complete_training_cv_score_in_declared_grid",
@@ -500,7 +546,7 @@ def calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=1
                   "new_representation_fits": new_fits, "reused_representation_folds": reused,
                   "compute_seconds": costs, "tuning_seconds": sum(costs.values()),
                   "current_call_wall_seconds": time.perf_counter() - start_call,
-                  "timing_note": "Screen statistics and mask selection are counted once when computed; a partial resume may recompute in-memory screens. Shared fit and projection are counted once per representation/fold; candidate fit times contain only their KNN fits. Recorded numerical compute excludes checkpoint I/O and uncommitted interrupted attempts, which remain in attempts/.",
+                  "timing_note": "Screen statistics, mask selection, representation fits, projection and shared neighbor-query/setup work are counted once when computed. Candidate fit times contain only their KNN fits; candidate prediction times contain voting/guard/public-fallback work excluding shared queries. Resume totals retain historical completed compute, not newly performed work. A partial resume may recompute in-memory screens. Recorded numerical compute excludes checkpoint I/O and uncommitted interrupted attempts, which remain in attempts/.",
                   "refit_performed": False, "final_fit_seconds": 0.0, "is_fallback": False,
                   "tuning_complete": False, "defaults_frozen": False}
         report = _jsonable(report)

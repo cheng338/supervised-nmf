@@ -122,9 +122,13 @@ three-workload comparison. Neither alternative is included in this update.
 
 ## Compatibility and verification
 
-Python 3.10 support does not introduce a slower shared solver, version-dependent
-fallback, or dependency downgrade in the primary environment. The package uses
-one pure-Python wheel. The BLAS optimization above was timed in the primary
+This section records version 0.1.0a2 validation. Python 3.10 support ended for
+current development on October 20, 2026; see the
+[current compatibility policy](compatibility.md).
+
+Python 3.10 support in 0.1.0a2 did not introduce a slower shared solver,
+version-dependent fallback, or dependency downgrade in the primary environment.
+That release used one pure-Python wheel. The BLAS optimization above was timed in the primary
 Python 3.12/AOCL environment; compatibility checks do not replace those
 performance measurements.
 

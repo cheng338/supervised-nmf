@@ -13,11 +13,13 @@ from sklearn.dummy import DummyClassifier
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 from supervised_nmf import NMFClassifier
 from supervised_nmf.evaluation import calibration_search
 from supervised_nmf.screening import BinaryScreening
 from supervised_nmf.study import calibration_knn_grid
+from supervised_nmf._neighbors import _KNNQueryReuse
 
 
 class SharedKNNGridTests(unittest.TestCase):
@@ -49,7 +51,16 @@ class SharedKNNGridTests(unittest.TestCase):
             ordinary = calibration_search(estimator, grid, self.X, self.y, cv=5, seed=19, refit=False).report
         ordinary_predictions = observed
         observed = {}
-        with patch.object(KNeighborsClassifier, "predict", capture):
+        original_shared_predict = _KNNQueryReuse.predict
+
+        def capture_shared(reuse, k, **kwargs):
+            result = original_shared_predict(reuse, k, **kwargs)
+            classifier = reuse.models[k]
+            key = (k, classifier._fit_X.shape[1])
+            observed.setdefault(key, []).append(result[0].copy())
+            return result
+
+        with patch.object(_KNNQueryReuse, "predict", capture_shared):
             shared = self.shared(estimator, grid, name)
         self.assertEqual(set(observed), set(ordinary_predictions))
         for key, folds in ordinary_predictions.items():
@@ -127,6 +138,94 @@ class SharedKNNGridTests(unittest.TestCase):
         self.X = np.repeat(np.array([[0, 0], [1, 0], [0, 1], [1, 1]], dtype=np.float32), 20, axis=0)
         self.y = np.tile([0, 1], 40)
         self.assert_equivalent(KNeighborsClassifier(weights="distance"), {"n_neighbors": [1, 3, 40]}, "ties")
+
+    def test_sd_knn_full_grid_matches_ordinary_and_scales_each_fold_once(self):
+        self.y = np.where(self.y, "present", "absent")
+        estimator = NMFClassifier(solver="spa", screening="none", n_components=2,
+                                  random_state=7, knn_normalization="sd", weights="distance")
+        self.assert_equivalent(estimator, {"n_neighbors": [1, 3, 5]}, "sd-reference")
+        fit_rows, transform_rows = [], []
+        original_fit, original_transform = StandardScaler.fit, StandardScaler.transform
+
+        def observe_fit(scaler, X, y=None, **kwargs):
+            fit_rows.append(np.array(X, copy=True))
+            return original_fit(scaler, X, y, **kwargs)
+
+        def observe_transform(scaler, X, **kwargs):
+            transform_rows.append(np.array(X, copy=True))
+            return original_transform(scaler, X, **kwargs)
+
+        with patch.object(StandardScaler, "fit", observe_fit), \
+                patch.object(StandardScaler, "transform", observe_transform):
+            report = self.shared(estimator, {"n_neighbors": [1, 3, 5]}, "sd-count")
+        self.assertEqual(len(fit_rows), 5)
+        # One fit_transform of training coordinates and one validation transform
+        # per representation fold; candidate KNN fits do not rescale again.
+        self.assertEqual([len(X) for X in transform_rows], [64, 16] * 5)
+        for rows, fold in zip(fit_rows, report["identity"]["folds"]):
+            training = fold["training_indices"]
+            reference = estimator.fit(self.X[training], self.y[training])
+            np.testing.assert_array_equal(rows, reference.training_coordinates_)
+
+    def test_sd_explicit_threshold_class_order_matches_ordinary_grid(self):
+        self.y = np.where(self.y, "present", "absent")
+        for threshold in (.37, .5, 0., 1.):
+            estimator = NMFClassifier(solver="spa", screening="none", n_components=2,
+                                      random_state=7, knn_normalization="sd", weights="distance",
+                                      decision_threshold=threshold, positive_label="absent")
+            grid = {"n_neighbors": [1, 3, 5, 64]}
+            ordinary = calibration_search(estimator, grid, self.X, self.y,
+                                           cv=5, seed=19, refit=False).report
+            shared = self.shared(estimator, grid, f"sd-threshold-{threshold}")
+            self.assertEqual(shared["selected_parameters"], ordinary["selected_parameters"])
+            for expected, actual in zip(ordinary["candidates"], shared["candidates"]):
+                self.assertTrue(actual["valid"])
+                self.assertEqual([row["balanced_accuracy"] for row in expected["folds"]],
+                                 [row["balanced_accuracy"] for row in actual["folds"]])
+
+    def test_shared_costs_are_counted_once_and_resume_never_queries(self):
+        estimator = KNeighborsClassifier(algorithm="brute")
+        grid = {"n_neighbors": [1, 3, 5, 200]}
+        report = self.shared(estimator, grid, "cost-accounting")
+        costs = report["compute_seconds"]
+        self.assertEqual(report["schema_version"], 3)
+        self.assertEqual(costs["knn_shared_query_seconds"],
+                         sum(row["neighbor_query_seconds"] for row in report["representation_folds"]))
+        self.assertEqual(costs["knn_reuse_setup_seconds"],
+                         sum(row["neighbor_reuse_setup_seconds"] for row in report["representation_folds"]))
+        self.assertEqual(costs["knn_prediction_seconds"],
+                         sum(head["prediction_seconds"] for row in report["representation_folds"]
+                             for head in row["neighbors"].values()))
+        self.assertEqual(report["tuning_seconds"], sum(costs.values()))
+        self.assertTrue(all(len([query for query in fold["neighbor_queries"] if query["queried"]]) == 1
+                            for fold in report["representation_folds"]))
+        self.assertTrue(all(fold["neighbors"]["200"]["status"] == "failed"
+                            for fold in report["representation_folds"]))
+        source = report["identity"]["runtime"]["package_source"]
+        self.assertTrue(any(name.endswith("_neighbors.py") for name in source))
+        with patch.object(KNeighborsClassifier, "fit", side_effect=AssertionError("resume must not fit")), \
+                patch.object(_KNNQueryReuse, "predict", side_effect=AssertionError("resume must not query")):
+            resumed = self.shared(estimator, grid, "cost-accounting")
+        self.assertEqual(resumed["compute_seconds"], costs)
+        self.assertEqual(resumed["new_representation_fits"], 0)
+
+    def test_shared_query_warning_invalidates_affected_heads(self):
+        estimator = KNeighborsClassifier(algorithm="brute", weights="distance")
+        original = KNeighborsClassifier.kneighbors
+
+        def warn_shared(knn, X=None, n_neighbors=None, return_distance=True):
+            if n_neighbors == 4:
+                warnings.warn("shared neighbor query incomplete", ConvergenceWarning)
+            return original(knn, X, n_neighbors=n_neighbors, return_distance=return_distance)
+
+        with patch.object(KNeighborsClassifier, "kneighbors", warn_shared):
+            report = self.shared(estimator, {"n_neighbors": [1, 3]}, "query-warning")
+        self.assertTrue(all(not row["valid"] for row in report["candidates"]))
+        self.assertTrue(all(head["status"] == "nonconverged"
+                            for fold in report["representation_folds"]
+                            for head in fold["neighbors"].values()))
+        self.assertTrue(all(fold["neighbor_queries"][0]["warnings"]
+                            for fold in report["representation_folds"]))
 
     def test_screening_is_fit_on_each_training_fold_once_without_refit(self):
         estimator = Pipeline([("screen", BinaryScreening(percentile=50)),

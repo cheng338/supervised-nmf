@@ -69,9 +69,11 @@ class BinaryScreening(TransformerMixin, BaseEstimator):
     threshold). Features constant within each class but different between
     classes have infinite scores and are eligible; no variance floor is added.
     The signed t statistic uses mean(classes_[1]) - mean(classes_[0]).
-    Statistics use float64 with featurewise unit rescaling solely to avoid
-    numerical overflow/underflow; transform preserves input float32/float64
-    values. Diagnostic variances and standard errors are in these scaled units.
+    Statistics use float64 after subtracting each training feature's minimum
+    and rescaling its range. This preserves the exact pooled t/F statistic
+    while avoiding avoidable cancellation and extreme measurement units.
+    Transform preserves input float32/float64 values. Diagnostic variances and
+    standard errors are in these centered, scaled units.
     F scores can overflow when finite t scores are squared; selection ranks |t|
     directly and ``n_f_overflow_`` records this distinct numerical event.
     Both modes raise when no features survive, making invalid search candidates
@@ -130,10 +132,14 @@ class BinaryScreening(TransformerMixin, BaseEstimator):
         return self
 
     def _fit_statistics(self, X, y, classes, counts):
-        # Scale only the statistic computation, not the transformed features.
-        # A common positive scale per feature leaves pooled t/F unchanged and
-        # avoids squaring very large or very small raw measurement units.
+        # Translate and scale only statistics, never transformed features.
+        # Subtract before dividing: scaling a large offset first can discard
+        # a small spread that is still represented in the supplied input.
+        # Nonnegative finite X makes this subtraction overflow-safe; a minimum
+        # reference is independent of row order. Exact pooled t/F is invariant.
         X_statistics = X.astype(np.float64, copy=False)
+        offsets = X_statistics.min(axis=0)
+        X_statistics = X_statistics - offsets
         scales = X_statistics.max(axis=0)
         scaled = np.divide(X_statistics, scales, out=np.zeros_like(X_statistics), where=scales > 0)
         groups = [scaled[y == label] for label in classes]
@@ -167,6 +173,7 @@ class BinaryScreening(TransformerMixin, BaseEstimator):
         self.class_counts_ = counts
         self.scores_ = scores
         self.t_scores_ = t_scores
+        self.statistic_offsets_ = offsets
         self.statistic_scales_ = scales
         self.scaled_pooled_variances_ = pooled
         self.scaled_standard_errors_ = standard_error

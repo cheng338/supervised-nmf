@@ -1,6 +1,6 @@
 # Validation status and historical checks
 
-Records through October 5, 2026. Author: Chang Cheng.
+Records through October 6, 2026. Author: Chang Cheng.
 
 Environment: conda `py12_df_aocl`, Python 3.12.14, NumPy 2.5.2,
 SciPy 1.18.0, scikit-learn 1.9.0, threadpoolctl 3.5.0, AOCL-BLAS 5.2.0,
@@ -9,6 +9,70 @@ thread. These results do not establish compatibility with every allowed version.
 
 ## Current implementation checks
 
+- The [five-dataset expansion](multi-dataset-validation.md) adds **24 focused
+  checks** in each numerical environment: six for the seven-method helper,
+  nine for the grouped-split runner, six for source-image preparation, and
+  three for independent receipt/metric auditing. All pass. The independent
+  face-data audit reconstructs 1,024 images and 1,162,240 feature values exactly,
+  with zero discrepancies. All 35 final evaluations qualify. The pretest audit
+  checks 38,854 candidates and 2,270 representation-fold records; the posttest
+  audit reproduces metrics from 12,642 predictions and all 30 paired contrasts,
+  with zero errors. [Complete tables](multi-dataset-results.md) retain the mixed
+  outcomes. These checks do not change the frozen core implementation or
+  constitute repeated nested-CV replication.
+- The screened-CD supplement passed **six focused tests** in both numerical
+  environments (4.321 and 4.282 seconds). They check nontrivial fold-local
+  screening, public/reference feature masks and predictions, training-only
+  fitting, held-out-label invariance, the original refinement rule, failure
+  retention and frozen-access integrity. Exact logs/source/runtime receipts are
+  `tmp/celeba-screened-cd-tests-primary-20261006.*` and
+  `tmp/celeba-screened-cd-tests-pinned-20261006.*`. Both study audits passed;
+  these study-helper checks did not modify or rerun the frozen core test suite.
+- The unscreened-NMF supplement passed **six dedicated tests** in both numerical
+  environments (5.238 and 5.124 seconds), checking both public-estimator/pipeline
+  equivalence paths, training-only fits, failure qualification, frozen receipt
+  integrity, contrast direction and repeated-access refusal. Logs and exact
+  source/version receipts are `tmp/celeba-unscreened-tests-primary-20261006.*`
+  and `tmp/celeba-unscreened-tests-pinned-20261006.*`. The frozen core package is
+  unchanged; these are additional study-helper checks, not a claimed full-suite
+  rerun. Both independent supplemental audits passed with zero errors.
+- The later identity-validation helper passed all **10 dedicated tests** in both
+  numerical environments (5.417 and 6.124 seconds). These cover fold qualification,
+  frozen-input integrity, scaling choices and equivalence with public
+  `NMFClassifier`, including the unscaled 4,096-feature float32 face path. The
+  core package sources still match the 303-test revision below. The new study's
+  independent pretest and posttest audits pass with zero errors; no full-suite
+  rerun is claimed for these study-only additions.
+- The final Wang-study revision passed **303 tests** in the primary environment
+  (121.042 seconds) and the exact Python 3.10.12 numerical profile (65.999
+  seconds), with no skips. The first compatibility attempt passed 302 tests
+  and encountered one missing optional Matplotlib dependency in a new report
+  test. After installing Matplotlib 3.10.9 under the unchanged numerical
+  constraints, the complete suite passed; `pip check` was clean. Logs are
+  `tmp/wang-final-check-aocl.log`, `tmp/wang-final-check-robust.log` (the retained
+  initial failure), and `tmp/wang-final-check-robust-with-study.log`.
+  `runs/wang-validation-audit-20261006/implementation-checks.json` binds the
+  logs, package sources and tests by hash. Observed times reflect concurrent
+  host work and do not compare environment speeds.
+- The final local wheel and source archive were rebuilt with the BLAS change
+  and completed study documentation. Isolated wheel checks passed in both
+  environments; packaged implementation, study sources and reports match the
+  files at that revision byte for byte. The later identity-validation study and
+  its documentation are not included in those archived builds. Prior archives
+  are preserved separately.
+  `runs/wang-validation-audit-20261006/local-build.json` records archive hashes
+  and checks; build and wheel logs use the `tmp/wang-final-` prefix. These are
+  local artifacts, with no package publication.
+- At the initial [SPA BLAS optimization](blas-optimization.md) revision, all **300 tests**
+  passed in `py12_df_aocl` (61.257 seconds) and the exact Python 3.10.12
+  compatibility environment (58.437 seconds). The seven dedicated numerical
+  regression tests cover the former NumPy/NNLS algorithm, layouts, ties,
+  ill-conditioning, mutation, iteration failures and both final classifiers.
+  Seven paired timing repeats on each of four training-only workloads produced
+  identical anchors, factors, coordinates and classifier outputs, with
+  12.6–16.6% lower fit-plus-projection time. These checks do not complete the
+  separate Wang scientific validation. Logs are `tmp/blas-full-check-aocl.log`
+  and `tmp/blas-full-check-robust.log`.
 - Version **0.1.0a1** adds optional logistic regression while retaining
   SPA, absolute screening and KNN as defaults. The complete suite passed
   **281 tests in 59.991 seconds** in `py12_df_aocl` and **281 tests in
@@ -87,7 +151,137 @@ The paired smoke uses a single dataset, one candidate per method, and a small
 development split. It tests functionality and audit records. Its accuracy and
 timings cannot determine defaults, establish scientific superiority, reproduce
 the historical experiment, or close Wang's empirical concerns. In particular,
-the full repeated simulation study and numerical tuning/refinement remain open.
+the historical smoke runs did not complete the repeated simulation study or
+numerical tuning/refinement. The later completed study is recorded separately
+below; its finite-grid and local-refinement limitations remain explicit.
+
+## Completed Wang validation after the BLAS change
+
+The [integrated report](wang-validation-report.md) records 900 independently
+retuned simulation draws (9,930 valid evaluations), ten fully retuned CelebA
+resamples (260 valid evaluations) and twenty fixed-setting resamples (520 valid
+evaluations). The combined independent audit passed with zero discrepancies:
+113,156 CV candidates, 565,780 candidate-fold records and 7,886,400 saved predictions were
+checked, including all matched masks and representative-case bootstrap intervals.
+All final fits qualified; infeasible CV candidates were retained and rejected.
+The 11-arm historical diagnostic and 21-receipt Fashion reanalysis remain
+separate supporting records. That study accessed no official image-test outcomes.
+
+SPA improves the KNN procedure on CelebA Smiling but trails logistic PCA/pixel
+baselines. Simulations and Fashion-MNIST do not support a general NMF advantage.
+The original-size historical diagnostic identifies an insufficient iteration
+cap as a sufficient numerical cause in the reconstruction, not an exact
+historical-environment reproduction. Finite tuning grids, reused image
+validation, unverified identity separation, reduced simulation dimensions,
+whole-study memory and theoretical assumptions remain qualified in the report.
+
+## Completed identity-disjoint face validation
+
+The [CelebA Smiling report](celeba-identity-validation.md) records a separate
+October 6 validation chosen from the earlier positive development finding.
+Official identity metadata, verified against the published checksum, confirms
+that all original CelebA partitions are pairwise disjoint by annotated identity.
+The new study uses 2,000 training identities and one preselected image from each
+of the 1,000 official-test identities. Training image IDs are fresh relative to
+prior caches; training identities may recur. The historical uncertainty about
+partial in-memory test decoding in an abandoned attempt remains disclosed.
+
+The user's request for broader KNN tuning superseded the first coarse calibration
+before any new test access. The dense successor offers every integer K from 1 to
+101, plus 125, 151 and 201, to all four methods. Five-fold training-only tuning
+and one local refinement produced 4,690 candidates and 23,450 candidate-fold
+records. Two infeasible candidates account for all ten invalid fold records;
+their failures are retained. The independent pretest audit passed before the
+frozen configurations were evaluated on all planned test rows.
+
+The sNMF procedure obtained **81.40% accuracy and 81.37% balanced accuracy**;
+sPCA obtained **78.50% and 78.51%**, respectively. The primary paired balanced-
+accuracy difference is **+2.86 percentage points**, with a 95% class-stratified
+bootstrap interval **[+0.68, +5.05]**. Screening-only KNN obtained 79.60% accuracy
+and 79.58% balanced accuracy; the sNMF contrast with that control remains
+inconclusive. Raw-pixel KNN obtained 62.20% and 61.98%. All four final evaluations
+qualified without warnings. The public sNMF estimator and reference pipeline
+had identical labels, screening masks and probabilities.
+
+The posttest audit independently reconstructed all 1,000 test images and labels,
+checked 4,000 predictions, and reproduced every metric and all three paired
+contrasts with zero discrepancies. The result supports this selected task and
+KNN comparison, conditional on a fixed training cohort, finite search and fitted
+models. It does not establish a universal NMF advantage, a retraining uncertainty
+interval, or superiority over parametric classifiers. This study evaluated
+official-test outcomes once; earlier studies above retain their own test-access
+scope. Frozen receipts and the rendered figure are under
+`runs/celeba-identity-validation-dense-knn-20261006/`.
+
+## Completed unscreened-NMF supplement
+
+The [supplement](celeba-unscreened-supplement.md) restores the dissertation's
+standard CD-NMF+KNN baseline and adds unscreened SPA-NMF+KNN. It was designed
+after the original face-test results were known and therefore provides
+descriptive additional comparisons on the same people. The original four
+models, saved predictions and results remain unchanged.
+
+Each new method independently used the same five training folds, initial five
+ranks and 104 K values, followed by the same single local refinement rule.
+All **1,045 candidates and 5,225 candidate-fold results** qualified without
+warnings. Standard CD selected rank 80 and K 101; unscreened SPA selected rank
+80 and K 18. Both ranks remain at the explored upper boundary. These are
+finite-search results and do not establish globally optimized NMF baselines.
+
+Standard CD-NMF+KNN achieved **73.00% accuracy / 72.95% balanced accuracy**;
+unscreened SPA-NMF+KNN achieved **61.90% / 61.82%**. Both used all 4,096 pixels,
+qualified without fit/projection warnings, and matched their reference pipeline
+labels and probabilities exactly. The CD final fit converged at 2,199 iterations
+under the declared 20,000 cap. The original screened SPA result remains
+81.40% accuracy / 81.37% balanced accuracy.
+
+Descriptive paired balanced-accuracy differences favor screened SPA by
+8.42 points over standard CD (95% interval [5.53, 11.30]) and 19.55 points over
+unscreened SPA ([16.03, 23.14]). Independently selected ranks/K differ, so these
+compare complete procedures; they are not fixed-setting causal effects of
+screening. The post-evaluation audit checked all 2,000 new predictions and
+4,000 original predictions, every reported metric and all 11 saved directional
+contrasts, with zero discrepancies. It also records all 15 distinct six-method
+pairs. Supplemental intervals are unadjusted and conditional on the fitted
+models; they do not provide a new unseen-test confirmation.
+
+The full six-method table and figure, both audit receipts, and frozen source/data
+bindings are linked from the supplement, with raw receipts under
+`runs/celeba-unscreened-supplement-20261006/`. The historical below-chance
+simulation diagnostic remains a separate experiment.
+
+## Completed screened-CD supplement
+
+The [seventh-method supplement](celeba-screened-cd-supplement.md) adds absolute
+screening followed by CD-NMF and KNN. It uses the same 2,000 training and 1,000
+test identities, the original screened cutoff/rank/dense-neighbor grid, and
+one local refinement. All **2,084 candidates and 10,420 candidate-fold scores**
+qualify without warnings; 120 shared representation-fold fits underlie those
+scores. The selected cutoff 8, rank 10 and K 39 have no flagged unresolved
+grid boundary, although this finite search is not global optimization.
+
+Screened CD obtains **79.00% accuracy / 78.98% balanced accuracy**. Its 124-pixel
+mask exactly matches the original screened SPA mask. Rank and K differ from
+SPA's rank 20 and K 11, so the comparison concerns independently tuned complete
+pipelines. CD converges in 705 iterations; final fit, prediction and separate
+public-estimator equivalence checks produce no warnings. Public/reference
+labels and masks are exact, with zero maximum probability difference.
+
+Screened SPA's advantage is **2.40 balanced-accuracy points**, with a
+descriptive, unadjusted 95% paired interval of **[0.18, 4.62]**. Screened CD's
+6.02-point advantage over unscreened CD has interval [3.10, 8.91]; its differences
+from screened PCA (+0.47 points) and screening-only KNN (-0.60 points) remain
+inconclusive. These additional results were designed after the prior six test
+outcomes were known, and do not provide new independent confirmation.
+
+The pre-evaluation audit verifies 120 training-fold screening masks independently
+and all grid, fold, selection, numerical and source bindings. The post-evaluation
+audit recomputes 1,000 new predictions, rechecks 6,000 existing predictions,
+verifies seven reported directional contrasts and records all 21 distinct
+seven-method pairs. Both audits pass with zero errors. All earlier scientific
+sources and results remain unchanged. Full metrics, inference limits, the
+seven-method figure and raw receipts are linked from the new report; its run is
+`runs/celeba-screened-cd-supplement-20261006/`.
 
 ## Four-solver benchmark
 
@@ -100,7 +294,7 @@ The four-solver benchmark began under `runs/four-solvers-20261003/` and complete
 under `runs/four-solvers-20261004-repair/` after the documented ANLS-BPP repair.
 It compared the four solvers with absolute screening fixed on Fashion-MNIST and
 a matched CelebA extension. The frozen rule selects SPA; the report remains
-`selected_for_audit`. No new official-test run has started. The reporter includes
+`selected_for_audit`. That comparison did not evaluate official-test outcomes. The reporter includes
 a separate Fashion-MNIST baseline table matched
 at 8,000 training observations and seed 43, so its three-task baselines are not
 mistaken for comparisons against NMF averages across all 18 configurations.
@@ -331,16 +525,62 @@ outperform the NMF methods in mean balanced accuracy. Dataset/task omission
 and workload sensitivities limit the scope of this recommendation. The report
 remains `selected_for_audit`; official test data were not evaluated.
 
+## October 20 approved source integration
+
+The integration batch was authorized on Robust with a total budget of 20 compute
+threads and Python 3.12. Numerical stages run sequentially; one-thread and
+20-thread measurements are separate. No local numerical checks were run.
+Historical study and release results above retain their original source.
+
+The frozen v3 source passed 260 regression tests, including classifier
+capabilities, fitted SD scaling, margins, serialization, warning handling,
+checkpoint identity and accounting, sparse/uncertain KNN fallback, numerical
+range repairs, and recovery reporting. The original-trigger replay passed
+114 NNLS checks and 204 screening checks. NNLS returned 102 qualified solutions
+and preserved six expected iteration-cap errors and six explicit range errors.
+Screening used 17 saved fixtures, four layouts and three cutoffs against the
+represented-input oracle, including empty-selection and underflow failures.
+
+All eight integrated KNN grid comparisons retained exact fold-level predictions,
+candidate rankings and resume accounting. These fixed-fixture checks and
+profiling repetitions do not add independent dataset replications or establish
+universal predictive gains. Detailed source-bound receipts, including the
+initial sparse-metadata error and corrected rerun, are retained in
+`output/implementation-20261020/`.
+
+The residual comparisons passed all 17 diagnostic cases and six actual public-fit
+cases at each of one and twenty native threads. At one thread, all ten accelerated
+diagnostic cases were faster in every paired repetition; complete large fits
+improved by about 5–8% in median time, with unchanged fitted state and predictions.
+Twenty-thread execution retained the original expression.
+
+Final source v4 narrows this branch to recognized MKL pools at one thread.
+Its three focused routing/arithmetic tests passed, along with actual 1/20-thread
+routing checks and paired diagnostic/common-map fits against v3. All other
+package source files were verified unchanged. AOCL/BLIS, OpenBLAS and mixed or
+unknown backends retain the existing path. The source changes remain unreleased;
+version 0.2.0 artifacts do not include them. Decisions, measured costs and
+preserved receipts are recorded in the locally retained implementation report,
+`output/implementation-20261020/IMPLEMENTATION-REPORT.md`, which is not bundled
+with the public source.
+
 ## Pending scientific and release work
 
 - Final evidence audit and release documentation for the completed
   CD/SPA/MU/ANLS-BPP comparison with absolute screening fixed, before freezing
   the general solver default for official-test evaluation.
-- Historical 32.42% baseline reproduction and controlled causal diagnosis.
-- Full harder-simulation study and broader independent replication; the scoped
-  CelebA refinement/default comparison is complete.
-- Wider independently tuned PCA/screening-only comparisons beyond the first
-  starting grid, identity audit, and frozen final-test evaluation.
-- Full memory/scaling measurements and dissertation-ready figures/tables.
-- Broader compatibility verification, author-selected distribution license, and
-  any publication to GitHub or a package index.
+- Exact historical-environment reproduction remains unavailable; the completed
+  original-size controlled reconstruction identifies an insufficient iteration
+  cap as a sufficient cause of below-chance behavior in that reconstruction.
+- Broader independent real-data replication beyond the completed 900-draw
+  simulation study, conditional CelebA resamples and identity-disjoint Smiling
+  test. The latter completes an identity audit and frozen final-test comparison
+  for that task; other datasets, retraining uncertainty and population scope
+  remain open. Independently tuned PCA/screening-only and logistic development
+  comparisons are complete within the reported finite grids.
+- Full-study memory and broad scaling measurements. The completed BLAS benchmark
+  includes native process peak-memory measurements; study figures and tables
+  appear in the [Wang validation report](wang-validation-report.md).
+- Broader compatibility verification and any new release or package-index
+  publication. Chang Cheng's original work is All Rights Reserved while the
+  distribution license remains undecided; see [LICENSE](../LICENSE).

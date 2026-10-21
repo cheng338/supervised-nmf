@@ -8,6 +8,9 @@ dist/
 tmp/
 data/
 runs/
+output/
+references/
+HANDOFF_CONDA_REPO_PLUGIN_FIX_9955HX.txt
 *.joblib
 portable_speedtest/validation/*.json
 

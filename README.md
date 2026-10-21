@@ -3,7 +3,8 @@
 `supervised-nmf` implements supervised nonnegative matrix factorization for
 binary classification with a scikit-learn-style interface. It screens features
 using the training labels, fits a nonnegative representation, and classifies
-new observations with k-nearest neighbors (KNN) or logistic regression.
+new observations with k-nearest neighbors (KNN), logistic regression or a
+linear support vector machine (SVM).
 
 The package provides:
 
@@ -14,25 +15,34 @@ The package provides:
 - **Feature-anchor factorization** (`FeatureSPA`), available as a separate
   transformer with fixed-basis projection for new observations.
 - **Classification comparisons** with screened PCA, screening without
-  factorization, raw features, and unscreened CD-NMF, using either classifier.
+  factorization, raw features, and unscreened CD-NMF, using the selected classifier.
 
 Chang Cheng developed the method and original research scripts. This package
 implements Chapter 7 of:
 
-> Cheng, Chang (2026). *Overcoming the Curses of Dimensionality and
-> Kernelization: Scalable DWD and Supervised NMF*. Doctoral dissertation
+> Cheng, Chang (2026). *Ensemble Kernel Distance-Weighted Discrimination and
+> Supervised Nonnegative Matrix Factorization for Classification*. Doctoral dissertation
 > manuscript, Purdue University, Department of Statistics.
 
 See [CITATION.cff](CITATION.cff) for citation details and
-[source provenance](provenance/README.md) for the original scripts. The current
-formal release is **0.2.0**, adding guarded batched projection, optional process
-workers, saved decision thresholds and reduced SPA workspace memory. See the
-[release notes](docs/release-0.2.0.md).
-A distribution license has not yet been selected.
+[source provenance](provenance/README.md) for the original scripts. The latest
+formal release is 0.2.0; this checkout also contains the unreleased changes
+described below.
+
+**Copyright (c) 2026 Chang Cheng. All Rights Reserved.** A distribution license
+has not yet been selected. Public availability of this repository does not
+grant an open-source license. See [LICENSE](LICENSE) and the separately
+applicable [third-party notices](THIRD_PARTY_NOTICES).
+
+The optional KNN standard-deviation scaling and linear-SVM interface described
+here are **unreleased source changes**. Their integration checks passed on Robust;
+they are not included in the released 0.2.0 wheel. See
+[validation](docs/validation.md#october-20-approved-source-integration).
 
 # Installation
 
-Python 3.10 or later is required. Dependencies are NumPy, SciPy, scikit-learn
+Python 3.11 or later is required for current development. Python 3.10 support
+ended on October 20, 2026. Dependencies are NumPy, SciPy, scikit-learn
 1.6 or later (below 2.0), threadpoolctl, and joblib 1.3 or later. With access to the repository:
 
 ```shell
@@ -52,12 +62,10 @@ python -m pip install ".[study]"
 The study extra also includes Matplotlib. Use `python -m pip install -e .`
 for an editable development installation. Tested environments and remaining
 compatibility checks are listed in [validation](docs/validation.md).
-The supplied Python 3.10.12 numerical profile is recorded in
-[runtime compatibility](docs/compatibility.md), including exact dependency pins
-and instructions for preserving an existing environment. The full source suite
-passed all 370 tests on Windows with Python 3.10 and 3.12. Earlier Linux checks
-covered the projection/threshold changes; the final workspace-lifetime change
-has been verified on Windows. See [implementation checks](docs/implementation-improvements.md).
+Python 3.12 in `py12_df_aocl` remains the primary development environment.
+See [runtime compatibility](docs/compatibility.md) for the current setup policy
+and historical numerical profiles. Earlier Python 3.10 test results describe
+their recorded revisions, not support for current development.
 
 # Basic use
 
@@ -107,19 +115,65 @@ This optional extension standardizes the fitted coordinates inside the
 classifier, using training means and scales. It does not change screening,
 factorization, or the coordinates returned by `transform`.
 
+In the unreleased source, optional KNN scaling divides each coordinate by its
+training-fitted standard deviation without centering:
+
+```python
+scaled_knn = NMFClassifier(
+    knn_normalization="sd", n_neighbors=5, random_state=42,
+).fit(X_train, y_train)
+```
+
+The default `knn_normalization="none"` preserves unscaled KNN. SD changes the
+distance metric used by the head; it does not alter screening, factorization,
+`training_coordinates_` or `transform`. The fitted scaler is reused at
+prediction time and follows scikit-learn's constant/nearconstant scale handling.
+SD can amplify weak or nuisance coordinates, so it is an explicit choice rather
+than an automatic accuracy improvement. Logistic regression retains its existing
+scaler; the KNN option does not add another one.
+
+The unreleased linear-SVM head uses unscaled NMF coordinates and a primal
+L2-regularized squared-hinge objective:
+
+```python
+svm_model = NMFClassifier(
+    classifier="linear_svm", svm_C=1.0,
+    svm_max_iter=20000, svm_tol=1e-5, random_state=42,
+).fit(X_train, y_train)
+svm_predictions, margins = svm_model.predict_with_decision_function(X_test)
+```
+
+Margins are real decision scores toward `classes_[1]`, not probabilities.
+Positive margins select that class; exact zero selects `classes_[0]`.
+SVM has no `predict_proba` or `predict_with_probabilities` method, and fitting
+with a non-`None` `decision_threshold` raises an error. There is no implicit
+standardization or probability calibration. Tune `svm_C` with the coordinate
+units in mind; its numerical cap and tolerance are separate from NMF's.
+
 # Solvers and defaults
 
 The default is **SPA with absolute screening**. Use `solver="mu"` for
 multiplicative updates or `solver="cd"` for the dissertation's original
 coordinate-descent implementation.
 
-SPA uses direct BLAS anchor updates and releases anchor-selection workspaces
-before fitting its basis. Version 0.2.0 uses guarded batched NNLS for
-suitable query batches, with public SciPy NNLS as its numerical fallback.
-Use `projection_solver="scipy"` for the original row-wise projection.
-Optional `projection_workers=8` enables reusable processes for large batches;
-the default is one worker. See [projection controls](docs/api.md#spa-projection-execution)
-and the [implementation checks](docs/implementation-improvements.md).
+In the current unreleased source, `training_coordinates="auto"` trains the
+SPA classifier on fixed-basis NNLS coordinates, using the same fitted basis
+and projection map for training and prediction. This adds a training projection
+to fit time. CD and MU retain their factorization's returned training coordinates.
+Set `training_coordinates="fit_transform"` explicitly to reproduce the previous
+coordinate convention. Retraining can change predictions and accuracy; an
+accuracy improvement is not guaranteed. The standalone `FeatureSPA` transformer
+keeps its existing behavior; see [training coordinates](docs/api.md#training-coordinates).
+The released 0.2.0 wheel still defaults to `training_coordinates="fit_transform"`.
+
+SPA uses direct BLAS updates and reuses the fixed NNLS matrix layout during
+projection. New models use guarded batched NNLS for suitable query batches,
+with public SciPy NNLS as the numerical fallback. Use
+`projection_solver="scipy"` for the original row-wise projection. Optional
+`projection_workers=8` enables reusable process workers for large batches;
+the default is one worker. See [projection controls](docs/api.md#spa-projection-execution),
+the [0.2.0 implementation record](docs/implementation-improvements.md), and the
+earlier [BLAS checks](docs/blas-optimization.md).
 
 | Solver | Factorization |
 | --- | --- |
@@ -134,29 +188,36 @@ and the [implementation checks](docs/implementation-improvements.md).
 | `screening` | `"absolute"` | Also accepts `"percentile"` or `"none"`. |
 | `score_threshold` | `2.0` | Inclusive cutoff on the absolute pooled-t score. |
 | `percentile` | `10.0` | Retained percentage when percentile screening is selected. |
-| `classifier` | `"knn"` | Final classifier; also accepts `"logistic"`. |
+| `classifier` | `"knn"` | Final classifier; also accepts `"logistic"` and unreleased `"linear_svm"`. |
 | `n_neighbors` | `5` | Number of neighbors; used only by KNN. |
 | `weights` | `"uniform"` | KNN-only weighting; `"distance"` is also available. |
+| `knn_normalization` | `"none"` | Unreleased KNN option: `"sd"` uses training-fitted SD without centering. |
 | `logistic_C` | `1.0` | Inverse L2 regularization strength for logistic regression. |
 | `logistic_max_iter` | `1000` | Logistic-regression iteration limit, independent of the NMF cap. |
 | `logistic_tol` | `1e-4` | Logistic-regression stopping tolerance. |
 | `logistic_class_weight` | `None` | Also accepts `"balanced"` from training labels, or a dictionary of class weights. |
+| `svm_C` | `1.0` | Unreleased linear-SVM inverse L2 regularization strength; depends on coordinate units. |
+| `svm_max_iter` | `20000` | Linear-SVM iteration cap, independent of the NMF cap. |
+| `svm_tol` | `1e-5` | Linear-SVM stopping tolerance. |
+| `svm_class_weight` | `None` | Linear-SVM class weights: `None`, `"balanced"` or a dictionary. |
 | `max_iter` | `20000` | CD/MU iteration limit or the limit for each SPA NNLS solve. |
 | `tol` | `1e-4` | CD/MU stopping tolerance; SPA's NNLS routine does not use this parameter. |
 | `random_state` | `None` | Set an integer for reproducible CD/MU initialization. |
-| `training_coordinates` | `"fit_transform"` | Uses the factorization's returned training coordinates; `"transform"` re-encodes them against the fitted basis. |
+| `training_coordinates` | `"auto"` | Uses `"transform"` for SPA and `"fit_transform"` for CD/MU; either convention can also be selected explicitly. |
 | `projection_solver` | `"auto"` | SPA query projection: guarded batching; also `"scipy"` or `"batched"`. |
 | `projection_workers` | `1` | Maximum SPA projection processes; independent of outer CV workers. |
 | `projection_batch_size` | `256` | Maximum query rows per NNLS block. |
 | `projection_native_threads` | `1` | Numerical threads per projection process. |
-| `decision_threshold` | `None` | Optional frozen probability cutoff; `None` preserves the classifier's decision rule. |
-| `positive_label` | `None` | Class to threshold; defaults to `classes_[1]`. |
+| `decision_threshold` | `None` | Optional frozen probability cutoff for KNN/logistic; SVM requires `None`. |
+| `positive_label` | `None` | Class for probability thresholding; defaults to `classes_[1]`. Does not reverse SVM margins. |
 
 Rank, screening cutoff and the selected classifier's predictive parameters
 require tuning for the data. CD and MU use different stopping criteria, so
 equal tolerances do not imply equal
 numerical accuracy. Features and factors are not automatically rescaled for
-NMF or KNN. Logistic regression uses a separate fitted coordinate scaler.
+NMF. KNN is unscaled by default and offers explicit SD scaling in current
+source. Logistic regression uses a separate fitted coordinate scaler; linear
+SVM uses the unscaled coordinates.
 
 The default follows the recorded accuracy-time comparison on CelebA and
 Fashion-MNIST. Its evidence remains under final audit and does not establish
@@ -171,10 +232,9 @@ Version 0.1.0a2 adds subject-aware training folds, bounded rank exploration,
 reused fold-local screening statistics, and evaluation summaries with class
 support and numerical-stage diagnostics. Solver, screening, and rank defaults
 are unchanged in that release. Version 0.2.0 additionally provides guarded
-batched projection, saved decision thresholds and lower SPA workspace memory.
-Existing serialized models retain their SciPy projection path. See
-[tuning improvements](docs/tuning-improvements.md) and the
-[API guide](docs/api.md).
+batched projection and saved decision thresholds; existing serialized models
+retain their SciPy projection path. See the [0.2.0 release record](docs/release-0.2.0.md),
+[tuning improvements](docs/tuning-improvements.md), and the [API guide](docs/api.md).
 
 Run `python examples/grouped_tuning.py --output runs/grouped-example` for a
 small subject-separated example. Search budgets and failed upper-rank
@@ -217,6 +277,14 @@ For logistic regression, use `calibration_search` with
 KNN parameters in that grid. The scaler is fitted within each training fold.
 `calibration_knn_grid` is restricted to KNN.
 
+For linear SVM, use `calibration_search` with
+`NMFClassifier(classifier="linear_svm")` and tune `svm_C` alongside rank and
+screening. `comparison_models(classifier="linear_svm")` supplies independent
+SVM grids for the NMF, PCA, screening-only and raw-feature comparisons, with
+no added scaler. Evaluation uses genuine margins for AUROC and average
+precision and records them separately from probabilities. The completed
+integration checks do not establish a universal accuracy advantage.
+
 # Examples and diagnostics
 
 Run the example scripts from the source checkout or source archive:
@@ -236,9 +304,47 @@ preprocessing; the examples use the training and validation partitions.
 Datasets are not included in the package.
 
 `compare_classifiers.py` compares KNN and logistic regression across matched
-NMF, PCA, screening-only and raw-feature paths. Completed CelebA and
-Fashion-MNIST solver studies used KNN; logistic regression has not been selected
-as a new default or established as superior by those results.
+NMF, PCA, screening-only and raw-feature paths. The completed
+[Wang validation](docs/wang-validation-report.md) adds 900 independently retuned
+simulation draws, ten fully retuned CelebA resamples and twenty fixed-setting
+resamples. It finds classifier-dependent benefits and retains unfavorable
+comparisons with simpler baselines. No classifier default is changed.
+
+The subsequent [CelebA Smiling identity validation](docs/celeba-identity-validation.md)
+uses 2,000 training identities and one face from each of 1,000 separate official-test
+identities. All four KNN procedures receive 104 initial neighbor choices in
+training-only CV. Frozen sNMF+KNN achieves 81.40% accuracy versus 78.50% for
+sPCA+KNN; the balanced-accuracy difference is +2.86 percentage points
+(paired 95% interval +0.68 to +5.05). Both independent audits pass. This supports
+a dataset-specific KNN comparison; the task was selected from prior development
+evidence, and the difference from screening-only KNN remains inconclusive.
+
+The [unscreened NMF supplement](docs/celeba-unscreened-supplement.md) restores
+the dissertation's standard CD-NMF+KNN baseline and adds unscreened SPA-NMF+KNN,
+bringing this face comparison to six KNN procedures. The supplement was designed
+after the original test outcomes were known; the original four results remain
+unchanged. Standard CD-NMF+KNN achieves 73.00% accuracy and unscreened SPA-NMF+KNN
+61.90%; both evaluations and independent audits pass. Both added methods select
+rank 80 at the explored upper boundary,
+so their results do not establish the best attainable unscreened-NMF accuracy.
+
+The subsequent [screened CD supplement](docs/celeba-screened-cd-supplement.md)
+completes the seven-method comparison. Screened CD-NMF+KNN obtains 79.00%
+accuracy after selecting cutoff 8, rank 10 and K 39; screened SPA remains at
+81.40%. Both retain the same 124 pixels, but their ranks and K differ. SPA's
+balanced-accuracy advantage is 2.40 points (descriptive, unadjusted 95% interval
+0.18 to 4.62). All 2,084 new training candidates and the final CD fit qualify;
+both independent audits pass. This additional known-test comparison preserves
+all six earlier results and does not establish universal solver superiority.
+
+The [completed additional-dataset study](docs/multi-dataset-results.md) adds
+FEI, CMU Faces, Sonar, Spambase and WDBC, with all 35 final evaluations qualified
+and both independent audits passed. Face tuning and testing separate subjects.
+SPA sNMF has higher accuracy than screened PCA on FEI (94.17% versus 91.67%),
+ties on WDBC, and is lower on the other three tasks. The FEI difference remains
+inconclusive under its subject-bootstrap interval. Every dataset outcome is
+retained; one reserved split per dataset does not constitute repeated nested-CV
+replication. See the [fixed protocol and sources](docs/multi-dataset-validation.md).
 
 After fitting, inspect `selected_features_`, `selected_components_`,
 `training_coordinates_`, `n_iter_`, `converged_`, and `convergence_warnings_`.
@@ -246,7 +352,7 @@ After fitting, inspect `selected_features_`, `selected_components_`,
 `classifier_n_iter_`, `classifier_converged_`, and
 `classifier_convergence_warnings_` distinguish classifier diagnostics from
 factorization diagnostics. `fit_times_` separates screening, factorization,
-training projection and classifier fitting, including logistic scaling.
+training projection and classifier fitting, including fitted head scaling.
 Evaluation reports record prediction time; search reports record
 tuning and final-fit time separately.
 

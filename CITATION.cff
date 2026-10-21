@@ -10,8 +10,9 @@ authors:
     given-names: Chang
 abstract: >-
   Supervised nonnegative matrix factorization for binary classification, using
-  feature screening, nonnegative factorization and nearest-neighbor or logistic prediction.
-  Implements Chapter 7 of Chang Cheng's dissertation, Overcoming the Curses of
-  Dimensionality and Kernelization: Scalable DWD and Supervised NMF, from the
-  original simulation and CelebA experiment scripts.
+  feature screening, nonnegative factorization and classification.
+  Implements the supervised NMF methodology in Chapter 7 of Chang Cheng's
+  dissertation, Ensemble Kernel Distance-Weighted Discrimination and Supervised
+  Nonnegative Matrix Factorization for Classification, from the original
+  simulation and CelebA experiment scripts.
 

@@ -359,12 +359,12 @@ class PortableManifestTests(unittest.TestCase):
 
 
 class PortableCompatibilityTests(unittest.TestCase):
-    def test_entrypoints_and_unpublished_source_parse_under_python_310_grammar(self):
+    def test_entrypoints_and_current_source_parse_under_python_311_grammar(self):
         paths = list(PORTABLE.glob("*.py")) + list((ROOT / "src/supervised_nmf").rglob("*.py"))
         self.assertGreater(len(paths), 3)
         for path in paths:
             with self.subTest(path=path.relative_to(ROOT)):
-                ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path), feature_version=(3, 10))
+                ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path), feature_version=(3, 11))
 
     def test_native_pool_check_requires_one_thread_in_every_pool(self):
         self.assertTrue(benchmark.native_pools_valid([{"num_threads": 1}, {"num_threads": 1}]))

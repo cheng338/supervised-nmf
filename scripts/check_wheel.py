@@ -23,7 +23,13 @@ with zipfile.ZipFile(wheel) as archive:
     metadata = Parser().parsestr(archive.read(metadata_file).decode("utf-8"))
     assert metadata["Author"] == "Chang Cheng"
     assert metadata["Version"] == version
-    assert metadata["Requires-Python"] == ">=3.10"
+    assert metadata["Requires-Python"] == ">=3.11"
+    assert metadata["License-Expression"] == "LicenseRef-All-Rights-Reserved AND BSD-3-Clause"
+    license_files = ("LICENSE", "THIRD_PARTY_NOTICES")
+    assert set(metadata.get_all("License-File", [])) == set(license_files)
+    dist_info = metadata_file.rsplit("/", 1)[0]
+    for license_file in license_files:
+        assert archive.read(f"{dist_info}/licenses/{license_file}") == (root / license_file).read_bytes(), license_file
     assert "study" in metadata.get_all("Provides-Extra", [])
     assert any("matplotlib" in requirement and 'extra == "study"' in requirement
                for requirement in metadata.get_all("Requires-Dist", []))
@@ -102,6 +108,11 @@ np.testing.assert_array_equal(logistic_labels, logistic.predict(data.data[:5]))
 
 with tarfile.open(root / "dist" / f"supervised_nmf-{version}.tar.gz") as archive:
     members = archive.getnames()
+    for license_file in license_files:
+        member = f"supervised_nmf-{version}/{license_file}"
+        assert archive.getmember(member).isfile(), member
+        with archive.extractfile(member) as stream:
+            assert stream.read() == (root / license_file).read_bytes(), license_file
     assert not any(set(Path(n).parts) & {"tmp", "data", "runs"} or "ensemble-reference" in n for n in members)
     assert not any(n.endswith(withdrawn_workflow) for n in members)
     for suffix in ("provenance/original/sim.py", "provenance/original/snmf_am.py",

@@ -1,7 +1,28 @@
 # Runtime compatibility
 
-The supplied `robust` profile describes an x86-64 Ubuntu 22.04.5 LTS system
-running Python 3.10.12 with the following numerical stack:
+## Current support policy
+
+Python 3.10 support ended on October 20, 2026. Current source requires Python
+3.11 or later; Python 3.12 in `py12_df_aocl` remains the primary development
+environment. This removes Python 3.10 from future compatibility work and
+validation plans without changing the numerical algorithms or reducing
+performance to accommodate an older runtime.
+
+The declared minimum is an installation requirement, not a claim that a new
+validation run has been completed on every eligible Python version. Confirm
+with Chang Cheng whether to use the local PC or Robust before running tests,
+smoke checks, numerical checks, benchmarks, or studies. Robust's default
+compute budget is 20 total threads across workers and native numerical threads.
+
+Existing releases, frozen Python 3.10 bundles, requirements, and receipts remain
+historical records. Their original support declarations and results are not
+changed retroactively. Do not use them as installation guidance for current
+source.
+
+## Historical Python 3.10 profile
+
+The original supplied `robust` profile described an x86-64 Ubuntu 22.04.5 LTS
+system running Python 3.10.12 with the following numerical stack:
 
 | Package | Version |
 | --- | --- |
@@ -12,23 +33,25 @@ running Python 3.10.12 with the following numerical stack:
 | threadpoolctl | 3.6.0 |
 
 These five versions are recorded in
-[requirements/robust.txt](../requirements/robust.txt). This file pins the target
-runtime for reproducibility; it is not a list of new dependencies to add to an
-environment that already supplies those versions. Version 0.2.0 declares
-joblib>=1.3 directly for optional projection process workers.
+[requirements/robust.txt](../requirements/robust.txt). This file preserves the
+historical target runtime for reproducibility. It is not the current recommended
+environment and should not be applied to an existing development environment.
 
-## Validation scope
+## Historical validation scope
 
 On October 5, 2026, the complete source test suite passed in an isolated
 Windows 11 environment using Python 3.10.12 and these exact package versions:
-281 tests passed in 57.313 seconds, with no skipped tests. Pillow 12.3.0 was
-installed for the image-loader fixtures. The runtime reported NumPy OpenBLAS
-0.3.29 and SciPy OpenBLAS 0.3.28. The primary Python 3.12 environment also passed
-all 281 tests in 59.991 seconds.
+303 tests passed in 65.999 seconds, with no skipped tests. Pillow 12.3.0 enabled
+the image-loader fixtures; the new report test also needed the optional
+Matplotlib dependency (3.10.9). Installation preserved all five numerical pins,
+and `pip check` reported no broken requirements. The runtime reported NumPy
+OpenBLAS 0.3.29 and SciPy OpenBLAS 0.3.28. The primary Python 3.12 environment
+passed all 303 tests in 121.042 seconds while other study jobs were active;
+these suite times are not cross-environment speed comparisons.
 
-The package now declares Python 3.10 or later. These results validate the tested
-historical source revision on Windows; that check did not test Ubuntu. Matching
-Python, package and OpenBLAS version numbers does not establish identical
+At that revision the package declared Python 3.10 or later. These results
+validate that tested source revision on Windows; they did not establish Ubuntu
+execution. Matching Python, package and OpenBLAS version numbers does not establish identical
 binary builds, Linux behavior or timing. Each runtime's actual libraries and
 thread counts must be recorded with its results.
 
@@ -37,51 +60,64 @@ the five pinned dependencies. Installed-package fit/predict checks passed for
 all six SPA/CD/MU by KNN/logistic combinations, and `pip check` found no broken
 requirements. See [validation](validation.md) for completed checks and their limits.
 
+## Unreleased SPA training-coordinate default
+
+This is a local development change, not a published release. The released
+0.2.0 wheel still defaults to `training_coordinates="fit_transform"`.
+The current source changes `NMFClassifier`'s default to `"auto"`.
+For SPA, this uses fixed-basis NNLS for both the classifier's training
+coordinates and later predictions. For CD and MU, it retains the coordinates
+returned by `fit_transform`. The standalone `FeatureSPA` API and its behavior
+inside generic sklearn pipelines are unchanged; see
+[training coordinates](api.md#training-coordinates).
+
+SPA training now includes an additional projection, recorded in fit time.
+Retrained models can produce different predictions and accuracy, with no
+guarantee of improvement. Use explicit `training_coordinates="fit_transform"`
+to reproduce the prior coordinate convention, together with the original
+recorded runtime and other settings. Existing saved study results remain
+historical evidence and are not revised by this source change. The corrected
+simulation portable retains its pinned released 0.2.0 wheel and explicitly
+projects training observations; it does not depend on this new default.
+No package version number is changed here.
+
 ## Use an existing target environment
 
-Activate the intended environment, then run these commands from the source
-checkout. First check that its Python and numerical packages match the profile:
-
-```shell
-python --version
-python -m pip show numpy scipy scikit-learn joblib threadpoolctl
-python -c "import sys; from importlib.metadata import version; expected = {'numpy': '2.2.6', 'scipy': '1.15.3', 'scikit-learn': '1.7.0', 'joblib': '1.5.1', 'threadpoolctl': '3.6.0'}; assert sys.version_info[:3] == (3, 10, 12), sys.version; assert all(version(name) == wanted for name, wanted in expected.items()), 'Numerical package versions do not match requirements/robust.txt'; print('Target runtime versions match.')"
-```
-
-After that check succeeds, install the package without changing runtime
-dependencies:
+Use an environment with Python 3.11 or later; Python 3.12 is the primary
+development target. Activate the intended environment and install from the
+source checkout without changing its already-provisioned numerical dependencies:
 
 ```shell
 python -m pip install --no-deps .
-python -c "import supervised_nmf; print(supervised_nmf.__version__)"
 ```
 
-The profile also lists cvxpy, dwd, ipykernel and a missing debugpy dependency.
-These are not requirements of `supervised-nmf`; this installation does not add,
-remove or repair them. A general `pip check` may still report unrelated
-environment issues. Image-loading examples additionally require Pillow, and
-plotting requires Matplotlib; those optional dependencies are outside the five
-runtime pins above.
+This command does not install missing dependencies or validate the environment.
+Confirm the validation machine before checking installed behavior and timing.
+Image-loading examples additionally require Pillow, and plotting requires
+Matplotlib.
 
-## Reproduce the numerical stack separately
+## Provision a separate Python 3.12 environment
 
-For a new, isolated environment with Python 3.10.12, install the pinned numerical
-stack before installing the package:
+For a new, isolated Python 3.12 environment, the numerical version profile is
+recorded in [requirements/robust-py312.txt](../requirements/robust-py312.txt).
+Install those versions before installing the package:
 
 ```shell
-python -m pip install -r requirements/robust.txt
+python -m pip install -r requirements/robust-py312.txt
 python -m pip install --no-deps .
 ```
 
-Use a separate environment when the active one has different dependency
-versions. The requirements file should not be applied to an unrelated working
-environment merely to run the package.
+These pins do not reproduce the Windows AOCL binaries on Linux. Record the
+actual BLAS libraries and thread configuration, and assess performance in the
+chosen environment after the required location confirmation. Do not replace
+the working `py12_df_aocl` numerical stack merely to match another machine.
 
-## Version 0.2.0 checks
+## Historical version 0.2.0 validation
 
-The full source suite passed all 370 tests on Windows Python 3.10 and 3.12.
-Before the final workspace-lifetime change, the projection and threshold
-implementation also passed 153 regression tests on Linux Python 3.12/OpenBLAS.
-Those Linux results do not establish a full Linux test of the final release.
-See the [implementation record](implementation-improvements.md) and
-[release notes](release-0.2.0.md) for scope and installation details.
+The [October 9 release record](release-0.2.0.md) and
+[implementation record](implementation-improvements.md) preserve the evidence
+for the released 0.2.0 source: 370 tests passed on Windows Python 3.12 and
+Python 3.10. Earlier Linux Python 3.12 checks covered projection and thresholds;
+the final workspace-lifetime change was checked on Windows. These are historical
+results, not validation of the current modified source. The current Python
+3.11 minimum and machine-confirmation requirement above remain in force.

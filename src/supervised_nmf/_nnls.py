@@ -1,7 +1,7 @@
 """Guarded multiple-right-hand-side NNLS for fixed SPA bases.
 
 The block-principal-pivot strategy follows Kim and Park (2011),
-doi:10.1137/100799802, and its public nonnegfac-python reference. The
+doi:10.1137/110821172, and its public nonnegfac-python reference. The
 implementation groups equal passive sets and reuses their Cholesky factors.
 The public SciPy solver is the reference and the numerical fallback.
 
@@ -31,6 +31,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 
 from numbers import Integral
+import math
 
 import numpy as np
 from scipy import linalg
@@ -43,6 +44,11 @@ from scipy.optimize import nnls
 _BATCH_CONDITION_LIMIT = 1e4
 _AUTO_MIN_ROWS = 32
 _FACTOR_CACHE_LIMIT = 128
+# A bounded numerical domain, not a claim that problems outside it are
+# mathematically unsolvable. Binary scaling leaves NNLS coefficients unchanged.
+_MIN_EXPONENT = -450
+_MAX_EXPONENT = 450
+_MAX_SCALED_DIMENSION = 2**32
 
 
 def _positive_integer(value, name):
@@ -174,6 +180,12 @@ def project_nnls(design, rows, *, solver="auto", maxiter=None, batch_size=256):
     Failed block solves or row-level KKT checks fall back to public SciPy with
     the original maxiter; reference failures always propagate.
 
+    Extreme magnitudes use exactly reversible common binary scaling of the
+    design and each independent RHS. Rows with the same scale share a solve;
+    eligibility never depends on unrelated query rows. Inputs whose nonzero
+    exponent span cannot fit the supported range raise FloatingPointError.
+    This does not change conditioning or certify arbitrary extreme problems.
+
     Returns a float64 array of shape (len(rows), design.shape[1]). Inputs are
     never modified. This internal helper also permits signed input via SciPy.
     """
@@ -192,6 +204,91 @@ def project_nnls(design, rows, *, solver="auto", maxiter=None, batch_size=256):
         raise ValueError("NNLS input shapes are incompatible or empty.")
     if not np.isfinite(design).all() or not np.isfinite(rows).all():
         raise ValueError("NNLS inputs must contain only finite values.")
+    if not len(rows):
+        return np.empty((0, design.shape[1]), dtype=np.float64)
+    if max(design.shape + rows.shape) > _MAX_SCALED_DIMENSION:
+        raise FloatingPointError("NNLS dimensions exceed the supported numerical range.")
+    design_bounds = _magnitude_bounds(design)
+    bounds = _combine_bounds(design_bounds, _magnitude_bounds(rows))
+    if _within_range(bounds):
+        result = _project_unscaled(design, rows, solver, maxiter, batch_size)
+    else:
+        prepared = _prepare_scale_groups(design, rows, design_bounds)
+        result = np.empty((len(rows), design.shape[1]), dtype=np.float64)
+        for indices, scaled_design, scaled_rows in prepared:
+            result[indices] = _project_unscaled(
+                scaled_design, scaled_rows, solver, maxiter, batch_size
+            )
+    if not np.isfinite(result).all() or np.any(result < 0):
+        raise FloatingPointError("NNLS returned nonfinite or negative coefficients.")
+    return result
+
+
+def _magnitude_bounds(values):
+    """Inclusive frexp exponents of nonzero finite input values."""
+    absolute = np.abs(values)
+    maximum = float(np.max(absolute, initial=0.0))
+    if maximum == 0:
+        return None
+    minimum = float(np.min(absolute, where=absolute != 0, initial=np.inf))
+    return math.frexp(minimum)[1], math.frexp(maximum)[1]
+
+
+def _combine_bounds(*bounds):
+    present = [bound for bound in bounds if bound is not None]
+    if not present:
+        return None
+    return min(bound[0] for bound in present), max(bound[1] for bound in present)
+
+
+def _within_range(bounds):
+    return bounds is None or (_MIN_EXPONENT <= bounds[0] and bounds[1] <= _MAX_EXPONENT)
+
+
+def _scale_exponent(bounds):
+    if bounds is None or _within_range(bounds):
+        return 0
+    lower, upper = bounds[1] - _MAX_EXPONENT, bounds[0] - _MIN_EXPONENT
+    if lower > upper:
+        raise FloatingPointError(
+            "NNLS input exponent span exceeds the supported scaling range; "
+            "this is not a claim that the mathematical problem is unsolvable."
+        )
+    return min(max(bounds[1], lower), upper)
+
+
+def _binary_scale(design, rows, exponent):
+    with np.errstate(over="raise", invalid="raise", under="ignore"):
+        scaled_design = np.ldexp(design, -exponent)
+        scaled_rows = np.ldexp(rows, -exponent)
+        if (not np.array_equal(np.ldexp(scaled_design, exponent), design)
+                or not np.array_equal(np.ldexp(scaled_rows, exponent), rows)):
+            raise FloatingPointError("NNLS binary scaling is not exactly reversible.")
+    if not _within_range(_combine_bounds(
+            _magnitude_bounds(scaled_design), _magnitude_bounds(scaled_rows))):
+        raise FloatingPointError("NNLS scaled inputs exceed the supported range.")
+    return scaled_design, scaled_rows
+
+
+def _prepare_scale_groups(design, rows, design_bounds):
+    """Validate all independent RHS groups before any numerical solve."""
+    membership = {}
+    for index, row in enumerate(rows):
+        exponent = _scale_exponent(_combine_bounds(design_bounds, _magnitude_bounds(row)))
+        membership.setdefault(exponent, []).append(index)
+    prepared = []
+    for exponent, members in sorted(membership.items()):
+        indices = np.asarray(members, dtype=np.intp)
+        if exponent:
+            scaled_design, scaled_rows = _binary_scale(design, rows[indices], exponent)
+        else:
+            scaled_design, scaled_rows = design, rows[indices]
+        prepared.append((indices, scaled_design, scaled_rows))
+    return prepared
+
+
+def _project_unscaled(design, rows, solver, maxiter, batch_size):
+    """Existing guarded solver on validated, ordinary-scale arrays."""
     rank = design.shape[1]
     if (solver == "scipy" or not len(rows)
             or (solver == "auto" and len(rows) < _AUTO_MIN_ROWS)

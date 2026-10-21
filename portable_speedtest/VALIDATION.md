@@ -56,10 +56,13 @@ changes. The compatibility checker also passed all six checks in PC1's existing
 environment at validation time.
 
 These frozen-snapshot checks do **not** establish Ubuntu 22.04 / Python 3.10.12
-compatibility. Run `python3 check_compatibility.py --expect-target-versions`
-and the smoke test on that actual machine. The frozen snapshot declared Python
->=3.11. The current package declares Python >=3.10 and has separate
+compatibility. The original protocol called for target-version and smoke checks
+on that machine. The frozen snapshot declared Python >=3.11. A later package
+revision declared Python >=3.10 and has separate
 [runtime compatibility results](../docs/compatibility.md), including a full
 source-suite check on Windows with Python 3.10.12. Those newer checks do not
 retroactively qualify this benchmark bundle or its recorded timings. Benchmark
-validation uses the selected environment without changing its installed packages.
+validation used the selected environment without changing its installed packages.
+Current development ended Python 3.10 support on October 20, 2026 and requires
+Python >=3.11. See the [current policy](../docs/compatibility.md) before planning
+new runs; the historical target instructions are not current support guidance.

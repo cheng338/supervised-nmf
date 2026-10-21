@@ -18,7 +18,8 @@ class PhaseReportingTests(unittest.TestCase):
         self.X[:, :3] += self.y[:, None]
 
     def test_skipped_training_projection_is_not_reported_as_passed(self):
-        model = NMFClassifier(random_state=3, score_threshold=0).fit(self.X, self.y)
+        model = NMFClassifier(random_state=3, score_threshold=0,
+                              training_coordinates="fit_transform").fit(self.X, self.y)
         self.assertFalse(model.training_projection_performed_)
         self.assertIsNone(model.training_projection_converged_)
         text = format_evaluation_summary(evaluate_classifier(model, self.X, self.y))

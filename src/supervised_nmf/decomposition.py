@@ -10,6 +10,7 @@ from sklearn.utils.validation import check_is_fitted
 
 from .screening import _clear_fitted_attributes, _nonnegative_array
 from ._projection import project_rows, validate_projection_parameters
+from ._residual import reconstruction_error
 
 
 class FeatureSPA(TransformerMixin, BaseEstimator):
@@ -154,7 +155,7 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
         self.basis_condition_ = basis_condition
         self.components_ = components
         self.fit_coordinates_ = coordinates
-        self.reconstruction_err_ = float(np.linalg.norm(X - coordinates @ components))
+        self.reconstruction_err_ = reconstruction_error(X, coordinates, components)
         self.n_iter_ = self.n_components_
         return self
 

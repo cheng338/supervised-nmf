@@ -121,14 +121,15 @@ class BatchedNNLSTests(unittest.TestCase):
                 _nnls.project_nnls(self.design, signed_rows, solver="batched"),
                 self.reference(rows=signed_rows))
 
-    def test_underflow_and_overflow_design_products_delegate_to_reference(self):
+    def test_common_extreme_scales_preserve_the_ordinary_problem(self):
+        expected = self.reference()
         for scale in (1e-200, 1e200):
-            with self.subTest(scale=scale), patch.object(
-                    _nnls, "nnls", return_value=(np.ones(7), 0)) as reference, patch.object(
-                    _nnls, "_batched_block", side_effect=AssertionError("Batch used")):
-                result = _nnls.project_nnls(self.design * scale, self.rows, solver="batched")
-                self.assertEqual(reference.call_count, len(self.rows))
-                np.testing.assert_array_equal(result, np.ones((len(self.rows), 7)))
+            for solver in ("scipy", "auto", "batched"):
+                with self.subTest(scale=scale, solver=solver):
+                    result = _nnls.project_nnls(
+                        self.design * scale, self.rows * scale, solver=solver
+                    )
+                    np.testing.assert_allclose(result, expected, rtol=1e-7, atol=1e-9)
 
     def test_batch_and_original_design_checks_are_bounded_by_block_size(self):
         with patch.object(_nnls, "_batched_block", wraps=_nnls._batched_block) as batch, \

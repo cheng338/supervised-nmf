@@ -2,6 +2,89 @@
 
 Author: Chang Cheng.
 
+## Current project rules — October 20, 2026
+
+The author added the following rules, also recorded in the repository's
+[AGENTS.md](../AGENTS.md). They govern future work and supersede conflicting
+earlier practices; historical configurations and results remain unchanged.
+
+1. A minor gain or loss in predictive performance or execution speed does not
+   automatically determine whether to accept, reject, or offer a proposed fix
+   or improvement as an option. Consider correctness, methodological fidelity,
+   theoretical support, numerical reliability, practical benefit, maintenance
+   cost, and evidence uncertainty, and explain the decision.
+   Evaluate proposals using mathematics, relevant theory, numerical analysis,
+   and coding knowledge alongside accuracy, runtime, and memory measurements.
+   Examine assumptions, mathematical equivalence or objective changes,
+   numerical stability, algorithmic complexity, implementation correctness,
+   and software design. Distinguish analytical guarantees from empirical
+   observations; benchmark performance alone does not establish correctness
+   or theoretical validity.
+2. Do not sacrifice execution speed for memory savings, including through
+   optional adoption. Report an unavoidable tradeoff instead of adopting it.
+   The first rule does not relax this constraint.
+3. Before each new validation run or agreed batch, confirm with Chang Cheng
+   whether to run on the local PC or Robust, and wait for his explicit choice.
+   This includes unit tests, smoke checks, numerical checks, benchmarks, and
+   dataset studies. Confirmation covers the specified batch, not unrelated
+   future runs. Read-only inspection and preparation do not launch validation.
+4. Robust has 20 physical cores and 40 logical threads. Default new runs to
+   20 total compute threads across concurrent workers and native numerical
+   threads, unless the author explicitly requests a different budget. Override
+   older 40-worker launch defaults or prepare an updated configuration before
+   execution; preserve frozen historical configurations and receipts.
+5. Python 3.10 support ended on October 20, 2026. Current development requires
+   Python 3.11 or later, with Python 3.12 in `py12_df_aocl` remaining the primary
+   environment. Do not add Python 3.10 compatibility workarounds or plan new
+   validation on it. Preserve its historical requirements, results, and release
+   artifacts. A runtime support change does not authorize validation execution.
+## Public source, rights and citation — October 20, 2026
+
+Chang Cheng requested public GitHub availability of the package while retaining
+All Rights Reserved for his original work pending a distribution-license
+decision. Preserve the separate third-party copyright and BSD notices; include
+both the project LICENSE and THIRD_PARTY_NOTICES in source and wheel archives.
+Public source availability does not supply an open-source license for the
+author's work, and historical release artifacts remain unchanged.
+
+The dissertation title is *Ensemble Kernel Distance-Weighted Discrimination and
+Supervised Nonnegative Matrix Factorization for Classification*. The package
+implements its supervised NMF methodology. Citing the full dissertation title
+does not incorporate the separate DWD methodology into this package.
+
+The author selected GitHub-hosted CI for this publication update, after the
+repository becomes public. Use standard public runners; do not start a private
+repository CI run while the private Actions allowance is exhausted. Future
+validation batches remain subject to the machine-confirmation rule above.
+
+## Classifier scope decision — October 20, 2026
+
+After reviewing the five-classifier face-image pilot, Chang Cheng selected
+three classifiers for continued package development:
+
+- K-nearest neighbors (KNN).
+- L2-regularized logistic regression.
+- Linear support vector machine (linear SVM).
+
+Histogram gradient boosting and shrinkage LDA are outside the adopted
+classifier scope. Preserve their completed pilot results, study adapters,
+failures and provenance as historical evidence. This scope decision supersedes
+the pilot's recommendation to retain boosting as a candidate for the proposed
+classifier interface; it is not a claim that the excluded methods performed
+worse.
+
+KNN remains the package default. KNN and logistic regression are already public
+classifier options; linear SVM is selected for integration and currently exists
+in the study adapter at the time of this scope decision. The approved integration
+below subsequently completed the public SVM API and its Robust checks; it remains
+unreleased. Preserve genuine SVM decision margins rather than presenting them as
+probabilities. DWD remains outside the current project.
+
+Continue face-image validation with these three classifiers, using training-only
+transformations and explicit imbalance handling. A new validation batch still
+requires the machine confirmation specified above; this scope decision does
+not launch a run or authorize a new machine selection.
+
 ## Scope and method
 
 1. Follow Chang Cheng's dissertation and original scripts; preserve his authorship.
@@ -48,6 +131,57 @@ Author: Chang Cheng.
     Preserve the historical KNN comparisons and solver/screening decision.
     Matched logistic comparisons and their theoretical assessment remain separate
     work before reconsidering the final classifier default.
+13. On October 5, the author requested investigation of direct BLAS calls before
+    continuing the Wang validation. SPA now uses public SciPy GEMV/GER updates
+    and one fixed-basis layout conversion per transform. The
+    [performance and equivalence record](blas-optimization.md) distinguishes
+    this implementation change from the statistical method. Preserve the
+    interrupted study snapshots and use a new source freeze for subsequent
+    runs; do not silently combine timing records from different implementations.
+14. On October 6, the author pointed out that the new four-method face validation
+    omitted the dissertation's standard NMF+KNN baseline. A separate supplement
+    restores unscreened CD-NMF+KNN and adds unscreened SPA-NMF+KNN, using the same
+    cohorts, independent rank/K tuning and public-estimator qualification.
+    The original four results remain frozen. Since the original test outcomes
+    were already known, the additions are descriptive supplementary comparisons,
+    not new unseen-test confirmation. Preserve numerical failures and any
+    unresolved rank boundaries; do not claim globally optimized baselines.
+15. On October 6, the author approved adding screened CD-NMF+KNN as a seventh
+    method after observing the unscreened CD/SPA comparison. Use the same
+    absolute-screening, rank and dense-K starting grids, five training folds,
+    single local refinement and numerical qualification rules as the frozen
+    face comparison. Independently tune the screened CD pipeline; preserve all
+    six earlier fits and results. This is another post-test-designed descriptive
+    supplement, not new independent confirmation. Comparing the tuned screened
+    SPA and CD pipelines may change cutoff, rank and K as well as solver;
+    do not interpret it as a fixed-configuration causal solver effect or use
+    its test outcome to revise package defaults.
+16. On October 6, the author requested additional datasets because a single
+    face-task validation is insufficient. The first expansion fixes two new
+    face datasets (FEI smile/neutral and CMU sunglasses/open) and three naturally
+    nonnegative nonface datasets (Sonar, Spambase and WDBC) before fitting.
+    Evaluate all seven KNN pipelines on every included task, retaining losses,
+    inconclusive comparisons and failures. Face identities must remain disjoint
+    across both the reserved split and every inner training/validation fold.
+    Retain the existing nonface preparation's reserved partitions. Use matched
+    five-fold tuning and the declared dense neighbor grid, with physical
+    small-sample omissions recorded before fitting. This first expansion is a
+    multiple-dataset benchmark, not a completed repeated nested-CV study or a
+    claim that R6's entire replication request has been resolved. Present
+    accuracy, fit-time and prediction-time tables in chat; open report panels
+    only when the author asks.
+17. On October 6, the author requested additional labels in the existing
+    datasets and explicitly included FEI. Explore observable CelebA attributes,
+    CMU source pose/expression conditions, and FEI source acquisition conditions
+    using all seven pipelines. Freeze the task list, development cohorts,
+    label coding, reduced image representation, grids and support rules before
+    fitting. Keep old official-test and reserved subjects outside this
+    exploratory study. Several labels from the same people are correlated
+    tasks, not independent datasets; previously used training images are not
+    fresh confirmatory evidence. Retain every task and failed method. Use
+    balanced accuracy to assess imbalanced attributes and report majority and
+    random-guess references with ordinary accuracy. Do not assign semantic
+    pose/expression names where the source only verifies condition identifiers.
 
 ## Stages and what constitutes evidence
 
@@ -136,4 +270,46 @@ Screened PCA is a priority comparison for Wang's R7. Smiling and Wearing_Necktie
 require separate tuning and reports. For the latter, report positive counts and
 precision/recall measures prominently so majority accuracy cannot conceal a
 failure to recognize positives. See [the CelebA study plan](celeba-study.md).
+
+## Approved October 20 implementation
+
+Following the retrospective review, Chang Cheng approved minimum-reference
+screening statistics, conditional per-RHS NNLS scaling, stable factor-recovery
+reporting, guarded neighbor-query reuse in explicit KNN grids, optional fitted
+SD scaling for KNN, and a public linear SVM head. Report-only residual blocking
+was conditional on integrated cost checks supporting its dispatch domain.
+The completed checks support a bounded dense float64, single-thread MKL path;
+other execution settings retain the original residual expression. See the
+[validation record](validation.md) for the completed integration evidence.
+These are current-source changes; previous releases and study receipts retain
+their original implementations and configurations.
+
+The screening and NNLS repairs preserve their mathematical objectives.
+Minimum-reference subtraction precedes scaling when computing pooled statistics;
+the selected data passed to factorization remain uncentered. NNLS uses a common,
+exactly reversible binary scale for a basis and each RHS, grouping equal scales
+for execution. It does not improve conditioning or certify every extreme input.
+Unrepresentable ranges fail explicitly. Factor-recovery reports normalize before
+forming cosines while retaining full-truth support and unmatched-rank penalties.
+
+KNN SD scaling and linear SVM are optional statistical choices, rather than
+numerically equivalent replacements for the existing classifier. SD scaling is
+fitted within each training fold, changes the KNN metric, and leaves factorization
+coordinates unchanged. The SVM head fits an unscaled, L2-regularized squared-hinge
+primal problem. Tune its C independently of representation parameters and qualify
+its own iteration cap and tolerance. Its decision margins support AUC/AP ranking;
+they are not probabilities. A probability threshold is inapplicable.
+
+Neighbor reuse is internal to compatible fold-local KNN grids. Unsupported or
+numerically uncertain cases use the selected-k public estimator on the original
+query batch. Reports charge actual shared query costs once and retain separate
+head costs. Old checkpoint identities cannot resume under changed package source.
+
+The agreed integration batch runs on Robust with at most 20 total compute
+threads. It covers correctness, API/serialization contracts, original numerical
+triggers, and targeted paired timing. It does not rerun the historical dataset
+studies, retune defaults, establish a new theorem, or authorize a release.
+Adoption weighs mathematical fidelity, numerical reliability, software design,
+maintenance and measured cost together. A memory saving cannot justify a
+slowdown, including through an optional implementation.
 

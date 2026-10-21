@@ -1,4 +1,4 @@
-"""Freeze the unpublished sNMF source and benchmark into a verified ZIP.
+"""Freeze the current sNMF source and benchmark into a verified ZIP.
 
 Run this from a suitable development Python environment. Nothing is installed,
 downloaded, or changed in src/. The finished bundle uses its own source snapshot.
@@ -42,7 +42,7 @@ def inputs():
     for name in ("benchmark.py", "compare.py", "projection.py", "pc_profiles.json", "check_compatibility.py", "sweep.py", "README.md", "PROTOCOL.md", "VALIDATION.md",
                  "RUN_BENCHMARK.cmd", "RUN_BENCHMARK.sh", "RUN_SWEEP.cmd", "RUN_SWEEP.sh", "PROMPT_FOR_OTHER_PC.txt"):
         result[Path(name)] = HERE / name
-    for name in ("README.md", "CITATION.cff", "pyproject.toml"):
+    for name in ("README.md", "CITATION.cff", "pyproject.toml", "LICENSE", "THIRD_PARTY_NOTICES"):
         result[Path("package") / name] = REPO / name
     for path in sorted((REPO / "docs").rglob("*.md")):
         result[Path("package") / "docs" / path.relative_to(REPO / "docs")] = path

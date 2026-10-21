@@ -40,6 +40,11 @@ with zipfile.ZipFile(wheel) as archive:
 
 sys.path.insert(0, str(wheel))
 import numpy as np
+from scipy.optimize import nnls
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import LinearSVC
 from threadpoolctl import threadpool_limits
 import supervised_nmf
 from supervised_nmf import NMFClassifier
@@ -62,6 +67,8 @@ assert defaults["screening"] == "absolute", defaults
 assert defaults["max_iter"] == 20000, defaults
 assert defaults["tol"] == 1e-4, defaults
 assert defaults["classifier"] == "knn", defaults
+assert defaults["knn_normalization"] == "none", defaults
+assert defaults["training_coordinates"] == "auto", defaults
 data = make_original_simulation(n_samples=60, n_features=20, signal_ratio=0.2)
 with threadpool_limits(limits=1):
     # Exercise the installed pair with both method parameters omitted.
@@ -106,6 +113,94 @@ assert logistic_labels.shape == (5,) and logistic_probabilities.shape == (5, 2)
 np.testing.assert_allclose(logistic_probabilities.sum(axis=1), 1)
 np.testing.assert_array_equal(logistic_labels, logistic.predict(data.data[:5]))
 
+# Check the installed coordinate policy and new heads against public solvers.
+with threadpool_limits(limits=1):
+    query = np.vstack([data.data[:3], data.data[-3:]]) * np.float32(1.07)
+    basis = model.selected_components_.copy()
+    selected_train = np.asarray(data.data[:, model.selected_features_], dtype=np.float64)
+    selected_query = np.asarray(query[:, model.selected_features_], dtype=np.float64)
+    expected_train = np.vstack([nnls(basis.T, row, maxiter=model.max_iter)[0]
+                                for row in selected_train])
+    expected_query = np.vstack([nnls(basis.T, row, maxiter=model.max_iter)[0]
+                                for row in selected_query])
+    assert model.training_coordinates_mode_ == "transform"
+    assert model.training_projection_performed_ and model.training_projection_converged_
+    np.testing.assert_allclose(model.training_coordinates_, expected_train, rtol=2e-10, atol=2e-10)
+    np.testing.assert_allclose(model.transform(query), expected_query, rtol=2e-10, atol=2e-10)
+    assert isinstance(model.classifier_, KNeighborsClassifier) and model.knn_normalization_ == "none"
+    default_reference = KNeighborsClassifier(n_neighbors=model.n_neighbors).fit(expected_train, data.target)
+    np.testing.assert_array_equal(model.predict(query), default_reference.predict(expected_query))
+    np.testing.assert_allclose(model.predict_proba(query), default_reference.predict_proba(expected_query))
+    for iterative in (override, mu):
+        assert iterative.training_coordinates == "auto"
+        assert iterative.training_coordinates_mode_ == "fit_transform"
+        assert not iterative.training_projection_performed_
+
+    legacy = NMFClassifier(training_coordinates="fit_transform", random_state=42).fit(data.data, data.target)
+    assert legacy.training_coordinates_mode_ == "fit_transform"
+    assert not legacy.training_projection_performed_
+    assert legacy.training_projection_converged_ is None
+    np.testing.assert_array_equal(legacy.selected_features_, model.selected_features_)
+    np.testing.assert_array_equal(legacy.selected_components_, basis)
+    np.testing.assert_array_equal(
+        legacy.training_coordinates_, selected_train[:, legacy.decomposition_.anchor_indices_])
+    np.testing.assert_allclose(legacy.transform(query), expected_query, rtol=2e-10, atol=2e-10)
+    legacy_reference = KNeighborsClassifier(n_neighbors=legacy.n_neighbors).fit(
+        legacy.training_coordinates_, data.target)
+    np.testing.assert_array_equal(legacy.predict(query), legacy_reference.predict(expected_query))
+
+    sd = NMFClassifier(knn_normalization="sd", random_state=42).fit(data.data, data.target)
+    assert sd.knn_normalization_ == "sd"
+    assert isinstance(sd.classifier_, Pipeline)
+    assert not sd.classifier_.named_steps["scale"].with_mean
+    np.testing.assert_array_equal(sd.selected_components_, basis)
+    np.testing.assert_allclose(sd.training_coordinates_, expected_train, rtol=2e-10, atol=2e-10)
+    sd_query = sd.transform(query)
+    np.testing.assert_allclose(sd_query, expected_query, rtol=2e-10, atol=2e-10)
+    sd_reference = Pipeline([
+        ("scale", StandardScaler(with_mean=False)),
+        ("knn", KNeighborsClassifier(n_neighbors=sd.n_neighbors, weights=sd.weights)),
+    ]).fit(sd.training_coordinates_, data.target)
+    scale_before = sd.classifier_.named_steps["scale"].scale_.copy()
+    sd_labels, sd_probabilities = sd.predict_with_probabilities(query)
+    np.testing.assert_array_equal(sd_labels, sd_reference.predict(sd_query))
+    np.testing.assert_allclose(sd_probabilities, sd_reference.predict_proba(sd_query), rtol=1e-12, atol=1e-12)
+    assert sd_probabilities.shape == (len(query), 2) and np.isfinite(sd_probabilities).all()
+    assert ((sd_probabilities >= 0) & (sd_probabilities <= 1)).all()
+    np.testing.assert_allclose(sd_probabilities.sum(axis=1), 1)
+    np.testing.assert_array_equal(sd.classifier_.named_steps["scale"].scale_, scale_before)
+    assert sd.classifier_.named_steps["scale"].n_samples_seen_ == len(data.target)
+
+    svm = NMFClassifier(classifier="linear_svm", random_state=42).fit(data.data, data.target)
+    assert isinstance(svm.classifier_, LinearSVC) and not svm.classifier_.dual
+    assert svm.knn_normalization_ is None
+    assert not hasattr(svm, "predict_proba") and not hasattr(svm, "predict_with_probabilities")
+    np.testing.assert_array_equal(svm.selected_components_, basis)
+    np.testing.assert_allclose(svm.training_coordinates_, expected_train, rtol=2e-10, atol=2e-10)
+    svm_query = svm.transform(query)
+    np.testing.assert_allclose(svm_query, expected_query, rtol=2e-10, atol=2e-10)
+    svm_reference = LinearSVC(
+        C=svm.svm_C, penalty="l2", loss="squared_hinge", dual=False,
+        max_iter=svm.svm_max_iter, tol=svm.svm_tol, class_weight=svm.svm_class_weight,
+        random_state=42).fit(svm.training_coordinates_, data.target)
+    svm_labels, margins = svm.predict_with_decision_function(query)
+    assert margins.shape == (len(query),) and np.isfinite(margins).all()
+    np.testing.assert_allclose(margins, svm_reference.decision_function(svm_query), rtol=1e-12, atol=1e-12)
+    np.testing.assert_array_equal(svm_labels, svm_reference.predict(svm_query))
+    np.testing.assert_array_equal(svm_labels, svm.classes_[(margins > 0).astype(int)])
+    np.testing.assert_array_equal(svm_labels, svm.predict(query))
+    np.testing.assert_allclose(margins, svm.decision_function(query), rtol=1e-12, atol=1e-12)
+    try:
+        NMFClassifier(classifier="linear_svm", decision_threshold=.5).fit(data.data, data.target)
+    except ValueError as error:
+        assert "requires probabilities" in str(error), str(error)
+    else:
+        raise AssertionError("Linear SVM must reject a probability decision threshold.")
+    for fitted in (model, legacy, sd, svm):
+        assert fitted.converged_ and fitted.last_transform_converged_
+        assert fitted.classifier_converged_
+        np.testing.assert_array_equal(fitted.selected_components_, basis)
+
 with tarfile.open(root / "dist" / f"supervised_nmf-{version}.tar.gz") as archive:
     members = archive.getnames()
     for license_file in license_files:
@@ -136,6 +231,11 @@ with tarfile.open(root / "dist" / f"supervised_nmf-{version}.tar.gz") as archive
                    "tests/test_rank_search.py", "tests/test_group_validation.py",
                    "tests/test_study_improvements.py", "tests/test_phase_reporting.py",
                    "tests/test_spa_blas.py", "examples/grouped_tuning.py",
+                   "src/supervised_nmf/_neighbors.py", "src/supervised_nmf/_recovery.py",
+                   "src/supervised_nmf/_residual.py", "tests/test_classifier_heads.py",
+                   "tests/test_margin_evaluation.py", "tests/test_neighbor_reuse.py",
+                   "tests/test_numerical_range_repairs.py", "tests/test_reported_residual.py",
+                   "tests/test_training_coordinate_defaults.py",
                    "docs/tuning-improvements.md", "portable_speedtest/benchmark.py"):
         assert any(n.endswith(suffix) for n in members), suffix
-print("Wheel import, author metadata, SPA/CD/MU fit/predict, KNN/logistic classifiers, installed defaults, explicit override, and source archive contents verified.")
+print("Wheel import, author/license metadata, SPA/CD/MU fit/predict, KNN/logistic/SVM heads, SD KNN, default/legacy training coordinates, explicit override, and source archive contents verified.")

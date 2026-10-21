@@ -60,11 +60,10 @@ the five pinned dependencies. Installed-package fit/predict checks passed for
 all six SPA/CD/MU by KNN/logistic combinations, and `pip check` found no broken
 requirements. See [validation](validation.md) for completed checks and their limits.
 
-## Unreleased SPA training-coordinate default
+## SPA training-coordinate default in version 0.3.0
 
-This is a local development change, not a published release. The released
-0.2.0 wheel still defaults to `training_coordinates="fit_transform"`.
-The current source changes `NMFClassifier`'s default to `"auto"`.
+Version 0.3.0 changes `NMFClassifier`'s default to
+`training_coordinates="auto"`. The 0.2.0 wheel defaults to `"fit_transform"`.
 For SPA, this uses fixed-basis NNLS for both the classifier's training
 coordinates and later predictions. For CD and MU, it retains the coordinates
 returned by `fit_transform`. The standalone `FeatureSPA` API and its behavior
@@ -79,7 +78,6 @@ recorded runtime and other settings. Existing saved study results remain
 historical evidence and are not revised by this source change. The corrected
 simulation portable retains its pinned released 0.2.0 wheel and explicitly
 projects training observations; it does not depend on this new default.
-No package version number is changed here.
 
 ## Use an existing target environment
 

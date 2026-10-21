@@ -25,28 +25,32 @@ implements Chapter 7 of:
 > manuscript, Purdue University, Department of Statistics.
 
 See [CITATION.cff](CITATION.cff) for citation details and
-[source provenance](provenance/README.md) for the original scripts. The latest
-formal release is 0.2.0; this checkout also contains the unreleased changes
-described below.
+[source provenance](provenance/README.md) for the original scripts.
+Version **0.3.0** adds a common SPA training/prediction coordinate map,
+optional SD-scaled KNN and linear SVM, and numerical and execution safeguards.
+See the [0.3.0 release notes](docs/release-0.3.0.md) for migration and validation limits.
 
 **Copyright (c) 2026 Chang Cheng. All Rights Reserved.** A distribution license
 has not yet been selected. Public availability of this repository does not
 grant an open-source license. See [LICENSE](LICENSE) and the separately
 applicable [third-party notices](THIRD_PARTY_NOTICES).
 
-The optional KNN standard-deviation scaling and linear-SVM interface described
-here are **unreleased source changes**. Their integration checks passed on Robust;
-they are not included in the released 0.2.0 wheel. See
-[validation](docs/validation.md#october-20-approved-source-integration).
-
 # Installation
 
-Python 3.11 or later is required for current development. Python 3.10 support
+Python 3.11 or later is required for version 0.3.0. Python 3.10 support
 ended on October 20, 2026. Dependencies are NumPy, SciPy, scikit-learn
-1.6 or later (below 2.0), threadpoolctl, and joblib 1.3 or later. With access to the repository:
+1.6 or later (below 2.0), threadpoolctl, and joblib 1.3 or later.
+Download the wheel from the [GitHub releases](https://github.com/cheng338/supervised-nmf/releases)
+and install it:
 
 ```shell
-git clone https://github.com/cheng338/supervised-nmf.git
+python -m pip install --upgrade supervised_nmf-0.3.0-py3-none-any.whl
+```
+
+To install the release from source:
+
+```shell
+git clone --branch v0.3.0 https://github.com/cheng338/supervised-nmf.git
 cd supervised-nmf
 python -m pip install .
 ```
@@ -115,7 +119,7 @@ This optional extension standardizes the fitted coordinates inside the
 classifier, using training means and scales. It does not change screening,
 factorization, or the coordinates returned by `transform`.
 
-In the unreleased source, optional KNN scaling divides each coordinate by its
+Optional KNN scaling divides each coordinate by its
 training-fitted standard deviation without centering:
 
 ```python
@@ -132,7 +136,7 @@ SD can amplify weak or nuisance coordinates, so it is an explicit choice rather
 than an automatic accuracy improvement. Logistic regression retains its existing
 scaler; the KNN option does not add another one.
 
-The unreleased linear-SVM head uses unscaled NMF coordinates and a primal
+The linear-SVM head uses unscaled NMF coordinates and a primal
 L2-regularized squared-hinge objective:
 
 ```python
@@ -156,7 +160,7 @@ The default is **SPA with absolute screening**. Use `solver="mu"` for
 multiplicative updates or `solver="cd"` for the dissertation's original
 coordinate-descent implementation.
 
-In the current unreleased source, `training_coordinates="auto"` trains the
+In version 0.3.0, the default `training_coordinates="auto"` trains the
 SPA classifier on fixed-basis NNLS coordinates, using the same fitted basis
 and projection map for training and prediction. This adds a training projection
 to fit time. CD and MU retain their factorization's returned training coordinates.
@@ -164,7 +168,8 @@ Set `training_coordinates="fit_transform"` explicitly to reproduce the previous
 coordinate convention. Retraining can change predictions and accuracy; an
 accuracy improvement is not guaranteed. The standalone `FeatureSPA` transformer
 keeps its existing behavior; see [training coordinates](docs/api.md#training-coordinates).
-The released 0.2.0 wheel still defaults to `training_coordinates="fit_transform"`.
+Version 0.2.0 defaulted to `training_coordinates="fit_transform"`; its archived
+artifacts and historical results retain that behavior.
 
 SPA uses direct BLAS updates and reuses the fixed NNLS matrix layout during
 projection. New models use guarded batched NNLS for suitable query batches,
@@ -188,15 +193,15 @@ earlier [BLAS checks](docs/blas-optimization.md).
 | `screening` | `"absolute"` | Also accepts `"percentile"` or `"none"`. |
 | `score_threshold` | `2.0` | Inclusive cutoff on the absolute pooled-t score. |
 | `percentile` | `10.0` | Retained percentage when percentile screening is selected. |
-| `classifier` | `"knn"` | Final classifier; also accepts `"logistic"` and unreleased `"linear_svm"`. |
+| `classifier` | `"knn"` | Final classifier; also accepts `"logistic"` and `"linear_svm"`. |
 | `n_neighbors` | `5` | Number of neighbors; used only by KNN. |
 | `weights` | `"uniform"` | KNN-only weighting; `"distance"` is also available. |
-| `knn_normalization` | `"none"` | Unreleased KNN option: `"sd"` uses training-fitted SD without centering. |
+| `knn_normalization` | `"none"` | `"sd"` uses training-fitted SD without centering. |
 | `logistic_C` | `1.0` | Inverse L2 regularization strength for logistic regression. |
 | `logistic_max_iter` | `1000` | Logistic-regression iteration limit, independent of the NMF cap. |
 | `logistic_tol` | `1e-4` | Logistic-regression stopping tolerance. |
 | `logistic_class_weight` | `None` | Also accepts `"balanced"` from training labels, or a dictionary of class weights. |
-| `svm_C` | `1.0` | Unreleased linear-SVM inverse L2 regularization strength; depends on coordinate units. |
+| `svm_C` | `1.0` | Linear-SVM inverse L2 regularization strength; depends on coordinate units. |
 | `svm_max_iter` | `20000` | Linear-SVM iteration cap, independent of the NMF cap. |
 | `svm_tol` | `1e-5` | Linear-SVM stopping tolerance. |
 | `svm_class_weight` | `None` | Linear-SVM class weights: `None`, `"balanced"` or a dictionary. |
@@ -215,8 +220,8 @@ Rank, screening cutoff and the selected classifier's predictive parameters
 require tuning for the data. CD and MU use different stopping criteria, so
 equal tolerances do not imply equal
 numerical accuracy. Features and factors are not automatically rescaled for
-NMF. KNN is unscaled by default and offers explicit SD scaling in current
-source. Logistic regression uses a separate fitted coordinate scaler; linear
+NMF. KNN is unscaled by default and offers explicit SD scaling.
+Logistic regression uses a separate fitted coordinate scaler; linear
 SVM uses the unscaled coordinates.
 
 The default follows the recorded accuracy-time comparison on CelebA and
@@ -226,12 +231,22 @@ separability and noise assumptions; classification accuracy does not establish
 those assumptions. See [solver comparisons](docs/nmf-solver-comparison.md),
 [methodology](docs/methodology.md), and [theoretical scope](docs/theory-implementation.md).
 
-# Tuning and reporting update
+# Release changes
 
-Version 0.1.0a2 adds subject-aware training folds, bounded rank exploration,
+Version 0.3.0 changes SPA classifier training to the common fixed-basis map
+described above, adds optional SD KNN and linear SVM, stabilizes screening for
+large offsets, and guards extreme-range NNLS and factor-recovery calculations.
+Compatible KNN grids reuse neighbor queries; a narrowly guarded one-thread MKL
+path accelerates report-only reconstruction norms. These changes do not imply
+a uniform speed or memory improvement. Controlled memory probes found peaks
+about 27–72% higher in particular screening and projection cases, relative to
+the earliest recoverable source. See the [release notes](docs/release-0.3.0.md)
+for the measured scope, mixed timing results and unresolved tuning boundaries.
+
+Version 0.1.0a2 added subject-aware training folds, bounded rank exploration,
 reused fold-local screening statistics, and evaluation summaries with class
 support and numerical-stage diagnostics. Solver, screening, and rank defaults
-are unchanged in that release. Version 0.2.0 additionally provides guarded
+were unchanged in that release. Version 0.2.0 additionally provided guarded
 batched projection and saved decision thresholds; existing serialized models
 retain their SciPy projection path. See the [0.2.0 release record](docs/release-0.2.0.md),
 [tuning improvements](docs/tuning-improvements.md), and the [API guide](docs/api.md).
@@ -366,7 +381,7 @@ are outside this release.
 
 # Tests and local builds
 
-From a source checkout with the dependencies installed:
+From the version 0.3.0 source checkout, with dependencies and build tools installed:
 
 ```shell
 python scripts/check.py
@@ -374,6 +389,7 @@ python scripts/build_release.py
 python -I scripts/check_wheel.py
 ```
 
-The build produces a local wheel and source archive. The wheel check verifies
+The build produces `dist/supervised_nmf-0.3.0-py3-none-any.whl` and a source
+archive. The wheel check verifies
 imports, authorship metadata, SPA/MU/CD fitting and prediction, and archive
 contents. It does not publish a release.

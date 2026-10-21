@@ -564,6 +564,12 @@ preserved receipts are recorded in the locally retained implementation report,
 `output/implementation-20261020/IMPLEMENTATION-REPORT.md`, which is not bundled
 with the public source.
 
+Release annotation, October 20, 2026: version 0.3.0 includes the approved
+integration described above. The unreleased status in that record describes
+the source before this release; the 0.2.0 artifacts and historical validation
+receipts remain unchanged. See the [0.3.0 release notes](release-0.3.0.md) for
+the release scope and additional validation evidence.
+
 ## Pending scientific and release work
 
 - Final evidence audit and release documentation for the completed
@@ -581,6 +587,6 @@ with the public source.
 - Full-study memory and broad scaling measurements. The completed BLAS benchmark
   includes native process peak-memory measurements; study figures and tables
   appear in the [Wang validation report](wang-validation-report.md).
-- Broader compatibility verification and any new release or package-index
+- Broader compatibility verification and any package-index
   publication. Chang Cheng's original work is All Rights Reserved while the
   distribution license remains undecided; see [LICENSE](../LICENSE).

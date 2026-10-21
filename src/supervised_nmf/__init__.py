@@ -5,6 +5,6 @@ from .decomposition import FeatureSPA
 from .screening import BinaryScreening
 
 __author__ = "Chang Cheng"
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = ["NMFClassifier", "FeatureSPA", "BinaryScreening"]
 

@@ -90,8 +90,10 @@ environment; the launchers invoke `python` on Windows and `python3` on Linux.
 installation lockfile. It cannot reproduce AOCL/OpenBLAS binary builds. Optional
 `psutil` is unnecessary when native Windows/Linux resource probes are available.
 
-All unpublished `supervised_nmf` Python source, package metadata, documentation,
+The current `supervised_nmf` Python source, package metadata, documentation,
 citation and original research provenance are included under `package/`.
+New snapshots also include `package/LICENSE` and `package/THIRD_PARTY_NOTICES`,
+preserving the project's rights notice and separate third-party terms.
 The runner imports that source directly instead of an installed sNMF distribution.
 Chang Cheng's authorship is preserved in `package/CITATION.cff` and provenance.
 

@@ -1,9 +1,9 @@
 # API reference
 
-This page describes current source. Optional KNN SD scaling and the linear-SVM
-head are **unreleased additions with completed integration checks on Robust**.
-They are not available in the released 0.2.0 wheel. Historical release and
-validation records remain separate.
+This page describes version 0.3.0. Optional KNN SD scaling and the linear-SVM
+head are included, with completed integration checks on Robust. They are not
+available in the 0.2.0 wheel. Historical release and validation records remain
+separate.
 
 ## Classifier
 
@@ -155,8 +155,8 @@ report nonconvergence; it is not a certificate of global optimality or consisten
 
 ### Training coordinates
 
-The current unreleased source defaults to `training_coordinates="auto"`.
-The released 0.2.0 wheel still defaults to `"fit_transform"`.
+Version 0.3.0 defaults to `training_coordinates="auto"`.
+The 0.2.0 wheel defaults to `"fit_transform"`.
 For SPA, this resolves to `"transform"`: after fitting the nonnegative basis,
 the classifier re-encodes its training observations by fixed-basis NNLS.
 Training and prediction therefore use the same fitted basis and projection map.
@@ -196,7 +196,7 @@ the rank, then fall back. This does not change the NNLS objective. Floating-poin
 coefficients need not be bitwise identical. `projection_solver="scipy"` selects
 the public row-wise solver for every query.
 
-Current unreleased source also guards input magnitude before either solver.
+Version 0.3.0 also guards input magnitude before either solver.
 Ordinary-range inputs retain their solver path. Extreme inputs use exactly
 reversible common binary scaling of the design and each independent RHS;
 rows with the same scale share execution. The scale preserves the NNLS
@@ -252,7 +252,7 @@ They do not revise saved study results or establish an accuracy improvement.
 
 `BinaryScreening` is a sklearn transformer with `fit`, `transform`, and
 `get_support`. It exposes signed `t_scores_`, squared `scores_`, selected indices,
-class counts and constant/infinite-score counts. In current unreleased source,
+class counts and constant/infinite-score counts. In version 0.3.0,
 statistics subtract each training feature's minimum before dividing by the
 remaining spread. This preserves represented small variation behind a large
 offset. `statistic_offsets_` and `statistic_scales_` record these operations;
@@ -433,7 +433,7 @@ scaler is reused across K values and applied once to each validation representat
 `knn_normalization` stays fixed within one shared grid; changing the metric
 requires a separate declared comparison.
 
-Current unreleased source also shares Euclidean neighbor queries among
+Version 0.3.0 also shares Euclidean neighbor queries among
 compatible fitted KNN heads. Callable weights, other metrics, sparse inputs,
 unknown backends and uncertain distance/vote boundaries use each selected-k
 public estimator on the whole original query batch. This internal adapter

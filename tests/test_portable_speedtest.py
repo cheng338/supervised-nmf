@@ -261,11 +261,14 @@ class PortableZipTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             builder.verify_zip(self.archive, self.bundle, self.manifest)
 
-    def test_builder_includes_all_entrypoints_and_unpublished_python_source(self):
+    def test_builder_includes_all_entrypoints_python_source_and_notices(self):
         inputs = builder.inputs()
         for name in ("benchmark.py", "compare.py", "check_compatibility.py", "sweep.py"):
             with self.subTest(entrypoint=name):
                 self.assertEqual(inputs[Path(name)], PORTABLE / name)
+        for name in ("LICENSE", "THIRD_PARTY_NOTICES"):
+            with self.subTest(notice=name):
+                self.assertEqual(inputs[Path("package") / name], ROOT / name)
         source = ROOT / "src" / "supervised_nmf"
         expected = {path for path in source.rglob("*.py")}
         bundled = {path for relative, path in inputs.items()

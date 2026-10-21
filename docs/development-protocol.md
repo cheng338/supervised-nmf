@@ -76,9 +76,9 @@ worse.
 KNN remains the package default. KNN and logistic regression are already public
 classifier options; linear SVM is selected for integration and currently exists
 in the study adapter at the time of this scope decision. The approved integration
-below subsequently completed the public SVM API and its Robust checks; it remains
-unreleased. Preserve genuine SVM decision margins rather than presenting them as
-probabilities. DWD remains outside the current project.
+below subsequently completed the public SVM API and its Robust checks; it is
+included in version 0.3.0. Preserve genuine SVM decision margins rather than
+presenting them as probabilities. DWD remains outside the current project.
 
 Continue face-image validation with these three classifiers, using training-only
 transformations and explicit imbalance handling. A new validation batch still

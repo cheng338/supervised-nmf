@@ -54,3 +54,14 @@ jobs:
         run: python scripts/build_release.py
       - name: Verify built distributions
         run: python -I scripts/check_wheel.py
+      - name: Retain verified release distributions
+        if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: distributions-${{ github.sha }}
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0

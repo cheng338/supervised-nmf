@@ -16,6 +16,38 @@ historical records. Their original support declarations and results are not
 changed retroactively. Do not use them as installation guidance for current
 source.
 
+## CD/MU numerical reproducibility
+
+A fixed `random_state` controls initialization randomness; it does not promise
+identical CD/MU factors or predictions across numerical environments. Record
+dependency versions and binary builds, loaded BLAS/LAPACK libraries, thread
+settings, input dtype and layout, source revision, data and model parameters
+when reproducing a study. Matching version numbers alone is insufficient.
+
+CD and MU use scikit-learn's NNDSVDa initialization and Frobenius objective.
+Small floating-point differences during initialization or iterative updates can
+lead to different fitted coordinates. NNDSVDa's truncation and mean filling of
+zeros can amplify some initialization differences, but the largest initial
+factor discrepancy need not determine the final model. Similar reconstruction
+errors, identical iteration counts or warning-free fits do not establish
+identical classification behavior.
+
+CD/MU retain accepted float32 factorization inputs; the package does not silently
+promote them to float64. Supplying float64 consistently for training and
+prediction can improve agreement across environments, with workload-dependent
+execution and memory costs. It does not guarantee identical results or higher
+classification accuracy. Solver defaults, initialization, tolerances and input
+precision remain explicit parts of the study configuration.
+
+The fixed-basis MU numerical fallback uses float64 logarithms for extreme-range
+queries and returns coordinates in the query dtype. It does not promote training
+factorization inputs or change the fitted basis. See the
+[projection diagnostics](api.md#fit-diagnostics) for its scope and cost.
+
+See [fit diagnostics](api.md#fit-diagnostics) for the meaning of convergence
+flags and [numerical test interpretation](development-protocol.md#numerical-test-interpretation)
+for the distinction between composition checks and environment comparisons.
+
 ## Historical Python 3.10 profile
 
 The original supplied compatibility profile described an x86-64 Ubuntu 22.04.5 LTS

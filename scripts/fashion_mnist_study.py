@@ -44,7 +44,7 @@ from supervised_nmf.evaluation import (
 )
 from supervised_nmf.screening import BinaryScreening
 from supervised_nmf.study import (
-    _checkpoint_lock, _read_receipt, _runtime_identity as _calibration_runtime,
+    _checkpoint_lock, _initialized_provenance, _read_receipt, _runtime_identity as _calibration_runtime,
     _write_receipt, calibration_knn_grid,
 )
 from profile_celeba_stages import _compare_predictions, _runtime_identity, _StageProfiler, profile_selected_estimator
@@ -71,7 +71,7 @@ def _integer(value, label, minimum=1, maximum=None):
 
 
 def _sources(extra_paths=()):
-    environment = provenance(1)
+    environment = _initialized_provenance(1)
     paths = [Path(__file__), ROOT / "scripts" / "profile_celeba_stages.py"]
     experimental = ROOT / "scripts" / "experimental_nmf.py"
     if experimental.exists():

@@ -17,6 +17,7 @@ from sklearn.utils.metaestimators import available_if
 from sklearn.utils.validation import check_is_fitted
 
 from .decomposition import FeatureSPA
+from ._mu import transform_mu
 from ._projection import validate_projection_parameters
 from ._residual import reconstruction_error
 from .screening import BinaryScreening, _binary_data, _clear_fitted_attributes, _nonnegative_array
@@ -73,6 +74,11 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
     loss, matching the original scripts. Multiplicative updates use the same
     initialization and loss with sklearn's MU solver. Raw nonnegative feature
     values and Euclidean KNN coordinates are not automatically scaled.
+    A fixed ``random_state`` does not guarantee identical CD/MU factors or
+    predictions across numerical-library builds, backends or thread settings.
+    For CD/MU, accepted float32 factorization inputs remain float32. Using float64
+    for both training and prediction can improve agreement at additional cost, without
+    guaranteeing identical results or better classification accuracy.
 
     ``classifier='knn'`` retains the original final classifier.
     ``knn_normalization='none'`` preserves its original metric. Optional ``'sd'``
@@ -118,8 +124,13 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
 
     ``projection_solver``, ``projection_workers``, ``projection_batch_size``
     and ``projection_native_threads`` configure SPA's fixed-basis prediction
-    projection (and training reprojection when requested). See ``FeatureSPA``
-    for their numerical safeguards and process-pool behavior. They are
+    projection (and training reprojection when requested). The default ``'auto'``
+    uses guarded batching. Optional ``'qr'`` shares a QR reduction and solves
+    the reduced NNLS problems with public SciPy, preserving the original
+    objective and leaving SPA basis fitting unchanged. It retains range,
+    conditioning and original-space qualification guards with public fallback;
+    its cost depends on the workload. See ``FeatureSPA`` for the numerical
+    limits, iteration-cap semantics and process-pool behavior. These controls are
     validated but unused by CD and MU. Unlike the fitted decision policy,
     projection execution settings may be changed without refitting.
 
@@ -134,8 +145,11 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
     the screening or basis. ``components_`` is padded with zeros to the original
     feature count; ``selected_components_`` contains only retained columns.
     Fit times exclude tuning; callers must separately record search costs.
-    The default iteration cap is 20,000 for CD/MU or each SPA NNLS solve;
-    converged routines can terminate earlier. CD and MU use their respective
+    The default iteration cap is 20,000 for CD/MU and SPA's public NNLS solves.
+    SPA may first make a bounded batched attempt, then pass the original cap
+    to SciPy fallback; this is not a shared total-work budget. Batched pivot
+    rounds and SciPy iterations are different units. Converged routines can
+    terminate earlier. CD and MU use their respective
     sklearn stopping criteria, so identical tolerances do not imply identical
     numerical accuracy. SPA's NNLS routine does not use ``tol``. Increasing the
     cap can change a previously truncated fit without changing its objective
@@ -146,6 +160,13 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
     ``convergence_warnings_`` include factorization, training projection, and
     classifier fitting; classifier-specific diagnostics are also available as
     ``classifier_converged_`` and ``classifier_convergence_warnings_``.
+    For stages that return successfully, these flags indicate the absence of
+    a captured sklearn ``ConvergenceWarning``; other warning categories do not
+    determine them. They do not independently certify stationarity, KKT
+    conditions, global optimality or agreement across environments. A skipped
+    training projection has ``training_projection_converged_=None``. For an
+    already fitted estimator, a failed transform records its latest error/status
+    without changing the fit's ``converged_``.
     """
 
     def __init__(self, n_components=2, *, solver="spa", screening="absolute", percentile=10.0,
@@ -340,7 +361,7 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
         stage = time.perf_counter()
         projection_warnings = ()
         if training_coordinates_mode == "transform":
-            W, projection_warnings = _record_warnings(lambda: decomposition.transform(X_selected))
+            W, projection_warnings = _record_warnings(lambda: transform_mu(decomposition, X_selected))
         training_projection_seconds = time.perf_counter() - stage
         stage = time.perf_counter()
         if self.classifier == "knn":
@@ -435,7 +456,7 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
             if X.shape[1] != self.n_features_in_:
                 raise ValueError(f"X has {X.shape[1]} features; expected {self.n_features_in_}.")
             X_selected = X[:, self.selected_features_]
-            W, messages = _record_warnings(lambda: self.decomposition_.transform(X_selected))
+            W, messages = _record_warnings(lambda: transform_mu(self.decomposition_, X_selected))
             self.last_transform_warnings_ = messages
             self.last_transform_converged_ = not messages
             return W

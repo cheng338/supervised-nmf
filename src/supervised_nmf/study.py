@@ -100,8 +100,17 @@ def _layout(estimator):
     raise TypeError("Use NMFClassifier with classifier='knn', a standard Pipeline ending in KNeighborsClassifier, or raw KNeighborsClassifier.")
 
 
+def _initialized_provenance(threads):
+    # A first BLAS operation can load a previously unseen OpenMP library.
+    # Stabilize that inventory before freezing it, without using study data.
+    with threadpool_limits(limits=threads):
+        probe = np.eye(4)
+        probe @ probe
+        return provenance(threads)
+
+
 def _runtime_identity(estimator, threads):
-    info = provenance(threads)
+    info = _initialized_provenance(threads)
     runtime_keys = ("user_api", "internal_api", "prefix", "filepath", "version", "threading_layer", "architecture")
     libraries = sorted([{key: pool.get(key) for key in runtime_keys} for pool in info["threadpools"]],
                        key=lambda row: row.get("filepath") or "")

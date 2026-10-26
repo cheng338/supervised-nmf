@@ -1,9 +1,9 @@
-"""Run local tests without installing the package or third-party test runners."""
+"""Run the source test suite with pytest."""
 
 from pathlib import Path
 import os
 import sys
-import unittest
+
 
 def main():
     if os.name == "nt":
@@ -20,9 +20,8 @@ def main():
     faulthandler.enable()
     root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(root / "src"))
-    suite = unittest.defaultTestLoader.discover(str(root / "tests"), pattern="test_*.py")
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
-    return not result.wasSuccessful()
+    import pytest
+    return pytest.main(["-v", str(root / "tests")])
 
 
 if __name__ == "__main__":

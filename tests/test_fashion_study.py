@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
-from threadpoolctl import threadpool_limits
+from threadpoolctl import threadpool_info, threadpool_limits
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -128,6 +128,28 @@ class FashionStudyTests(unittest.TestCase):
         self.assertEqual(result["completed_chunks_this_call"], 4)
         resumed = runner.run_cv(self.output, self.initialize(), workers=2)
         self.assertEqual(resumed["completed_chunks_this_call"], 0)
+
+    def test_source_inventory_is_stable_and_restores_thread_limits(self):
+        expected = runner._sources()
+        with threadpool_limits(limits=2):
+            before = {pool["filepath"]: pool["num_threads"] for pool in threadpool_info()}
+            self.assertEqual(runner._sources(), expected)
+            after = {pool["filepath"]: pool["num_threads"] for pool in threadpool_info()}
+            self.assertEqual(after, before)
+        self.assertEqual(runner._sources(), expected)
+
+    def test_source_guard_rejects_changed_library_and_package_identities(self):
+        expected = runner._sources()
+        self.assertTrue(expected["runtime"]["numerical_runtime"])
+        altered_runtime = deepcopy(expected)
+        altered_runtime["runtime"]["numerical_runtime"][0]["version"] = "different-runtime"
+        altered_source = deepcopy(expected)
+        name = next(iter(altered_source["package_source_sha256"]))
+        altered_source["package_source_sha256"][name] = "0" * 64
+        for altered in (altered_runtime, altered_source):
+            with self.subTest(identity=altered):
+                with self.assertRaisesRegex(ValueError, "Source or numerical runtime changed"):
+                    runner._check_source(altered)
 
     def test_serial_exact_profiles_metrics_and_resume(self):
         config = self.initialize()

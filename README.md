@@ -29,9 +29,10 @@ See [CITATION.cff](CITATION.cff) for citation details and
 Version **0.3.0** adds a common SPA training/prediction coordinate map,
 optional SD-scaled KNN and linear SVM, and numerical and execution safeguards.
 See the [0.3.0 release notes](docs/release-0.3.0.md) for migration and validation limits.
-The current release, **0.3.2**, simplifies packaging and edits the research
-documentation. The classification implementation is unchanged;
-see the [0.3.2 release notes](docs/release-0.3.2.md).
+Version **0.3.3** adds numerical recovery for MU projection, guarded SPA basis
+fitting, optional QR projection and clearer evaluation reports. Classifier
+choices and defaults are unchanged. See the
+[0.3.3 release notes](docs/release-0.3.3.md) for details and verification scope.
 
 **Copyright (c) 2026 Chang Cheng. All Rights Reserved.** A distribution license
 has not yet been selected. Public availability of this repository does not
@@ -40,20 +41,20 @@ applicable [third-party notices](THIRD_PARTY_NOTICES).
 
 # Installation
 
-Python 3.11 or later is required for version 0.3.2. Python 3.10 support
+Python 3.11 or later is required for version 0.3.3. Python 3.10 support
 ended on October 20, 2026. Dependencies are NumPy, SciPy, scikit-learn
 1.6 or later (below 2.0), threadpoolctl, and joblib 1.3 or later.
 Download the wheel from the [GitHub releases](https://github.com/cheng338/supervised-nmf/releases)
 and install it:
 
 ```shell
-python -m pip install --upgrade supervised_nmf-0.3.2-py3-none-any.whl
+python -m pip install --upgrade supervised_nmf-0.3.3-py3-none-any.whl
 ```
 
 To install the release from source:
 
 ```shell
-git clone --branch v0.3.2 https://github.com/cheng338/supervised-nmf.git
+git clone --branch v0.3.3 https://github.com/cheng338/supervised-nmf.git
 cd supervised-nmf
 python -m pip install .
 ```
@@ -175,11 +176,18 @@ Version 0.2.0 defaulted to `training_coordinates="fit_transform"`; its archived
 artifacts and historical results retain that behavior.
 
 SPA uses direct BLAS updates and reuses the fixed NNLS matrix layout during
-projection. New models use guarded batched NNLS for suitable query batches,
-with public SciPy NNLS as the numerical fallback. Use
-`projection_solver="scipy"` for the original row-wise projection. Optional
-`projection_workers=8` enables reusable process workers for large batches;
-the default is one worker. See [projection controls](docs/api.md#spa-projection-execution),
+projection. Version 0.3.3 also uses guarded batched NNLS to fit the basis
+from the selected anchors, with public SciPy fallback. This preserves the
+fixed-anchor objective; see [basis fitting](docs/api.md#spa-basis-fitting)
+for conditioning, numerical-range and iteration-limit behavior.
+The default `projection_solver="auto"` uses guarded batched NNLS for suitable
+query batches. Use `"scipy"` for the original row-wise projection or `"qr"` to
+request guarded QR reduction with public SciPy solves. QR shares the reduction
+across a query batch while preserving the fixed-basis NNLS objective. Its speed
+depends on the workload; it can also add overhead or fall back to the current
+solver. Selecting it does not change anchor selection or SPA basis fitting.
+Optional `projection_workers=8` enables reusable process workers for large
+batches; the default is one worker. See [projection controls](docs/api.md#spa-projection-execution),
 the [0.2.0 implementation record](docs/implementation-improvements.md), and the
 earlier [BLAS checks](docs/blas-optimization.md).
 
@@ -212,7 +220,7 @@ earlier [BLAS checks](docs/blas-optimization.md).
 | `tol` | `1e-4` | CD/MU stopping tolerance; SPA's NNLS routine does not use this parameter. |
 | `random_state` | `None` | Set an integer for reproducible CD/MU initialization. |
 | `training_coordinates` | `"auto"` | Uses `"transform"` for SPA and `"fit_transform"` for CD/MU; either convention can also be selected explicitly. |
-| `projection_solver` | `"auto"` | SPA query projection: guarded batching; also `"scipy"` or `"batched"`. |
+| `projection_solver` | `"auto"` | SPA fixed-basis projection: guarded batching; also `"scipy"`, `"batched"` or guarded `"qr"`. |
 | `projection_workers` | `1` | Maximum SPA projection processes; independent of outer CV workers. |
 | `projection_batch_size` | `256` | Maximum query rows per NNLS block. |
 | `projection_native_threads` | `1` | Numerical threads per projection process. |
@@ -227,6 +235,19 @@ NMF. KNN is unscaled by default and offers explicit SD scaling.
 Logistic regression uses a separate fitted coordinate scaler; linear
 SVM uses the unscaled coordinates.
 
+MU projection returns exact zero coordinates for an entirely zero selected
+query batch. For ordinary float32 queries whose fitted basis has tiny tails,
+or whose arithmetic raises a floating-point error, it first retries in float64.
+Tiny positive queries and failed retries use logarithmic arithmetic. These
+corrections preserve the fitted basis and returned dtype; they do not change
+joint factorization. See [MU projection](docs/api.md#fit-diagnostics) for
+numerical limits, warnings and possible additional cost.
+
+Version 0.3.3 also supports a bounded, one-thread AOCL path for reporting
+reconstruction norms, alongside the existing MKL path. It affects diagnostics
+only, not optimization, stopping, or predictions. See the
+[runtime and array requirements](docs/api.md#reconstruction-diagnostics).
+
 The default follows the recorded accuracy-time comparison on CelebA and
 Fashion-MNIST. Its evidence remains under final audit and does not establish
 a universal best solver. SPA's factor-recovery results require additional
@@ -235,6 +256,13 @@ those assumptions. See [solver comparisons](docs/nmf-solver-comparison.md),
 [methodology](docs/methodology.md), and [theoretical scope](docs/theory-implementation.md).
 
 # Release changes
+
+Version 0.3.3 adds MU projection recovery, guarded batched SPA basis fitting and
+the explicit `projection_solver="qr"` option. Evaluation summaries show class
+balance and distinguish overlapping timing totals. Source tests run under
+pytest. The default remains SPA with absolute screening and unscaled KNN;
+the new projection option does not change factorization or classifier defaults.
+See the [0.3.3 release notes](docs/release-0.3.3.md).
 
 Version 0.3.0 changes SPA classifier training to the common fixed-basis map
 described above, adds optional SD KNN and linear SVM, stabilizes screening for
@@ -384,15 +412,28 @@ are outside this release.
 
 # Tests and local builds
 
-From the version 0.3.2 source checkout, with dependencies and build tools installed:
+From the source checkout, install the test and study dependencies:
+
+```shell
+python -m pip install -e ".[study,test]"
+```
+
+Run the pytest suite through the launcher, which also configures native-failure
+tracebacks and Windows error handling:
 
 ```shell
 python scripts/check.py
+```
+
+The existing test cases and subtests run under pytest 9 or later. With build
+tools installed, build and check the distributions separately:
+
+```shell
 python scripts/build_release.py
 python -I scripts/check_wheel.py
 ```
 
-The build produces `dist/supervised_nmf-0.3.2-py3-none-any.whl` and a source
+The build produces `dist/supervised_nmf-0.3.3-py3-none-any.whl` and a source
 archive. The wheel check verifies
 imports, authorship metadata, SPA/MU/CD fitting and prediction, and archive
 contents. It does not publish a release.

@@ -1,9 +1,9 @@
 # API reference
 
-This page describes version 0.3.2. Optional KNN SD scaling and the linear-SVM
-head are included, with completed integration checks on the validation host.
-They are not available in the 0.2.0 wheel. Historical release and validation
-records remain separate.
+This page describes version 0.3.3. Optional QR projection and MU numerical
+recovery are new in this version. Optional KNN SD scaling and the linear-SVM
+head were introduced in 0.3.0. Historical release and validation records retain
+their original scope.
 
 ## Classifier
 
@@ -32,7 +32,7 @@ classifier = NMFClassifier(
     tol=1e-4,
     random_state=42,
     training_coordinates="auto",  # SPA: transform; CD/MU: fit_transform
-    projection_solver="auto",   # SPA only: "auto", "scipy", or "batched"
+    projection_solver="auto",   # SPA only: "auto", "scipy", "batched", or "qr"
     projection_workers=1,        # maximum process count for large queries
     projection_batch_size=256,
     projection_native_threads=1,
@@ -49,9 +49,11 @@ The default is SPA with absolute-score screening. Available solvers are
 `"spa"`, `"mu"`, and `"cd"`; CD reproduces the original solver choice. The
 [four-method development comparison](nmf-solver-comparison.md) supplies empirical
 context, not a universal solver ranking. Rank, cutoff and classifier parameters remain
-tunable. `max_iter=20000` preserves that study's numerical allowance: it caps
-CD/MU iterations or each SPA NNLS solve, depending on
-the solver. Converged routines stop earlier. The tolerance remains `1e-4` for
+tunable. `max_iter=20000` preserves that study's numerical allowance for
+CD/MU iterations and SPA's public NNLS solves. SPA may first make a bounded
+batched attempt, then pass the original cap to SciPy fallback; the cap is not
+a shared total-work budget. Batched pivot rounds and SciPy iterations are
+different units. Converged routines stop earlier. The tolerance remains `1e-4` for
 CD/MU and is not used by SPA's NNLS routine. CD and MU have different stopping
 criteria; equal tolerance values do not establish equal numerical accuracy.
 Explicit overrides are preserved; `None` is invalid for `solver` or `screening`.
@@ -142,6 +144,9 @@ the original feature mask. `classifier_` is a bare KNN for unscaled KNN, a
 pipeline named `scale`/`knn` for SD KNN, a pipeline named `scale`/`logistic` for
 logistic regression, or a bare `LinearSVC` for SVM. `knn_normalization_` records
 the fitted KNN metric and is `None` for other heads.
+
+### Fit diagnostics
+
 `fit_times_`, `n_iter_`, `converged_`, and `convergence_warnings_` expose fit
 diagnostics. `n_iter_` remains the factorization iteration count.
 `classifier_n_iter_`, `classifier_converged_`, and
@@ -150,8 +155,59 @@ diagnostics. `n_iter_` remains the factorization iteration count.
 list include factorization, any training reprojection and classifier fitting.
 Classifier fit timing includes scaler fitting for SD KNN or logistic regression.
 `last_transform_converged_` and `last_transform_warnings_` concern
-the most recent transform. Convergence here means the numerical routine did not
-report nonconvergence; it is not a certificate of global optimality or consistency.
+the most recent transform.
+
+For MU, an entirely zero matrix after fitted feature selection has the exact
+fixed-basis solution of zero coordinates. The package returns that solution
+without MU iterations for its standard unregularized Frobenius configuration,
+and reports a successful transform. Full input validation still applies,
+including to discarded columns. This shortcut applies only to exact zeros.
+The fitted classifier then predicts from those coordinates using its existing
+scaler and decision rule.
+
+Ordinary inputs retain the scikit-learn calculation. For float32 queries,
+tiny fitted basis entries or a floating-point failure first trigger a retry
+with float64 copies of the query and basis on a temporary estimator. Internal
+underflow remains an error; only final output rounding allows underflow.
+The fitted estimator and its arrays are not changed by this retry.
+
+Positive query entries below the square root of the input dtype's smallest
+normal value use logarithmic arithmetic directly. Tiny positive basis entries
+in float64, float64 arithmetic failures and failed float64 retries also use
+the logarithmic calculation. This preserves
+tiny input contributions without forcing ordinary float32 images into the
+more expensive path solely because their learned basis has tiny tails.
+Both recovery paths retain the MU update equations, uniform initialization and
+relative-error stopping rule. They preserve the fitted basis and return the
+input dtype; the widened path converts back only after solving. Nonzero inputs
+are not replaced with zeros; a coordinate below the output dtype's representable
+range can still round to zero. Unrepresentably large coordinates raise an error.
+In the recovery paths, the rank-one closed-form first MU update supplies the
+final coordinates; subnormal outputs use exact input ratios to resolve
+round-to-nearest ties.
+Recovery can cost more time and can change rounding and stopping iterations
+relative to the ordinary calculation. An exhausted positive-tolerance iteration
+cap still emits a convergence warning.
+An explicit training reprojection uses the same correction as prediction;
+joint factorization and the training-coordinate policy remain unchanged.
+
+For a stage that returns successfully, its convergence flag records the absence
+of a captured scikit-learn `ConvergenceWarning`. Other warning categories do not
+determine that flag. A skipped training projection has
+`training_projection_performed_=False` and `training_projection_converged_=None`.
+For an already fitted estimator, a failed transform raises its error, sets
+`last_transform_converged_=False` and records `last_transform_error_`; it does not
+change the preceding fit's `converged_`. Warnings emitted before a solver
+failure are forwarded, but may only be available to an external warning
+collector because the operation did not return its diagnostics.
+
+These flags do not independently verify stationarity, KKT conditions, global
+optimality, statistical consistency or agreement across environments. CD and MU
+use different stopping criteria: CD measures relative projected-gradient
+violation, while MU measures relative reconstruction-error improvement.
+Identical `tol` values or iteration counts therefore do not imply equal numerical
+accuracy. See [numerical reproducibility](compatibility.md#cdmu-numerical-reproducibility)
+for input precision and runtime considerations.
 
 ### Training coordinates
 
@@ -176,13 +232,40 @@ comparing fits or reproducing historical results.
 
 ## Screening and SPA separately
 
+### SPA basis fitting
+
+Version 0.3.3 fits the basis by guarded batched NNLS against the selected
+original-scale anchor columns. It uses the same fixed-anchor nonnegative
+least-squares objective as the previous public SciPy column loop. At least
+32 features and a nonnegative full-rank design with condition number at most
+1e4 are required for batching. Numerical blocks contain at most 256 target
+columns. Feasibility and original-design KKT checks qualify each result;
+ineligible designs and failed numerical checks use public SciPy NNLS.
+
+The helper uses normal equations, which square conditioning. Coefficients can
+lose precision near the acceleration limit even when residual and optimality
+checks pass. The acceleration guard is separate from `condition_limit`, and
+the fitted basis must still pass the existing rank and condition checks.
+If the helper raises `FloatingPointError`, basis fitting retries the original
+public column loop on the original inputs, preserving its accepted numerical
+range. Validation and iteration-exhaustion errors propagate. Projection retains
+its own numerical-range behavior described below.
+
+Basis fitting runs in the calling process and does not use the projection
+execution controls. Explicit iteration caps below three times the rank use
+SciPy directly for ordinary-range inputs. Otherwise, a batched attempt is
+bounded by three times the rank before fallback receives the original cap.
+This preserves the objective, not bitwise results or universal stopping parity.
+Existing serialized models keep their stored basis; refitting uses this
+implementation. No constructor parameters or fitted-state fields were added.
+
 ### SPA projection execution
 
 These controls apply to both `FeatureSPA` and `NMFClassifier(solver="spa")`.
 They affect fixed-basis projection, including training reprojection when
-`training_coordinates="transform"` or when `"auto"` resolves to it. SPA anchor
-selection and basis fitting still use the original algorithms. CD/MU ignore
-valid SPA projection controls.
+`training_coordinates="transform"` or when `"auto"` resolves to it. They do not
+control anchor selection or basis fitting. CD/MU ignore valid SPA projection
+controls.
 
 `projection_solver="auto"` attempts batched NNLS for at least 32 query rows.
 `"batched"` also attempts it for smaller queries. Both require a nonnegative,
@@ -196,7 +279,42 @@ the rank, then fall back. This does not change the NNLS objective. Floating-poin
 coefficients need not be bitwise identical. `projection_solver="scipy"` selects
 the public row-wise solver for every query.
 
-Version 0.3.0 also guards input magnitude before either solver.
+`projection_solver="qr"` requests a shared economic QR factorization followed
+by public SciPy NNLS solves on the reduced matrix. The original nonnegative
+design must have full column rank and at least twice as many rows as columns;
+each group submitted to the solver must have at least 32 right-hand sides.
+The estimated condition number of the reduced matrix must be finite and at
+most 1e6. This bound is separate from both the batched solver's 1e4 limit and
+SPA's model condition limit. It is an admission safeguard, not a guarantee of
+coefficient accuracy or identical classifier decisions.
+
+For a fixed design `A = Q @ R` with orthonormal columns in `Q`,
+
+```text
+||A @ z - b||² = ||R @ z - Q.T @ b||² + ||(I - Q @ Q.T) @ b||².
+```
+
+The last term is independent of `z`, so reduced NNLS retains the original
+objective minimizer and the constraint `z >= 0` in exact arithmetic. The
+reduced matrix and targets may be signed. They go to the public SciPy solver;
+finite, nonnegative coefficients must pass KKT checks against the original
+design and targets before the QR result is accepted. Ill-conditioned or
+ineligible designs, failed numerical checks and reduced-solver numerical
+failures use the current guarded solver and its public SciPy fallback. Explicit iteration
+caps below three times the rank retain the current direct SciPy route. Each
+fallback receives the original cap, and reference-solver errors propagate;
+the cap is not a combined work budget across an attempt and its fallback.
+
+QR factors are local to one scaling group within a call. They are not cached
+in the fitted estimator or reused across prediction calls. Sharing a tall
+reduction can help a large query batch, but reduced per-row solves and
+qualification can also cost more than the current batched path. Small changes
+in coefficients from floating-point arithmetic are possible. Select the solver
+using the complete fit/prediction workload; QR is not a general speed or
+accuracy improvement. The default remains `"auto"`, and this choice does not
+change SPA basis fitting.
+
+Input magnitude is checked before every projection solver.
 Ordinary-range inputs retain their solver path. Extreme inputs use exactly
 reversible common binary scaling of the design and each independent RHS;
 rows with the same scale share execution. The scale preserves the NNLS
@@ -215,6 +333,10 @@ startup cost, and joblib retires idle workers. `projection_native_threads=1`
 limits numerical threads per projection process and restores previous limits
 afterward. The controller discovers NumPy/SciPy libraries at first projection.
 Thread limits are process-wide; use process workers for concurrent work.
+QR admission applies separately inside each worker and scaling group. A worker
+chunk or final chunk with fewer than 32 rows can therefore use the current
+solver even when the full query batch is large. Splitting a query also repeats
+QR setup in each eligible worker call.
 
 Execution controls may change after fitting, for example
 `model.set_params(projection_workers=8)`, without refitting. Outer CV scheduling
@@ -342,8 +464,16 @@ print(format_evaluation_summary(validation))
 Training/evaluation IDs and subjects must not overlap. Training labels determine
 the majority-class reference; evaluation labels never choose that class.
 `min_class_support=10` and `min_groups=5` flag small evaluation samples without
-altering predictions or excluding rows. The summary includes both class recalls,
-class counts, available subject counts, timing, and numerical-stage diagnostics.
+altering predictions or excluding rows. The summary includes accuracy and balanced
+accuracy, per-class precision and recall, evaluation and supplied training class
+counts, available subject counts, timing, and numerical-stage diagnostics.
+Missing training counts and unavailable metrics are reported explicitly.
+Tuning and final fitting costs remain separate from prediction. Final fitting
+can include unsuccessful refit attempts; the fitted estimator's total already
+includes its screening, factorization, training projection and classifier stages.
+These totals overlap and must not be added. Individual-operation latency and
+batch throughput are distinct; sums of stage medians or concurrent worker times
+do not establish total elapsed time.
 Numerical-phase diagnostics on `NMFClassifier` now include
 `factorization_converged_` and `training_projection_converged_`, with their
 corresponding `*_convergence_warnings_` attributes.
@@ -447,14 +577,6 @@ A completed resume retains historical compute totals and performs no new
 representation fits or neighbor queries. Those totals are not resume runtime.
 Source and schema identities prevent reuse of old checkpoints under this change.
 
-For large, low-rank float64 fits, report-only reconstruction norms may use
-128-row blocks when all arrays are C/F-contiguous, the shape is 8,192–32,768
-rows by 1,024–4,096 features, rank is 1–32, and all detected BLAS pools are
-one-thread MKL. Other cases retain the original full-product expression.
-The blocks affect diagnostics only, not fitting, stopping or the prediction
-map. Their timing qualification is specific to the measured validation workloads;
-AOCL/BLIS and other backends retain the existing path.
-
 Checksummed fold records can be reused only with matching data, folds, grid,
 estimator, source and runtime identity. A report describes the declared grid and
 does not certify completed tuning. Record subsequent grid decisions and numerical
@@ -466,6 +588,29 @@ screening statistics across cutoff and rank settings. The report counts
 Empty screens and impossible ranks remain explicit failed candidates with a
 `failure_stage`; no threshold or rank is silently substituted. Generic pipeline
 layouts retain their ordinary fit path.
+
+## Reconstruction diagnostics
+
+For large, low-rank float64 fits, report-only reconstruction norms can use
+128-row blocks. The input shape must be 8,192–32,768 rows by 1,024–4,096
+features, with rank 1–32 and matching coordinate/component shapes. The runtime
+and all three arrays must satisfy one of these configurations:
+
+- All detected BLAS pools are one-thread MKL, and the arrays are C- or
+  F-contiguous.
+- On Windows, exactly one BLAS pool is detected as AOCL/BLIS with version
+  `AOCL-BLAS 5.3.0 Build 20260511`, using one thread, and all arrays are
+  C-contiguous.
+
+Other configurations, including unrecognized AOCL builds, mixed BLAS backends,
+multithreaded settings and unsupported shapes or layouts, retain the
+full-product expression. No array is copied merely to enter the blocked path.
+Block norms are combined to report the Frobenius norm; matrix-product rounding
+can differ from the full expression.
+This affects reconstruction diagnostics only. It does not change optimizers,
+stopping rules, KKT qualification, fitted coordinates or predictions. The
+runtime restrictions reflect measured timing results, not a universal speed
+advantage.
 
 ## Bounded rank exploration
 

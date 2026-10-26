@@ -34,8 +34,8 @@ def _native_controller():
 def validate_projection_parameters(projection_solver, projection_workers,
                                    projection_batch_size, projection_native_threads):
     if (not isinstance(projection_solver, str)
-            or projection_solver not in {"auto", "scipy", "batched"}):
-        raise ValueError("projection_solver must be 'auto', 'scipy', or 'batched'.")
+            or projection_solver not in {"auto", "scipy", "batched", "qr"}):
+        raise ValueError("projection_solver must be 'auto', 'scipy', 'batched', or 'qr'.")
     for name, value in (("projection_workers", projection_workers),
                         ("projection_batch_size", projection_batch_size),
                         ("projection_native_threads", projection_native_threads)):

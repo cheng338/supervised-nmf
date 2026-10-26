@@ -30,7 +30,7 @@
     "identity_disjointness_established": false
   },
   "numerical_configuration": {
-    "environment": "py12_df_aocl",
+    "environment": "Python 3.12 with AOCL",
     "max_iter": 20000,
     "tol": 0.0001,
     "native_threads": 1,

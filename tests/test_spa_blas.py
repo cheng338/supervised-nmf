@@ -194,7 +194,8 @@ class SPABlasEquivalenceTests(unittest.TestCase):
 
     def test_nnls_iteration_cap_is_forwarded_and_failures_remain_visible(self):
         X, incoming = self.separable(67)
-        with patch("supervised_nmf.decomposition.nnls", wraps=nnls) as observed:
+        # This small feature set takes the guarded helper's public SciPy path.
+        with patch("supervised_nmf._nnls.nnls", wraps=nnls) as observed:
             model = FeatureSPA(3, nnls_max_iter=37).fit(X)
             self.assertEqual(observed.call_count, X.shape[1])
             self.assertTrue(all(call.kwargs["maxiter"] == 37 for call in observed.call_args_list))

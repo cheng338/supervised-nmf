@@ -42,6 +42,9 @@ from scipy.optimize import nnls
 # condition_limit. Normal equations square the condition number; at 1e4 the
 # worst-case amplification of float64 roundoff is already about 2e-8.
 _BATCH_CONDITION_LIMIT = 1e4
+# QR avoids forming normal equations, but still needs a bounded admission
+# domain and original-design qualification; this is not a forward-error bound.
+_QR_CONDITION_LIMIT = 1e6
 _AUTO_MIN_ROWS = 32
 _FACTOR_CACHE_LIMIT = 128
 # A bounded numerical domain, not a claim that problems outside it are
@@ -180,6 +183,13 @@ def project_nnls(design, rows, *, solver="auto", maxiter=None, batch_size=256):
     Failed block solves or row-level KKT checks fall back to public SciPy with
     the original maxiter; reference failures always propagate.
 
+    ``qr`` attempts a call-local economy QR for at least 32 rows and a
+    nonnegative design with height >= 2 * rank and condition(R) <= 1e6.
+    Reduced systems use public SciPy NNLS and original-space qualification.
+    Ineligible calls or failed blocks use the existing ``auto`` path with
+    the original iteration cap. A short failed tail can therefore use SciPy
+    where a larger ``auto`` call would have treated it as a batched tail.
+
     Extreme magnitudes use exactly reversible common binary scaling of the
     design and each independent RHS. Rows with the same scale share a solve;
     eligibility never depends on unrelated query rows. Inputs whose nonzero
@@ -189,8 +199,8 @@ def project_nnls(design, rows, *, solver="auto", maxiter=None, batch_size=256):
     Returns a float64 array of shape (len(rows), design.shape[1]). Inputs are
     never modified. This internal helper also permits signed input via SciPy.
     """
-    if not isinstance(solver, str) or solver not in ("auto", "scipy", "batched"):
-        raise ValueError("solver must be 'auto', 'scipy', or 'batched'.")
+    if not isinstance(solver, str) or solver not in ("auto", "scipy", "batched", "qr"):
+        raise ValueError("solver must be 'auto', 'scipy', 'batched', or 'qr'.")
     batch_size = _positive_integer(batch_size, "batch_size")
     if maxiter is not None:
         maxiter = _positive_integer(maxiter, "maxiter")
@@ -289,6 +299,8 @@ def _prepare_scale_groups(design, rows, design_bounds):
 
 def _project_unscaled(design, rows, solver, maxiter, batch_size):
     """Existing guarded solver on validated, ordinary-scale arrays."""
+    if solver == "qr":
+        return _project_qr(design, rows, maxiter, batch_size)
     rank = design.shape[1]
     if (solver == "scipy" or not len(rows)
             or (solver == "auto" and len(rows) < _AUTO_MIN_ROWS)
@@ -320,4 +332,59 @@ def _project_unscaled(design, rows, solver, maxiter, batch_size):
             # Advanced indexing writes into the owned output, never input.
             failing = start + np.flatnonzero(~qualified)
             answer[failing] = _scipy_rows(design, block[~qualified], maxiter)
+    return answer
+
+
+def _project_qr(design, rows, maxiter, batch_size):
+    """Try orthogonal reduction; retain the current solver as block fallback.
+
+    For A = QR, ||Az-b||^2 = ||Rz-Q.T b||^2 + ||(I-Q Q.T)b||^2.
+    Variables and their nonnegativity constraint are unchanged. R and Q.T b
+    can be signed, so the reduced problem uses public SciPy, never BPP.
+    Factors live only for this validated scale-group call.
+    """
+    rank = design.shape[1]
+    if (len(rows) < _AUTO_MIN_ROWS or design.shape[0] < 2 * rank
+            or (maxiter is not None and maxiter < 3 * rank)
+            or np.any(design < 0)):
+        return _project_unscaled(design, rows, "auto", maxiter, batch_size)
+    failures = (np.linalg.LinAlgError, FloatingPointError, RuntimeError)
+    try:
+        with np.errstate(over="raise", invalid="raise", divide="raise"):
+            q, r = linalg.qr(design, mode="economic", pivoting=False,
+                             overwrite_a=False, check_finite=False)
+            r = np.ascontiguousarray(r)
+            if not np.isfinite(q).all() or not np.isfinite(r).all():
+                raise FloatingPointError("NNLS QR factors are nonfinite.")
+            condition = float(np.linalg.cond(r))
+    except failures:
+        return _project_unscaled(design, rows, "auto", maxiter, batch_size)
+    if not np.isfinite(condition) or condition > _QR_CONDITION_LIMIT:
+        return _project_unscaled(design, rows, "auto", maxiter, batch_size)
+
+    answer = np.empty((len(rows), rank), dtype=np.float64)
+    for start in range(0, len(rows), batch_size):
+        block = rows[start:start + batch_size]
+        if np.any(block < 0):
+            answer[start:start + len(block)] = _project_unscaled(
+                design, block, "auto", maxiter, batch_size)
+            continue
+        try:
+            with np.errstate(over="raise", invalid="raise", divide="raise"):
+                reduced_rows = block @ q
+                if not np.isfinite(reduced_rows).all():
+                    raise FloatingPointError("NNLS reduced targets are nonfinite.")
+            candidate = _scipy_rows(r, reduced_rows, maxiter)
+            qualified = _qualified_rows(design, block.T, candidate.T)
+        except failures:
+            answer[start:start + len(block)] = _project_unscaled(
+                design, block, "auto", maxiter, batch_size)
+            continue
+        if not qualified.all():
+            # Retry the whole rejected block, including a possible short tail.
+            # Fallback errors propagate with the caller's original cap.
+            answer[start:start + len(block)] = _project_unscaled(
+                design, block, "auto", maxiter, batch_size)
+            continue
+        answer[start:start + len(block)] = candidate
     return answer

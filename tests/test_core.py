@@ -274,7 +274,9 @@ class ClassifierTests(CoreTestCase):
 
     def test_mu_matches_independent_screening_nmf_knn_pipeline(self):
         X = self.X.astype(np.float32)
-        incoming = (self.X[:11] * 1.07 + .03).astype(np.float32)
+        # Compare pipeline composition with matching query layouts. Independent
+        # projection accuracy across layouts is checked against a closed form below.
+        incoming = np.asfortranarray((self.X[:11] * 1.07 + .03).astype(np.float32))
         for screening in ("absolute", "percentile", "none"):
             with self.subTest(screening=screening):
                 steps = []
@@ -292,13 +294,48 @@ class ClassifierTests(CoreTestCase):
                 np.testing.assert_array_equal(model.training_coordinates_, expected_coordinates)
                 np.testing.assert_array_equal(model.selected_components_, reference.named_steps["nmf"].components_)
                 np.testing.assert_array_equal(model.predict(incoming), reference.predict(incoming))
-                # Column indexing can change memory layout and float32 rounding
-                # in the fixed-basis transform without changing the method.
                 np.testing.assert_allclose(model.predict_proba(incoming), reference.predict_proba(incoming),
                                            rtol=1e-6, atol=1e-7)
                 self.assertEqual(model.training_coordinates_.dtype, np.float32)
                 self.assertEqual(model.n_iter_, reference.named_steps["nmf"].n_iter_)
                 self.assertAlmostEqual(model.reconstruction_err_, reference.named_steps["nmf"].reconstruction_err_)
+
+    def test_mu_rank_one_projection_matches_closed_form_across_layouts(self):
+        # The fixed nonzero rank-one basis has a unique NNLS projection.
+        # Its scale comes from the fit; joint NMF factors are not unique.
+        for dtype in (np.float32, np.float64):
+            basis = np.array([[1, 2, 0, 4]], dtype=dtype)
+            coefficients = np.array([[.2], [.5], [1.2], [2.], [3.], [4.]], dtype=dtype)
+            training = coefficients @ basis
+            labels = np.repeat([0, 1], 3)
+            model = self.model(solver="mu", screening="none", n_components=1,
+                               n_neighbors=1).fit(training, labels)
+            fitted_basis = model.decomposition_.components_.copy()
+            fitted_coordinates = model.training_coordinates_.copy()
+            h = fitted_basis.astype(np.float64)
+            squared_norm = float((h @ h.T)[0, 0])
+            self.assertTrue(np.isfinite(squared_norm) and squared_norm > 0)
+            query = np.array([[0, 0, 0, 0], [1e-8, 2e-8, 0, 4e-8],
+                              [1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 7, 0],
+                              [1, 2, 3, 4]], dtype=dtype)
+            expected = np.maximum(query.astype(np.float64) @ h.T / squared_norm, 0)
+            backing = np.zeros((len(query), 2 * query.shape[1]), dtype=dtype)
+            backing[:, ::2] = query
+            readonly = query.copy()
+            readonly.flags.writeable = False
+            query_before = query.copy()
+            layouts = {"C": query, "F": np.asfortranarray(query),
+                       "strided": backing[:, ::2], "readonly": readonly}
+            for layout, incoming in layouts.items():
+                with self.subTest(dtype=np.dtype(dtype).name, layout=layout):
+                    np.testing.assert_array_equal(incoming, query_before)
+                    actual = model.transform(incoming)
+                    self.assertTrue(np.isfinite(actual).all())
+                    self.assertTrue((actual >= 0).all())
+                    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
+                    np.testing.assert_array_equal(incoming, query_before)
+                    np.testing.assert_array_equal(model.decomposition_.components_, fitted_basis)
+                    np.testing.assert_array_equal(model.training_coordinates_, fitted_coordinates)
 
     def test_original_float32_cd_computations_preserved(self):
         X = self.X.astype(np.float32)

@@ -31,8 +31,7 @@ author's work, and historical release artifacts remain unchanged.
 
 The dissertation title is *Ensemble Kernel Distance-Weighted Discrimination and
 Supervised Nonnegative Matrix Factorization for Classification*. The package
-implements its supervised NMF methodology. Citing the full dissertation title
-does not incorporate the separate DWD methodology into this package.
+implements the supervised NMF methodology in Chapter 7.
 
 The public repository uses standard GitHub-hosted runners for CI.
 
@@ -245,7 +244,38 @@ require separate tuning and reports. For the latter, report positive counts and
 precision/recall measures prominently so majority accuracy cannot conceal a
 failure to recognize positives. See [the CelebA study plan](celeba-study.md).
 
-## Approved October 20 implementation
+## Numerical test interpretation
+
+Composition tests compare the package with the corresponding estimator pipeline
+in the same environment, using matched data, dtype, layout, initialization and
+training-coordinate policy. Preserve their strict assertions. Independent
+numerical checks, such as the rank-one projection oracle, serve a different
+purpose and should continue to cover supported dtypes, layouts and input
+immutability.
+
+Environment comparisons use the same source, data, parameters and seeds, with
+controlled thread settings and recorded numerical-library builds. Compare
+selected features, finite/nonnegative factors, the original reconstruction
+objective, appropriate projected-gradient diagnostics, warnings, iterations,
+predictions and measured costs. For fixed-basis projection, only W is optimized;
+an H gradient is not a query-solve optimality criterion. State diagnostic
+normalizations before comparing their values.
+
+Raw factor equality is not a portability requirement: NMF admits component
+permutations, positive rescaling and different local solutions. Nearby objective
+values or unchanged accuracy do not establish equivalent predictions. Investigate
+material differences with common initialization, basis and classifier-coordinate
+replays. A large numerical discrepancy does not identify its causal importance;
+use controlled interventions to distinguish mechanisms.
+
+Do not relax suite-wide tolerances or change solver stopping settings merely to
+make environments agree. Retain failed cases and justify any test-specific
+tolerance or design change mathematically. Warning-free completion does not
+independently establish stationarity or global optimality. Use float64 as an
+explicit study choice where warranted, recording its cost and the changed
+configuration rather than altering the package's dtype behavior.
+
+## October 20 implementation
 
 Following the retrospective review, the package adopted minimum-reference
 screening statistics, conditional per-RHS NNLS scaling, stable factor-recovery
@@ -255,8 +285,8 @@ was conditional on integrated cost checks supporting its dispatch domain.
 The completed checks support a bounded dense float64, single-thread MKL path;
 other execution settings retain the original residual expression. See the
 [validation record](validation.md) for the completed integration evidence.
-These are current-source changes; previous releases and study receipts retain
-their original implementations and configurations.
+These changes were released in version 0.3.0; earlier releases and study
+receipts retain their original implementations and configurations.
 
 The screening and NNLS repairs preserve their mathematical objectives.
 Minimum-reference subtraction precedes scaling when computing pooled statistics;
@@ -286,4 +316,46 @@ studies or retune defaults, and it does not establish a new theorem.
 Adoption weighs mathematical fidelity, numerical reliability, software design,
 maintenance and measured cost together. A memory saving cannot justify a
 slowdown, including through an optional implementation.
+
+## October 25 SPA basis integration
+
+The high-rank scaling investigation supported reusing the guarded batched NNLS
+kernel for SPA basis fitting. The fixed anchor coordinates,
+screening rules, NNLS objective, classifier defaults and projection controls are
+preserved. A basis-specific internal wrapper retains the original public SciPy
+column loop as a compatibility fallback for numerical-range rejection. It adds
+no public execution option or nested basis workers.
+
+The implementation retains the 1e4 normal-equation condition guard, numerical
+qualification and fitted-basis condition check. Near the guard, small residuals do not imply
+the same coefficient precision as public SciPy. Batched pivot rounds and SciPy
+iterations are different units; fallback receives the original iteration cap.
+These limits accompany the runtime evidence and shared-kernel maintenance
+benefit in the adoption decision. Historical source snapshots and study results
+remain unchanged. Existing serialized bases are preserved; refitting uses the
+current implementation.
+
+## October 26 MU precision recovery
+
+MU range correction applies to fixed-basis projection, including an explicit
+training reprojection. Joint factorization and the default training-coordinate
+policy remain unchanged. Exact zero batches return zero coordinates after full
+input validation. Positive values are not classified as zero by a tolerance.
+
+Ordinary float32 observations can encounter tiny fitted basis tails or an
+underflowing update without requiring a full logarithmic solve. The projection
+therefore retries eligible float32 calculations in float64 before logarithmic
+recovery. It uses a temporary estimator and leaves the fitted basis unchanged.
+Tiny positive inputs and unresolved range failures retain logarithmic recovery.
+Both paths preserve the MU recurrence and stopping rule in exact arithmetic;
+finite precision can change rounding and stopping iterations. Output dtype,
+iteration-cap warnings and errors for unrepresentable coordinates are retained.
+
+The evaluation separates three implementations: the published 0.3.2 package,
+the earlier range correction and the revised precision recovery. It considers
+ordinary data, the failures that motivated each correction and difficult
+numerical cases. A large improvement over the earlier correction does not
+erase remaining overhead relative to the published package. Correctness,
+methodological fidelity, numerical reliability and measured cost all enter the
+decision; memory reduction is not a justification for slower execution.
 

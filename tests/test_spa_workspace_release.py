@@ -36,8 +36,8 @@ class SPAWorkspaceReleaseTests(unittest.TestCase):
         original_divide = decomposition.np.divide
         original_norm = decomposition.np.linalg.norm
         original_dgemv = decomposition.dgemv
-        original_nnls = decomposition.nnls
-        nnls_calls = 0
+        original_fit_basis = decomposition._fit_basis
+        basis_calls = 0
 
         def remember_storage(name, array):
             # Observing a transient view alone would pass while its full-size
@@ -67,9 +67,9 @@ class SPAWorkspaceReleaseTests(unittest.TestCase):
             remember_storage("projection", result)
             return result
 
-        def observed_nnls(design, target, *args, **kwargs):
-            nonlocal nnls_calls
-            if nnls_calls == 0:
+        def observed_fit_basis(design, target, *args, **kwargs):
+            nonlocal basis_calls
+            if basis_calls == 0:
                 self.assertEqual(len(references["normalized"]), 1)
                 for name in ("residual", "direction", "projection"):
                     self.assertEqual(len(references[name]), rank, name)
@@ -84,17 +84,17 @@ class SPAWorkspaceReleaseTests(unittest.TestCase):
                 self.assertEqual(alive, [], f"SPA workspaces still live: {alive}")
                 self.assertEqual(design.shape, (X.shape[0], rank))
                 self.assertTrue(np.isfinite(design).all())
-            nnls_calls += 1
-            return original_nnls(design, target, *args, **kwargs)
+            basis_calls += 1
+            return original_fit_basis(design, target, *args, **kwargs)
 
         # Plain replacement functions are deliberate: a recording Mock would
         # hold the ndarray arguments alive and invalidate the lifetime check.
         with patch.object(decomposition.np, "divide", new=observed_divide), \
                 patch.object(decomposition.np.linalg, "norm", new=observed_norm), \
                 patch.object(decomposition, "dgemv", new=observed_dgemv), \
-                patch.object(decomposition, "nnls", new=observed_nnls):
+                patch.object(decomposition, "_fit_basis", new=observed_fit_basis):
             model = FeatureSPA(rank, normalize=normalize).fit(X)
-        self.assertEqual(nnls_calls, X.shape[1])
+        self.assertEqual(basis_calls, 1)
         np.testing.assert_array_equal(X, original_X)
         np.testing.assert_array_equal(model.fit_coordinates_, X[:, model.anchor_indices_])
         np.testing.assert_allclose(

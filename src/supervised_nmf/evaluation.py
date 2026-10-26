@@ -661,10 +661,11 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
 
 
 def format_evaluation_summary(report):
-    """Format metrics, support, stage timings and convergence without raw rows.
+    """Format class balance, metrics, stage timings and convergence.
 
     Accept an evaluation report, or a comparison record containing ``evaluation``
     and its tuning/final-fit times. Missing diagnostics remain explicitly absent.
+    Timing totals are reported as recorded, never inferred by adding components.
     """
     evaluation = report.get("evaluation", report)
     lines = [f"Evaluation status: {evaluation.get('status', 'unavailable')}."]
@@ -674,24 +675,38 @@ def format_evaluation_summary(report):
     def number(value):
         return "unavailable" if value is None else f"{value:.6g}"
 
+    def count(value):
+        return "unavailable" if value is None else str(value)
+
     metrics = evaluation.get("metrics", {})
+    support = evaluation.get("support_diagnostics", {})
+    reference = evaluation.get("training_majority_reference", {})
     if metrics:
         lines += ["", "| Metric | Value |", "| --- | --- |"]
         for key in ("accuracy", "balanced_accuracy", "roc_auc", "average_precision"):
             lines.append(f"| {key.replace('_', ' ').capitalize()} | {number(metrics.get(key))} |")
         if evaluation.get("ranking_score_type") == "decision_margin":
             lines += ["", "Ranking metrics use decision margins; probabilities are unavailable."]
-        lines += ["", "| Class | Recall | Support |", "| --- | --- | --- |"]
-        for row in metrics.get("per_class", []):
+        if metrics.get("undefined_reason"):
+            lines += ["", metrics["undefined_reason"]]
+    class_rows = metrics.get("per_class", [])
+    if not class_rows:
+        class_rows = [{"label": label, "support": count} for label, count in
+                      zip(support.get("class_labels", []), support.get("class_counts", []))]
+    if class_rows:
+        training_counts = dict(zip(reference.get("class_labels", []),
+                                   reference.get("training_class_counts", []))) if reference.get("available") else {}
+        lines += ["", "| Class | Precision | Recall | Evaluation count | Training count |",
+                  "| --- | --- | --- | --- | --- |"]
+        for row in class_rows:
             label = str(row["label"]).replace("|", "\\|").replace("\n", " ")
-            lines.append(f"| {label} | {number(row['recall'])} | {row['support']} |")
-    reference = evaluation.get("training_majority_reference", {})
+            lines.append(f"| {label} | {number(row.get('precision'))} | {number(row.get('recall'))} | "
+                         f"{count(row.get('support'))} | {count(training_counts.get(row['label']))} |")
     if reference.get("available"):
         lines += ["", f"Training-majority reference (class {reference['label']}): "
                   f"accuracy {number(reference['accuracy'])}; balanced accuracy {number(reference['balanced_accuracy'])}."]
     else:
         lines += ["", "Training-majority reference: unavailable; training labels were not supplied."]
-    support = evaluation.get("support_diagnostics", {})
     if support:
         groups = support.get("group_count")
         lines.append(f"Evaluation support: {support['sample_count']} rows; "
@@ -724,11 +739,22 @@ def format_evaluation_summary(report):
         lines += ["", f"Latest projection error: {diagnostics['last_transform_error']}"]
     lines += ["", "| Timed stage | Seconds |", "| --- | --- |"]
     for label, value in (("Tuning", report.get("tuning_seconds")),
-                         ("Final fit", report.get("final_fit_seconds")),
+                         ("Final fitting (recorded attempts)", report.get("final_fit_seconds")),
                          ("Prediction", evaluation.get("prediction_seconds"))):
         lines.append(f"| {label} | {number(value)} |")
-    for label, value in diagnostics.get("fit_times", {}).items():
+    fit_times = diagnostics.get("fit_times", {})
+    stages = ("screening", "factorization", "training_projection", "classifier", "total")
+    for label in stages:
+        lines.append(f"| Fit: {label.replace('_', ' ')} | {number(fit_times.get(label))} |")
+    for label, value in fit_times.items():
+        if label in stages:
+            continue
         lines.append(f"| Fit: {label.replace('_', ' ')} | {number(value)} |")
+    lines += ["", "Final fitting can include unsuccessful refit attempts. Fit rows describe the "
+              "fitted estimator; its total includes its component stages. Prediction is the measured "
+              "evaluation operation. Do not add these overlapping totals or infer total time by "
+              "summing stage medians or concurrent worker times. Individual-operation latency "
+              "and batch throughput are separate measurements."]
     return "\n".join(lines) + "\n"
 
 

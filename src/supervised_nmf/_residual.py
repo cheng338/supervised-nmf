@@ -4,6 +4,7 @@ This helper does not drive optimization, stopping or numerical qualification.
 """
 
 import math
+import sys
 
 import numpy as np
 
@@ -26,12 +27,18 @@ def _use_blocks(X, coordinates, components):
     if not (8192 <= n <= 32768 and 1024 <= p <= 4096 and 1 <= rank <= 32
             and coordinates.shape[0] == n and components.shape == (rank, p)):
         return False
-    # The measured crossover is from single-threaded MKL. Other backends,
-    # including mixed-library processes, retain the original expression until
-    # their speed is qualified; smaller workspaces alone do not justify it.
+    # Preserve the qualified MKL path. The additional AOCL case is limited to
+    # the measured Windows build, one BLAS library and C-contiguous inputs.
     pools = [pool for pool in _native_controller().info() if pool.get("user_api") == "blas"]
-    return bool(pools) and all(pool.get("internal_api") == "mkl"
-                               and pool.get("num_threads") == 1 for pool in pools)
+    if not pools or any(pool.get("num_threads") != 1 for pool in pools):
+        return False
+    if all(pool.get("internal_api") == "mkl" for pool in pools):
+        return True
+    return (sys.platform == "win32" and len(pools) == 1
+            and pools[0].get("internal_api") == "blis"
+            and pools[0].get("prefix") == "aocl-libblis"
+            and pools[0].get("version") == "AOCL-BLAS 5.3.0 Build 20260511"
+            and all(array.flags.c_contiguous for array in (X, coordinates, components)))
 
 
 def _blocked_error(X, coordinates, components):

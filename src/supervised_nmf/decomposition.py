@@ -9,8 +9,25 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
 
 from .screening import _clear_fitted_attributes, _nonnegative_array
+from ._nnls import project_nnls
 from ._projection import project_rows, validate_projection_parameters
 from ._residual import reconstruction_error
+
+
+def _fit_basis(coordinates, X, maxiter):
+    """Fit the fixed-anchor NNLS basis independently of projection settings."""
+    try:
+        rows = project_nnls(coordinates, X.T, solver="auto", maxiter=maxiter,
+                            batch_size=256)
+    except FloatingPointError:
+        # The guarded helper has a bounded numerical domain. Preserve inputs
+        # accepted by the original basis solver by retrying the public loop.
+        # Validation and iteration-exhaustion errors must still propagate.
+        return np.column_stack([
+            nnls(coordinates, X[:, j], maxiter=maxiter)[0]
+            for j in range(X.shape[1])
+        ])
+    return np.ascontiguousarray(rows.T)
 
 
 class FeatureSPA(TransformerMixin, BaseEstimator):
@@ -36,15 +53,36 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
     References: Gillis and Vavasis (2014), doi:10.1109/TPAMI.2013.226.
     SPA/NNLS computations use float64, including when inputs are float32.
 
+    Basis fitting uses guarded batched NNLS for suitable designs and at least
+    32 feature columns, with public SciPy fallback. Its normal-equation path
+    requires condition number at most 1e4 and qualified nonnegative solutions.
+    A numerical-range rejection retries the original public column-wise solve.
+    Basis fitting stays in the calling process, independently of projection
+    controls. Batched pivot rounds and SciPy iterations are different units;
+    fallback receives the original ``nnls_max_iter`` after the bounded attempt.
+
     ``projection_solver='auto'`` uses guarded batched NNLS for suitable query
     batches and public SciPy NNLS otherwise. ``'scipy'`` selects the legacy
     row-wise solver; ``'batched'`` attempts batching even for small inputs,
-    with the same numerical guards and fallback. Basis fitting is unchanged.
+    with the same numerical guards and fallback. Optional ``'qr'`` shares an
+    economic QR reduction across at least 32 right-hand sides when the design
+    height is at least twice the rank and condition(R) <= 1e6. It solves the
+    signed reduced problems with public SciPy NNLS, then qualifies coefficients
+    against the original nonnegative design and targets. Orthogonal reduction
+    preserves the fixed-basis NNLS minimizer in exact arithmetic; floating-point
+    coefficients and execution time can differ. The current reversible scaling
+    checks apply, and failed or ineligible QR attempts use the current solver
+    with its public SciPy fallback. Small explicit caps keep the direct SciPy
+    route; fallback receives the original cap and propagates reference errors.
+    Q/R are local to a call, not cached in the estimator. These settings affect
+    projection only; the default and basis-fitting policy are unchanged.
     ``projection_batch_size`` bounds rows per numerical block. Optional
     ``projection_workers>1`` uses reusable process workers for at least 512
     rows and two blocks; smaller queries run in the caller. Each projection
     worker uses ``projection_native_threads`` numerical threads. These controls
     are separate from outer cross-validation workers and classifier threads.
+    QR admission applies per worker call and scaling group, so chunks with
+    fewer than 32 rows can use the current solver despite a large total query.
     """
 
     def __init__(self, n_components=2, *, normalize=True, condition_limit=1e12, nnls_max_iter=None,
@@ -61,7 +99,7 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
 
     def __setstate__(self, state):
         # Make get_params/clone work for models serialized before these
-        # execution controls existed, retaining their original solver.
+        # execution controls existed, retaining their original projection solver.
         state = dict(state)
         state.setdefault("projection_solver", "scipy")
         state.setdefault("projection_workers", 1)
@@ -70,7 +108,7 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
         super().__setstate__(state)
 
     def _projection_options(self):
-        # Older serialized estimators retain their historical numerical path.
+        # Older serialized estimators retain their historical projection path.
         options = dict(solver=getattr(self, "projection_solver", "scipy"),
                        workers=getattr(self, "projection_workers", 1),
                        batch_size=getattr(self, "projection_batch_size", 256),
@@ -138,10 +176,7 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
         if len(anchors) > 1:
             del old_direction
         coordinates = X[:, anchors].copy()
-        components = np.column_stack([
-            nnls(coordinates, X[:, j], maxiter=self.nnls_max_iter)[0]
-            for j in range(X.shape[1])
-        ])
+        components = _fit_basis(coordinates, X, self.nnls_max_iter)
         basis_condition = float(np.linalg.cond(components))
         if not np.isfinite(basis_condition) or basis_condition > self.condition_limit:
             raise ValueError("Fitted SPA basis is rank deficient or exceeds condition_limit.")

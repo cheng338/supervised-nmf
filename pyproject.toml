@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "supervised-nmf"
-version = "0.3.2"
+version = "0.3.3"
 description = "Supervised nonnegative matrix factorization for binary classification"
 readme = "README.md"
 license = "LicenseRef-All-Rights-Reserved AND BSD-3-Clause"
@@ -21,6 +21,7 @@ classifiers = [
 [project.optional-dependencies]
 examples = ["Pillow>=10"]
 study = ["Pillow>=10", "matplotlib>=3.8"]
+test = ["pytest>=9.0"]
 
 [project.urls]
 Repository = "https://github.com/cheng338/supervised-nmf"
@@ -28,4 +29,10 @@ Issues = "https://github.com/cheng338/supervised-nmf/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+pythonpath = ["src"]
 

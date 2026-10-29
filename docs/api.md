@@ -1,8 +1,8 @@
 # API reference
 
-This page describes the current development source. The optional MU
-per-observation projection policy is not part of release 0.3.3. That release
-introduced optional QR projection and MU numerical recovery. Optional KNN SD
+This page describes version 0.4.1, including its temporary AOCL NNLS workaround.
+The optional MU per-observation projection policy was added in 0.4.0. Version
+0.3.3 introduced optional QR projection and MU numerical recovery. Optional KNN SD
 scaling and the linear-SVM head were introduced in 0.3.0. Historical release
 and validation records retain their original scope.
 
@@ -450,6 +450,15 @@ implementation. No constructor parameters or fitted-state fields were added.
 
 ### SPA projection execution
 
+AOCL environments automatically use a package-side dimension-padding workaround
+for explicit matrix products in SPA's NNLS basis and projection solves.
+MKL-only environments retain direct multiplication. This preserves the NNLS
+objective and its numerical checks without changing the installed AOCL library.
+This is a temporary compatibility measure. Padding will be bypassed for verified
+AMD-fixed runtimes and removed when the supported AOCL builds no longer require
+it; unqualified versions retain the safeguard. See the
+[implementation, evidence scope and retirement policy](aocl-nnls-workaround.md).
+
 These controls apply to both `FeatureSPA` and `NMFClassifier(solver="spa")`.
 They affect fixed-basis projection, including training reprojection when
 `training_coordinates="transform"` or when `"auto"` resolves to it. They do not
@@ -520,7 +529,8 @@ Compatible calls reuse workers automatically, including across models; no
 pool or cached fitted basis is serialized with an estimator. First use pays
 startup cost, and joblib retires idle workers. `projection_native_threads=1`
 limits numerical threads per projection process and restores previous limits
-afterward. The controller discovers NumPy/SciPy libraries at first projection.
+afterward. The controller discovers NumPy/SciPy libraries at first NNLS or
+projection use, which can occur during basis fitting.
 Some native thread-limit controls affect shared process state; use process
 workers for concurrent work.
 QR admission applies separately inside each worker and scaling group. A worker
@@ -681,6 +691,19 @@ screening or SPA coordinates on the full dataset before splitting into folds.
 
 ## Calibration and reporting
 
+For a staged training-only workflow, start with the
+[quickstart tuning guide](../README.md#training-only-tuning) and pass
+`refit=False` to `calibration_search`. That mode returns `estimator=None` plus
+the CV report; it does not fit a final model or access final evaluation data.
+Review numerical qualification and boundary/refinement diagnostics, complete
+the declared training-only search, and freeze settings before final evaluation.
+Constructor defaults and the small grids below are illustrative starting values.
+
+The following compact API example uses the default `refit=True`, which fits
+a selected configuration on all supplied training data after CV. It illustrates
+the call sequence, not a completed tuning protocol. Do not run its evaluation
+step on a final reserved cohort until the training-only review and freeze above.
+
 ```python
 from supervised_nmf.evaluation import calibration_search, evaluate_classifier
 
@@ -691,6 +714,8 @@ calibrated = calibration_search(
     X_train, y_train, cv=5, seed=42, threads=1,
     checkpoint_path="runs/my-development-search.json",
 )
+if calibrated.report["is_fallback"]:
+    raise RuntimeError("Calibration returned a majority fallback, not a qualified NMF model.")
 validation = evaluate_classifier(calibrated.estimator, X_validation, y_validation)
 ```
 
@@ -699,7 +724,9 @@ the start of this page. Suitable ranges depend on the dataset. Any
 failed or nonconverged required fold disqualifies its candidate. The report
 retains each attempt, parameters, warnings, folds, selected dimensions, and
 timings. If every candidate fails, a clearly labeled training-majority fallback
-is returned. It must not be reported as the requested method's successful fit.
+is returned when `refit=True`. It must not be reported as the requested method's
+successful fit. With `refit=False`, no fallback is fitted and
+`selected_parameters=None` identifies the absence of a qualified candidate.
 
 For logistic regression, pass `NMFClassifier(classifier="logistic", screening="absolute")` and replace
 `n_neighbors` with `logistic_C`, for example `[0.01, 0.1, 1.0, 10.0, 100.0]`.

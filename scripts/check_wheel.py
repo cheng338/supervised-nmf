@@ -37,6 +37,13 @@ with zipfile.ZipFile(wheel) as archive:
     assert not any(set(Path(n).parts) & {"tmp", "data", "runs"} or "ensemble-reference" in n
                    for n in archive.namelist())
     assert not any(n.endswith(withdrawn_workflow) for n in archive.namelist())
+    source_modules = {path.relative_to(root / "src").as_posix(): path
+                      for path in (root / "src/supervised_nmf").rglob("*.py")}
+    packaged_modules = {name for name in archive.namelist()
+                        if name.startswith("supervised_nmf/") and name.endswith(".py")}
+    assert packaged_modules == set(source_modules), "Wheel module inventory differs from source"
+    for name, path in source_modules.items():
+        assert archive.read(name) == path.read_bytes(), name
 
 sys.path.insert(0, str(wheel))
 import numpy as np
@@ -48,6 +55,7 @@ from sklearn.svm import LinearSVC
 from threadpoolctl import threadpool_limits
 import supervised_nmf
 from supervised_nmf import NMFClassifier
+from supervised_nmf import _aocl
 from supervised_nmf.datasets import make_original_simulation
 from supervised_nmf.study import calibration_knn_grid
 from supervised_nmf.search import calibration_rank_search
@@ -55,6 +63,7 @@ from supervised_nmf.validation import build_cv_folds
 from supervised_nmf.evaluation import evaluate_classifier, format_evaluation_summary
 
 assert ".whl" in supervised_nmf.__file__, supervised_nmf.__file__
+assert ".whl" in _aocl.__file__, _aocl.__file__
 assert supervised_nmf.__author__ == "Chang Cheng"
 assert supervised_nmf.__version__ == version
 assert callable(calibration_knn_grid)
@@ -223,6 +232,11 @@ with tarfile.open(root / "dist" / f"supervised_nmf-{version}.tar.gz") as archive
             assert stream.read() == (root / license_file).read_bytes(), license_file
     assert not any(set(Path(n).parts) & {"tmp", "data", "runs"} or "ensemble-reference" in n for n in members)
     assert not any(n.endswith(withdrawn_workflow) for n in members)
+    for relative in ("src/supervised_nmf/_aocl.py", "tests/test_aocl_nnls.py",
+                     "docs/aocl-nnls-workaround.md", "docs/current-package-evidence-20261029.md",
+                     "docs/release-0.4.1.md"):
+        with archive.extractfile(f"supervised_nmf-{version}/{relative}") as stream:
+            assert stream.read() == (root / relative).read_bytes(), relative
     for suffix in ("provenance/original/sim.py", "provenance/original/snmf_am.py",
                    "examples/compare_simulation.py", "examples/celeba_classification.py",
                    "examples/celeba_parameter_study.py", "examples/celeba_starting_grid.json",

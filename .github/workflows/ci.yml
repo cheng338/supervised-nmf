@@ -50,10 +50,16 @@ jobs:
           python -m pip check
       - name: Run tests
         run: python scripts/check.py
+      - name: Run quickstart API demonstration
+        run: python -c "import json, subprocess, sys; result = json.loads(subprocess.check_output([sys.executable, 'examples/quickstart.py'], text=True)); assert result['converged']; assert result['solver'] == 'spa' and result['screening'] == 'absolute'; print(json.dumps(result, indent=2))"
       - name: Build wheel and source archive
         run: python scripts/build_release.py
       - name: Verify built distributions
         run: python -I scripts/check_wheel.py
+      - name: Install and import built wheel
+        run: |
+          python -c "from pathlib import Path; import subprocess, sys; wheels = list(Path('dist').glob('*.whl')); assert len(wheels) == 1; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', '--no-deps', str(wheels[0])])"
+          python -I -c "from importlib.metadata import version; import supervised_nmf; from supervised_nmf import _aocl; assert supervised_nmf.__version__ == version('supervised-nmf'); assert 'site-packages' in supervised_nmf.__file__; assert 'site-packages' in _aocl.__file__; print(supervised_nmf.__version__)"
       - name: Retain verified release distributions
         if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

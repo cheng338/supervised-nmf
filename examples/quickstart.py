@@ -1,4 +1,8 @@
-"""Small runnable example using the selected SPA and absolute-screening defaults."""
+"""Small fit/predict API demonstration with illustrative, untuned parameters.
+
+For applications, follow README.md's training-only tuning workflow before
+freezing parameters and evaluating a final reserved cohort.
+"""
 
 from pathlib import Path
 import json
@@ -19,7 +23,8 @@ def main():
     X_train, X_test, y_train, y_test = train_test_split(
         data.data, data.target, test_size=0.25, stratify=data.target, random_state=42
     )
-    # Omitted solver/screening use SPA + absolute screening; tune the cutoff on training data.
+    # Omitted solver/screening use SPA + absolute screening. The values below
+    # illustrate the API; tune rank, cutoff and K using training data for applications.
     model = NMFClassifier(
         score_threshold=2.0, n_components=2, n_neighbors=5, max_iter=20000, random_state=42,
     )

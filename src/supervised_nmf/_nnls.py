@@ -37,6 +37,8 @@ import numpy as np
 from scipy import linalg
 from scipy.optimize import nnls
 
+from ._aocl import nnls_matmul
+
 
 # The acceleration guard is intentionally much stricter than SPA's modelling
 # condition_limit. Normal equations square the condition number; at 1e4 the
@@ -102,9 +104,9 @@ def _passive_solve(gram, cross, passive, factors):
     return result
 
 
-def _batched_block(design, targets, gram, maxiter):
+def _batched_block(design, targets, gram, maxiter, *, matmul=np.matmul):
     """Return a candidate and per-RHS convergence flags, never certify it here."""
-    cross = design.T @ targets
+    cross = matmul(design.T, targets)
     if not np.isfinite(cross).all():
         raise FloatingPointError("NNLS products overflowed.")
     rank, rhs = cross.shape
@@ -139,11 +141,11 @@ def _batched_block(design, targets, gram, maxiter):
                 passive[np.flatnonzero(violations[:, column])[-1], column] ^= True
         solved = _passive_solve(gram, cross[:, pending], passive[:, pending], factors)
         coefficients[:, pending] = solved
-        gradient[:, pending] = gram @ solved - cross[:, pending]
+        gradient[:, pending] = matmul(gram, solved) - cross[:, pending]
     return coefficients, counts == 0
 
 
-def _qualified_rows(design, targets, coefficients):
+def _qualified_rows(design, targets, coefficients, *, matmul=np.matmul):
     """Check finite feasible solutions and KKT against ORIGINAL design/targets.
 
     A residual workspace is limited to one block, never all input rows. The
@@ -153,11 +155,11 @@ def _qualified_rows(design, targets, coefficients):
     """
     feasible = np.isfinite(coefficients).all(axis=0) & (coefficients >= 0).all(axis=0)
     with np.errstate(over="ignore", invalid="ignore", under="ignore"):
-        fitted = design @ coefficients
+        fitted = matmul(design, coefficients)
         residual = fitted - targets
-        gradient = design.T @ residual
-        cross_scale = design.T @ np.abs(targets)
-        roundoff_scale = design.T @ (np.abs(fitted) + np.abs(targets))
+        gradient = matmul(design.T, residual)
+        cross_scale = matmul(design.T, np.abs(targets))
+        roundoff_scale = matmul(design.T, np.abs(fitted) + np.abs(targets))
         tolerance = (1e-12 * cross_scale
                      + 64 * np.finfo(float).eps * max(design.shape) * roundoff_scale)
         projected = np.where((coefficients > 0) | (gradient < 0), gradient, 0.0)
@@ -220,14 +222,15 @@ def project_nnls(design, rows, *, solver="auto", maxiter=None, batch_size=256):
         raise FloatingPointError("NNLS dimensions exceed the supported numerical range.")
     design_bounds = _magnitude_bounds(design)
     bounds = _combine_bounds(design_bounds, _magnitude_bounds(rows))
+    matmul = nnls_matmul() if solver != "scipy" else np.matmul
     if _within_range(bounds):
-        result = _project_unscaled(design, rows, solver, maxiter, batch_size)
+        result = _project_unscaled(design, rows, solver, maxiter, batch_size, matmul=matmul)
     else:
         prepared = _prepare_scale_groups(design, rows, design_bounds)
         result = np.empty((len(rows), design.shape[1]), dtype=np.float64)
         for indices, scaled_design, scaled_rows in prepared:
             result[indices] = _project_unscaled(
-                scaled_design, scaled_rows, solver, maxiter, batch_size
+                scaled_design, scaled_rows, solver, maxiter, batch_size, matmul=matmul
             )
     if not np.isfinite(result).all() or np.any(result < 0):
         raise FloatingPointError("NNLS returned nonfinite or negative coefficients.")
@@ -297,10 +300,10 @@ def _prepare_scale_groups(design, rows, design_bounds):
     return prepared
 
 
-def _project_unscaled(design, rows, solver, maxiter, batch_size):
+def _project_unscaled(design, rows, solver, maxiter, batch_size, *, matmul=np.matmul):
     """Existing guarded solver on validated, ordinary-scale arrays."""
     if solver == "qr":
-        return _project_qr(design, rows, maxiter, batch_size)
+        return _project_qr(design, rows, maxiter, batch_size, matmul=matmul)
     rank = design.shape[1]
     if (solver == "scipy" or not len(rows)
             or (solver == "auto" and len(rows) < _AUTO_MIN_ROWS)
@@ -308,7 +311,7 @@ def _project_unscaled(design, rows, solver, maxiter, batch_size):
             or not _eligible_design(design)):
         return _scipy_rows(design, rows, maxiter)
     with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-        gram = design.T @ design
+        gram = matmul(design.T, design)
     if not np.isfinite(gram).all() or np.any(np.diag(gram) < np.finfo(float).tiny):
         return _scipy_rows(design, rows, maxiter)
     answer = np.empty((len(rows), rank), dtype=np.float64)
@@ -322,8 +325,8 @@ def _project_unscaled(design, rows, solver, maxiter, batch_size):
             continue
         try:
             with np.errstate(over="raise", invalid="raise", divide="raise"):
-                candidate, converged = _batched_block(design, block.T, gram, cap)
-            qualified = converged & _qualified_rows(design, block.T, candidate)
+                candidate, converged = _batched_block(design, block.T, gram, cap, matmul=matmul)
+            qualified = converged & _qualified_rows(design, block.T, candidate, matmul=matmul)
         except (np.linalg.LinAlgError, FloatingPointError):
             answer[start:start + len(block)] = _scipy_rows(design, block, maxiter)
             continue
@@ -335,7 +338,7 @@ def _project_unscaled(design, rows, solver, maxiter, batch_size):
     return answer
 
 
-def _project_qr(design, rows, maxiter, batch_size):
+def _project_qr(design, rows, maxiter, batch_size, *, matmul=np.matmul):
     """Try orthogonal reduction; retain the current solver as block fallback.
 
     For A = QR, ||Az-b||^2 = ||Rz-Q.T b||^2 + ||(I-Q Q.T)b||^2.
@@ -347,7 +350,7 @@ def _project_qr(design, rows, maxiter, batch_size):
     if (len(rows) < _AUTO_MIN_ROWS or design.shape[0] < 2 * rank
             or (maxiter is not None and maxiter < 3 * rank)
             or np.any(design < 0)):
-        return _project_unscaled(design, rows, "auto", maxiter, batch_size)
+        return _project_unscaled(design, rows, "auto", maxiter, batch_size, matmul=matmul)
     failures = (np.linalg.LinAlgError, FloatingPointError, RuntimeError)
     try:
         with np.errstate(over="raise", invalid="raise", divide="raise"):
@@ -358,33 +361,33 @@ def _project_qr(design, rows, maxiter, batch_size):
                 raise FloatingPointError("NNLS QR factors are nonfinite.")
             condition = float(np.linalg.cond(r))
     except failures:
-        return _project_unscaled(design, rows, "auto", maxiter, batch_size)
+        return _project_unscaled(design, rows, "auto", maxiter, batch_size, matmul=matmul)
     if not np.isfinite(condition) or condition > _QR_CONDITION_LIMIT:
-        return _project_unscaled(design, rows, "auto", maxiter, batch_size)
+        return _project_unscaled(design, rows, "auto", maxiter, batch_size, matmul=matmul)
 
     answer = np.empty((len(rows), rank), dtype=np.float64)
     for start in range(0, len(rows), batch_size):
         block = rows[start:start + batch_size]
         if np.any(block < 0):
             answer[start:start + len(block)] = _project_unscaled(
-                design, block, "auto", maxiter, batch_size)
+                design, block, "auto", maxiter, batch_size, matmul=matmul)
             continue
         try:
             with np.errstate(over="raise", invalid="raise", divide="raise"):
-                reduced_rows = block @ q
+                reduced_rows = matmul(block, q)
                 if not np.isfinite(reduced_rows).all():
                     raise FloatingPointError("NNLS reduced targets are nonfinite.")
             candidate = _scipy_rows(r, reduced_rows, maxiter)
-            qualified = _qualified_rows(design, block.T, candidate.T)
+            qualified = _qualified_rows(design, block.T, candidate.T, matmul=matmul)
         except failures:
             answer[start:start + len(block)] = _project_unscaled(
-                design, block, "auto", maxiter, batch_size)
+                design, block, "auto", maxiter, batch_size, matmul=matmul)
             continue
         if not qualified.all():
             # Retry the whole rejected block, including a possible short tail.
             # Fallback errors propagate with the caller's original cap.
             answer[start:start + len(block)] = _project_unscaled(
-                design, block, "auto", maxiter, batch_size)
+                design, block, "auto", maxiter, batch_size, matmul=matmul)
             continue
         answer[start:start + len(block)] = candidate
     return answer

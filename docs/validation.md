@@ -133,9 +133,10 @@ inputs and numerical stress cases in four environments. Its CelebA workload used
 previously exposed Smiling data, with 1,600 training and 400 query observations
 and fixed settings.
 
-The frozen candidate's SPA basis-fitting, NNLS, projection, residual and screening
-modules match v0.3.3 by SHA-256. The October 28 source retains those numerical
-operations; later docstring clarifications in `decomposition.py` change its file
+At the October 28 record review, the frozen candidate's SPA basis-fitting, NNLS,
+projection, residual and screening modules matched v0.3.3 by SHA-256. That source
+retained those numerical operations; later docstring clarifications in
+`decomposition.py` change its file
 hash without changing executable statements. The surrounding classifier has
 subsequent changes, including mixed-dtype handling and the optional MU projection
 policy. These engineering checks support the numerical
@@ -146,8 +147,8 @@ Reproducing an entire historical table with current source would require freezin
 that source and replaying the saved data splits and selected settings under a
 separate protocol. Such a replay would measure reproducibility on already exposed
 data. Independent statistical confirmation would additionally
-require an appropriately reserved evaluation cohort. Neither is claimed here,
-and no default is changed by this record review.
+require an appropriately reserved evaluation cohort. Neither was claimed by
+that October 28 record review, and it changed no default.
 
 ### Record provenance
 
@@ -168,6 +169,33 @@ from the package distributions:
 - October 26: `final-release-comparison-20261026/REPORT.txt` and
   `source-manifest.json`; the latter has SHA-256
   `88bd04b5cbcda9f328ca1178449514377bd802e6e74b307c42732386703d8a2f`.
+
+## October 29 current-package comparison
+
+The [current-package CelebA comparison](current-package-evidence-20261029.md)
+qualified all **34 prespecified final evaluations** across AOCL and MKL. On
+Smiling, tuned current SPA reached **81.35% balanced accuracy**, versus **80.10%**
+for independently tuned screened PCA: **+1.24 percentage points**, with a paired
+95% interval of **−1.00 to +3.47**. The interval includes zero. On Wearing_Necktie,
+SPA reached **62.98%** versus PCA's **65.44%**; positive recalls were **31.58%**
+and **35.53%**. The literal constructor reached **54.41%** Smiling balanced
+accuracy and **50.44%** on Necktie, detecting only **1/76** Necktie positives.
+
+Only crashed calibration work was continued after the AOCL workaround. Seven
+completed selections and the completed Smiling/SPA stages and fold cells retain
+their original source identities; calibration therefore mixes pre-fix and
+post-fix evidence. Every final fit used frozen current source. All 17 arms had
+identical predicted labels across AOCL and MKL, although some internal arrays
+differed. This is retrospective evidence on archived features and an already
+exposed cohort, not fresh confirmation or entirely current-source calibration.
+
+The scoped finding-4c scientific comparison is available regardless of whether
+SPA wins. Four historical native failures remain recorded, and one earlier
+Smiling/PCA controller interruption still has an unknown duration and missing
+final process observations. The report consequently distinguishes complete
+scientific outcomes from an incomplete execution history. Chang Cheng authorized
+the subsequent [0.4.1 GitHub release](release-0.4.1.md) on October 29, 2026;
+no default or general methodological claim is changed by that decision.
 
 ## October 6 implementation checks
 

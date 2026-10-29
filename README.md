@@ -40,6 +40,11 @@ Version **0.4.0** fixes mixed-dtype prediction, improves qualified float64 MU
 recovery, adds optional rowwise MU projection, and moves prediction diagnostics
 into evaluation results. See the [0.4.0 release notes](docs/release-0.4.0.md)
 for migration details and the comparison with 0.3.3.
+Version **0.4.1** adds a temporary AOCL-specific NNLS workaround for a reproduced
+native matrix-multiplication crash and clarifies the training-only tuning
+workflow. MKL retains direct multiplication. See the
+[0.4.1 release notes](docs/release-0.4.1.md) and
+[workaround retirement policy](docs/aocl-nnls-workaround.md#retirement-policy).
 
 **Copyright (c) 2026 Chang Cheng. All Rights Reserved.** A distribution license
 has not yet been selected. Public availability of this repository does not
@@ -48,20 +53,20 @@ applicable [third-party notices](THIRD_PARTY_NOTICES).
 
 # Installation
 
-Python 3.11 or later is required for version 0.4.0. Python 3.10 support
+Python 3.11 or later is required for version 0.4.1. Python 3.10 support
 ended on October 20, 2026. Dependencies are NumPy, SciPy, scikit-learn
 1.6 or later (below 2.0), threadpoolctl, and joblib 1.3 or later.
 Download the wheel from the [GitHub releases](https://github.com/cheng338/supervised-nmf/releases)
 and install it:
 
 ```shell
-python -m pip install --upgrade supervised_nmf-0.4.0-py3-none-any.whl
+python -m pip install --upgrade supervised_nmf-0.4.1-py3-none-any.whl
 ```
 
 To install the release from source:
 
 ```shell
-git clone --branch v0.4.0 https://github.com/cheng338/supervised-nmf.git
+git clone --branch v0.4.1 https://github.com/cheng338/supervised-nmf.git
 cd supervised-nmf
 python -m pip install .
 ```
@@ -84,8 +89,14 @@ their recorded revisions, not support for current development.
 
 # Basic use
 
+**For your own data, start with [training-only tuning](#training-only-tuning).**
+The constructor's rank (`2`), absolute screening cutoff (`2.0`) and neighbor
+count (`5`) are starting values, not calibrated settings. Calling `fit` fits
+the specified configuration; it does not search for better parameters.
+
 This example generates a small dataset from the original simulation model and
-fits both SPA and MU. It requires no download.
+fits both SPA and MU. It requires no download and demonstrates the API with
+illustrative parameters; its printed scores are not solver-selection evidence.
 
 ```python
 from sklearn.metrics import balanced_accuracy_score
@@ -128,6 +139,61 @@ PCA and other solvers remain necessary; a common training/prediction map does
 not by itself resolve this limitation. See the
 [anchor-selection explanation](docs/theory-implementation.md#spa-anchor-selection-and-screening-false-positives)
 and [completed simulation diagnostic](docs/wang-simulation-validation.md#october-20-anchor-and-information-diagnostic).
+
+## Training-only tuning
+
+Reserve the final evaluation data before exploring settings. Fit screening,
+the representation and the classifier inside each training CV fold; do not
+screen the full dataset before CV. For repeated subjects or duplicate groups,
+keep groups separate in the outer split and supply training `groups` to the
+calibration helper. The synthetic rows above illustrate the independent-row case.
+For an application, begin this workflow before viewing any final-cohort scores;
+the synthetic scores printed above are demonstration output.
+
+The existing helper can evaluate an explicit grid without a full-training refit
+or final-test prediction. It ranks candidates by mean balanced accuracy, and
+every required fold must qualify numerically:
+
+```python
+from supervised_nmf.evaluation import calibration_search
+
+calibrated = calibration_search(
+    NMFClassifier(solver="spa", screening="absolute", random_state=42),
+    {"n_components": [2, 4], "score_threshold": [0.0, 2.0],
+     "n_neighbors": [3, 5, 9]},
+    X_train, y_train, cv=5, seed=42, threads=1, refit=False,
+    checkpoint_path="runs/quickstart-cv.json",
+)
+if calibrated.report["selected_parameters"] is None:
+    raise RuntimeError("No candidate qualified in every training CV fold.")
+print(calibrated.report["selected_parameters"])
+print(calibrated.report["refinement"])
+```
+
+This small grid illustrates the workflow, not recommended ranges for other
+datasets. With `refit=False`, `calibrated.estimator` is `None`. A completed grid
+and a selected candidate do not establish completed tuning. Review candidate
+failures, warnings and refinement diagnostics; investigate feasible boundary
+winners and nearby settings using training data. Preserve the same folds and
+use a new checkpoint path when changing the grid. Compare with screening-only,
+PCA and raw-feature baselines using the same training folds.
+
+Once that training-only review is complete, freeze the chosen configuration,
+fit it on all training data, check numerical qualification, and evaluate it on
+the reserved data. Do not change settings in response to the final scores.
+Report balanced accuracy and class-specific recall alongside ordinary accuracy,
+especially for imbalanced classes.
+
+See [calibration and reporting](docs/api.md#calibration-and-reporting) for
+metadata, failures and final evaluation, and
+[shared KNN grids](docs/api.md#explicit-grids-with-shared-representations) to
+reuse fold-local representations across neighbor counts. The
+[grouped example](examples/grouped_tuning.py) demonstrates subject metadata and
+bounded rank exploration; its caps and subsequent demonstration fit do not
+certify completed tuning. The [current-package comparison](docs/current-package-evidence-20261029.md)
+records how strongly untuned and tuned results can differ on the evaluated tasks.
+
+## Other classifier and scaling options
 
 KNN remains the default. To use L2-regularized logistic regression on the NMF
 coordinates:
@@ -184,7 +250,7 @@ The default is **SPA with absolute screening**. Use `solver="mu"` for
 multiplicative updates or `solver="cd"` for the dissertation's original
 coordinate-descent implementation.
 
-The development source also offers `mu_projection="rowwise"` for MU predictions
+The package also offers `mu_projection="rowwise"` for MU predictions
 that may arrive individually or in changing batches. It assigns each observation
 its own stopping decision, with guarded float64 working arithmetic. The default
 `"batch"` retains the existing shared stopping rule and can produce different
@@ -252,7 +318,7 @@ earlier [BLAS checks](docs/blas-optimization.md).
 | `tol` | `1e-4` | CD/MU stopping tolerance; SPA's NNLS routine does not use this parameter. |
 | `random_state` | `None` | Set an integer for reproducible CD/MU initialization. |
 | `training_coordinates` | `"auto"` | Uses `"transform"` for SPA and `"fit_transform"` for CD/MU; either convention can also be selected explicitly. |
-| `mu_projection` | `"batch"` | Development source, MU only: shared batch stopping or explicit `"rowwise"` stopping. Recorded at fit time. |
+| `mu_projection` | `"batch"` | MU only: shared batch stopping or explicit `"rowwise"` stopping. Recorded at fit time. |
 | `projection_solver` | `"auto"` | SPA fixed-basis projection: guarded batching; also `"scipy"`, `"batched"` or guarded `"qr"`. |
 | `projection_workers` | `1` | Maximum SPA projection processes; independent of outer CV workers. |
 | `projection_batch_size` | `256` | Maximum query rows per NNLS block. |
@@ -509,7 +575,7 @@ python scripts/build_release.py
 python -I scripts/check_wheel.py
 ```
 
-The build produces `dist/supervised_nmf-0.4.0-py3-none-any.whl` and a source
+The build produces `dist/supervised_nmf-0.4.1-py3-none-any.whl` and a source
 archive. The wheel check verifies
 imports, authorship metadata, SPA/MU/CD fitting and prediction, and archive
 contents. It does not publish a release.

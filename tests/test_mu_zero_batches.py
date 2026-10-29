@@ -11,6 +11,7 @@ from sklearn.exceptions import NotFittedError
 from threadpoolctl import threadpool_limits
 
 from supervised_nmf import NMFClassifier
+from supervised_nmf.classifier import _capture_projection
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -84,15 +85,16 @@ def assert_delegates_like_sklearn(monkeypatch, model, query):
         return original(*args, **kwargs)
 
     monkeypatch.setattr(model.decomposition_, "_fit_transform", traced)
-    actual, actual_error, actual_warnings = capture_transform(lambda: model.transform(query))
+    with _capture_projection(model) as diagnostic:
+        actual, actual_error, actual_warnings = capture_transform(lambda: model.transform(query))
     assert calls, "The fallback must invoke the fitted sklearn solver"
     assert actual_error == expected_error
     assert actual_warnings == expected_warnings
     if expected_error is None:
         np.testing.assert_array_equal(actual, expected)
     else:
-        assert model.last_transform_converged_ is False
-        assert model.last_transform_error_ == f"{expected_error[0].__name__}: {expected_error[1]}"
+        assert diagnostic["last_transform_converged"] is False
+        assert diagnostic["last_transform_error"] == f"{expected_error[0].__name__}: {expected_error[1]}"
 
 
 @pytest.mark.parametrize("head", ["knn", "knn_sd", "logistic", "linear_svm"])
@@ -106,7 +108,7 @@ def test_zero_coordinates_and_fitted_head_oracle(data, head, monkeypatch):
     forbid_iteration(monkeypatch, model)
 
     # Zero coordinates attain the global lower bound of the nonnegative objective.
-    with warnings.catch_warnings():
+    with warnings.catch_warnings(), _capture_projection(model) as diagnostic:
         warnings.simplefilter("error")
         with np.errstate(invalid="raise"):
             coordinates = model.transform(query)
@@ -125,9 +127,9 @@ def test_zero_coordinates_and_fitted_head_oracle(data, head, monkeypatch):
     np.testing.assert_array_equal(model.training_coordinates_, before_training)
     np.testing.assert_array_equal(query, np.zeros_like(query))
     assert (model.converged_, model.n_iter_, model.convergence_warnings_) == fit_state
-    assert model.last_transform_converged_ is True
-    assert model.last_transform_warnings_ == ()
-    assert model.last_transform_error_ is None
+    assert diagnostic["last_transform_converged"] is True
+    assert diagnostic["last_transform_warnings"] == ()
+    assert diagnostic["last_transform_error"] is None
 
 
 def test_selected_zero_layouts_and_discarded_positive_features(data, fitted, monkeypatch):
@@ -151,21 +153,28 @@ def test_selected_zero_layouts_and_discarded_positive_features(data, fitted, mon
         np.testing.assert_array_equal(query, before)
 
 
-def test_zero_success_clears_failed_transform_status(data, fitted, monkeypatch):
+def test_zero_success_has_fresh_diagnostics_without_rewriting_old_model_fields(data, fitted, monkeypatch):
     model = deepcopy(fitted)
     fit_state = (model.converged_, model.n_iter_)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError), _capture_projection(model) as failed:
         model.transform(data[2][:, :-1])
-    assert model.last_transform_converged_ is False
-    assert model.last_transform_error_ is not None
-    # A subsequent successful exact solution must also clear older warning metadata.
+    assert failed["last_transform_converged"] is False
+    assert failed["last_transform_error"] is not None
+    # Legacy fields may exist on an older saved model, but are not call diagnostics.
+    model.last_transform_converged_ = False
+    model.last_transform_error_ = failed["last_transform_error"]
     model.last_transform_warnings_ = ("previous projection warning",)
+    model.last_transform_seconds_ = -1
+    stale = {key: value for key, value in vars(model).items() if key.startswith("last_transform_")}
     forbid_iteration(monkeypatch, model)
-    model.transform(np.zeros_like(data[2]))
-    assert model.last_transform_converged_ is True
-    assert model.last_transform_warnings_ == ()
-    assert model.last_transform_error_ is None
-    assert model.last_transform_seconds_ >= 0
+    with _capture_projection(model) as diagnostic:
+        model.transform(np.zeros_like(data[2]))
+    assert diagnostic["last_transform_converged"] is True
+    assert diagnostic["last_transform_warnings"] == ()
+    assert diagnostic["last_transform_error"] is None
+    assert diagnostic["last_transform_seconds"] >= 0
+    assert {key: value for key, value in vars(model).items() if key.startswith("last_transform_")} == stale
+    assert failed["last_transform_converged"] is False
     assert (model.converged_, model.n_iter_) == fit_state
 
 
@@ -196,14 +205,14 @@ def test_full_query_validation_precedes_zero_shortcut(data, fitted, kind):
         # The last training column is discarded, but invalid raw values still fail.
         assert query.shape[1] - 1 not in model.selected_features_
         query[0, -1] = {"negative": -1, "nan": np.nan, "inf": np.inf}[kind]
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError), _capture_projection(model) as diagnostic:
         model.transform(query)
-    assert model.last_transform_converged_ is False
-    assert model.last_transform_error_ is not None
+    assert diagnostic["last_transform_converged"] is False
+    assert diagnostic["last_transform_error"] is not None
     assert model.converged_ == fitted.converged_
 
 
-@pytest.mark.parametrize("kind", ["zero", "negative", "nan", "inf", "wrong_width", "wrong_dtype", "matrix"])
+@pytest.mark.parametrize("kind", ["zero", "negative", "nan", "inf", "wrong_width", "matrix"])
 def test_invalid_basis_keeps_upstream_behavior(data, fitted, kind, monkeypatch):
     model = deepcopy(fitted)
     basis = model.decomposition_.components_.copy()
@@ -213,8 +222,6 @@ def test_invalid_basis_keeps_upstream_behavior(data, fitted, kind, monkeypatch):
         basis[0, 0] = {"negative": -1, "nan": np.nan, "inf": np.inf}[kind]
     elif kind == "wrong_width":
         basis = basis[:, :-1]
-    elif kind == "wrong_dtype":
-        basis = basis.astype(np.float64 if basis.dtype == np.float32 else np.float32)
     else:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", PendingDeprecationWarning)
@@ -249,9 +256,9 @@ def test_fitted_configuration_survives_constructor_changes(data, fitted, monkeyp
 
 def test_projection_settings_still_validate_for_mu(data, fitted):
     model = deepcopy(fitted).set_params(projection_workers=0)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError), _capture_projection(model) as diagnostic:
         model.transform(np.zeros_like(data[2]))
-    assert model.last_transform_converged_ is False
+    assert diagnostic["last_transform_converged"] is False
 
 
 @pytest.mark.parametrize("kind", ["nndsvd", "feature_names"])
@@ -266,15 +273,31 @@ def test_unrelated_warnings_are_not_hidden(data, fitted, kind, monkeypatch):
     assert_delegates_like_sklearn(monkeypatch, model, np.zeros_like(data[2]))
     with warnings.catch_warnings():
         warnings.simplefilter("error", UserWarning)
-        with pytest.raises(UserWarning):
+        with pytest.raises(UserWarning), _capture_projection(model) as diagnostic:
             model.transform(np.zeros_like(data[2]))
-    assert model.last_transform_converged_ is False
+    assert diagnostic["last_transform_converged"] is False
 
 
-def test_query_dtype_must_match_fitted_basis(data, fitted, monkeypatch):
+def test_mixed_dtype_zero_query_uses_common_dtype(data, fitted, monkeypatch):
     model = deepcopy(fitted)
     other_dtype = np.float64 if data[2].dtype == np.float32 else np.float32
-    assert_delegates_like_sklearn(monkeypatch, model, np.zeros_like(data[2], dtype=other_dtype))
+    before_basis = model.decomposition_.components_.copy()
+    forbid_iteration(monkeypatch, model)
+    actual = model.transform(np.zeros_like(data[2], dtype=other_dtype))
+    assert actual.dtype == np.float64
+    np.testing.assert_array_equal(actual, np.zeros((len(data[2]), 2)))
+    np.testing.assert_array_equal(model.decomposition_.components_, before_basis)
+    assert model.decomposition_.components_.dtype == before_basis.dtype
+
+
+def test_low_level_mu_still_delegates_unaligned_dtypes(data, fitted):
+    # The public classifier aligns dtypes; the recovery helper keeps its
+    # narrower contract and upstream validation for direct calls.
+    from supervised_nmf._mu import transform_mu
+    other_dtype = np.float64 if data[2].dtype == np.float32 else np.float32
+    selected = np.zeros((len(data[2]), len(fitted.selected_features_)), dtype=other_dtype)
+    with pytest.raises(TypeError, match="same dtype"):
+        transform_mu(deepcopy(fitted.decomposition_), selected)
 
 
 def test_valid_iteration_caps_do_not_force_zero_work(data, fitted, monkeypatch):
@@ -283,11 +306,11 @@ def test_valid_iteration_caps_do_not_force_zero_work(data, fitted, monkeypatch):
         model.decomposition_.max_iter = cap
         model.decomposition_.tol = tol
         forbid_iteration(monkeypatch, model)
-        with warnings.catch_warnings():
+        with warnings.catch_warnings(), _capture_projection(model) as diagnostic:
             warnings.simplefilter("error")
             actual = model.transform(np.zeros_like(data[2]))
         np.testing.assert_array_equal(actual, np.zeros_like(actual))
-        assert model.last_transform_converged_ is True
+        assert diagnostic["last_transform_converged"] is True
 
 
 def test_pickled_model_retains_exact_zero_projection(data, fitted, monkeypatch):

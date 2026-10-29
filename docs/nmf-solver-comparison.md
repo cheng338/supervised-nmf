@@ -30,14 +30,15 @@ All four use the same absolute pooled-t screening rule and KNN classifier in
 the [frozen comparison](fashion-mnist-protocol.md). Rank, score cutoff and KNN
 neighbors are selected independently within matched training folds. CD, MU
 and ANLS-BPP use NNDSVDa initialization; SPA retains its anchor construction.
-Classification uses each method's fitted training coordinates, retaining their
-original scales and the resulting classifier geometry.
+Classification in the frozen study uses each method's `fit_transform` training
+coordinates, retaining their original scales and classifier geometry. For SPA,
+these are original-scale anchor columns; query coordinates use fixed-basis NNLS.
 
 The public MU path preserves that study's unregularized Frobenius objective and
 NNDSVDa initialization. It exposes the existing `max_iter`, `tol`, `random_state`,
-and `training_coordinates` parameters. The default `"fit_transform"` training
-coordinates preserve the study's fitted-coordinate convention; `"transform"`
-explicitly recomputes them against the fitted basis. The comparison-model
+and `training_coordinates` parameters. For MU, the current `"auto"` policy
+resolves to `"fit_transform"`, preserving the study's fitted-coordinate convention;
+`"transform"` explicitly recomputes them against the fitted basis. The comparison-model
 factory includes `screened_mu_absolute` and `screened_mu_percentile` alongside
 the existing SPA/CD models. These API options do not extend the absolute-only
 four-solver study into evidence about percentile MU.
@@ -69,6 +70,13 @@ corollary is not automatically established by any of the four implementations.
 The comparison completed on October 5, 2026, with 89 qualified selected models
 and three valid timing repetitions per model. It selects SPA under the declared
 accuracy/time rule and remains `selected_for_audit`.
+
+The October 5 accuracy and timing results describe the study's frozen source
+and its `fit_transform` training-coordinate convention. Since
+[v0.3.0](release-0.3.0.md#spa-training-coordinates-migration), the default SPA
+classifier uses fixed-basis projections for training as well as prediction.
+That changes the classifier's training coordinates and adds projection cost;
+the historical measurements are not measurements of the later default.
 
 | Dataset | Method | Balanced accuracy | Fit + predict (seconds) |
 | --- | --- | ---: | ---: |

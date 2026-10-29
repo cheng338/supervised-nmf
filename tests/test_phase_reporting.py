@@ -1,10 +1,11 @@
-"""Numerical phase reporting follows the operation most recently attempted."""
+"""Numerical phase reporting belongs to the operation being evaluated."""
 import unittest
 from unittest.mock import patch
 
 import numpy as np
 from threadpoolctl import threadpool_limits
 from supervised_nmf import NMFClassifier
+from supervised_nmf.classifier import _capture_projection
 from supervised_nmf.evaluation import evaluate_classifier, format_evaluation_summary
 
 
@@ -28,27 +29,31 @@ class PhaseReportingTests(unittest.TestCase):
         self.assertTrue(model.training_projection_performed_)
         self.assertTrue(model.training_projection_converged_)
 
-    def test_failed_projection_clears_previous_success_and_recovers(self):
+    def test_failed_projection_has_its_own_status_and_recovers(self):
         model = NMFClassifier(random_state=3, score_threshold=0).fit(self.X, self.y)
-        model.transform(self.X)
-        self.assertTrue(model.last_transform_converged_)
+        with _capture_projection(model) as first:
+            model.transform(self.X)
+        self.assertTrue(first["last_transform_converged"])
         with patch.object(model.decomposition_, "transform", side_effect=RuntimeError("NNLS iteration limit")):
             result = evaluate_classifier(model, self.X, self.y)
         self.assertEqual(result["status"], "failed")
         self.assertFalse(result["diagnostics"]["last_transform_converged"])
         self.assertIn("NNLS iteration limit", result["diagnostics"]["last_transform_error"])
         self.assertIn("| Latest projection | failed |", format_evaluation_summary(result))
-        model.transform(self.X)
-        self.assertTrue(model.last_transform_converged_)
-        self.assertIsNone(model.last_transform_error_)
+        with _capture_projection(model) as recovered:
+            model.transform(self.X)
+        self.assertTrue(recovered["last_transform_converged"])
+        self.assertIsNone(recovered["last_transform_error"])
+        self.assertTrue(first["last_transform_converged"])
+        self.assertFalse(hasattr(model, "last_transform_converged_"))
 
     def test_invalid_projection_shape_does_not_retain_success(self):
         model = NMFClassifier(random_state=3, score_threshold=0).fit(self.X, self.y)
         model.transform(self.X)
-        with self.assertRaisesRegex(ValueError, "expected"):
+        with self.assertRaisesRegex(ValueError, "expecting"), _capture_projection(model) as diagnostic:
             model.transform(self.X[:, :-1])
-        self.assertFalse(model.last_transform_converged_)
-        self.assertIn("ValueError", model.last_transform_error_)
+        self.assertFalse(diagnostic["last_transform_converged"])
+        self.assertIn("ValueError", diagnostic["last_transform_error"])
 
 
 if __name__ == "__main__":

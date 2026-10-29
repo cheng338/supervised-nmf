@@ -7,9 +7,16 @@ commands refer to the retained local study workspace.
 
 Author: Chang Cheng. Supplement designed 6 October 2026 (UTC).
 
+The SPA comparisons below retain the October 6 frozen predictions, obtained
+with anchor-derived training coordinates (`training_coordinates="fit_transform"`)
+and fixed-basis NNLS query projections. Since [version 0.3.0](release-0.3.0.md#spa-training-coordinates-migration),
+the default SPA classifier also projects training observations. These historical
+comparisons do not measure that later default. CD retains its fitted-coordinate
+training convention.
+
 **Complete: both independent audits passed with zero errors.** Screened CD sNMF+KNN achieved **79.0% accuracy and 78.9756% balanced accuracy** on the existing 1,000 test identities. Screened SPA achieved 81.4% and 81.3725%, respectively: its paired balanced-accuracy advantage over screened CD was **2.3970 percentage points**, with a descriptive 95% interval of **[0.1841, 4.6178]**. Screened CD improved on unscreened CD, but its differences from screened PCA and screening-only KNN were inconclusive.
 
-This seventh method is supervised screening followed by coordinate-descent (CD) NMF and KNN. It restores the supervised solver family used in the dissertation and compares it with both the current screened SPA pipeline and the separately tuned unscreened CD baseline.
+This seventh method is supervised screening followed by coordinate-descent (CD) NMF and KNN. It restores the supervised solver family used in the dissertation and compares it with both the frozen screened SPA pipeline and the separately tuned unscreened CD baseline.
 
 **All six earlier methods' test outcomes were known when this supplement was designed.** It reuses the same 1,000 test identities and is descriptive supplementary evidence, not another independent holdout confirmation. The [original four-method validation](celeba-identity-validation.md) and [two-method unscreened supplement](celeba-unscreened-supplement.md) remain unchanged. Their frozen predictions, rather than new fits, supply the six comparators.
 
@@ -31,7 +38,7 @@ The complete comparison figure is available as PNG (retained locally: `../runs/c
 
 Chang Cheng's dissertation, Chapter 7's methodology and Section 7.3.2, describes CD with NNDSVDa initialization for the supervised NMF experiments, followed by Euclidean KNN on the fitted nonnegative coefficients. It also says that both the supervised and standard unsupervised NMF face pipelines used CD. Thus screened CD is directly relevant to the dissertation's method, not just another arbitrary benchmark.
 
-The [preserved CelebA implementation](../provenance/original/snmf_am.py), lines 193–206 and 255–275, confirms this: its training pipeline uses `SelectPercentile(score_func=f_classif)`, CD NMF with NNDSVDa initialization, and KNN with three neighbors. The final supervised fit uses the selected percentile and rank, `max_iter=400`, and seed 42. The current package's primary face result instead uses FeatureSPA and an absolute feature-score cutoff. The earlier unscreened CD supplement restored the dissertation's standard unsupervised baseline; the present addition separately restores its supervised factorization family.
+The [preserved CelebA implementation](../provenance/original/snmf_am.py), lines 193–206 and 255–275, confirms this: its training pipeline uses `SelectPercentile(score_func=f_classif)`, CD NMF with NNDSVDa initialization, and KNN with three neighbors. The final supervised fit uses the selected percentile and rank, `max_iter=400`, and seed 42. The October 6 identity study's primary face result instead uses FeatureSPA and an absolute feature-score cutoff. The earlier unscreened CD supplement restored the dissertation's standard unsupervised baseline; the present addition separately restores its supervised factorization family.
 
 This is not an exact historical reproduction. It retains the current absolute screening rule, identity-based cohort, dense neighbor grid, independent hyperparameter selection, and a fixed CD iteration budget of 20,000. Those choices differ from the historical percentile screen, fixed three-neighbor classifier, cap of 400, seed, and data split. Historical dissertation accuracies must therefore not be treated as targets for this evaluation.
 

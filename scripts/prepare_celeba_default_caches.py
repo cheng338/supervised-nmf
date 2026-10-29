@@ -25,7 +25,7 @@ import numpy as np
 from threadpoolctl import threadpool_limits
 
 from supervised_nmf.datasets import _attribute_labels, _partitions, load_celeba
-from supervised_nmf.evaluation import _digest, data_fingerprint, provenance
+from supervised_nmf.evaluation import data_fingerprint, provenance
 
 ATTRIBUTES = ("Smiling", "Wearing_Necktie")
 SIZES = (2000, 4000, 8000)

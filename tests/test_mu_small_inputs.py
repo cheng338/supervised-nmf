@@ -10,6 +10,7 @@ from sklearn.decomposition import NMF
 from threadpoolctl import threadpool_limits
 
 from supervised_nmf import NMFClassifier
+from supervised_nmf.classifier import _capture_projection
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -89,16 +90,16 @@ def projection_without_warnings(model, query):
     fit_state = (model.n_iter_, model.converged_, model.convergence_warnings_)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        with np.errstate(invalid="raise", divide="raise", over="raise"):
+        with np.errstate(invalid="raise", divide="raise", over="raise"), _capture_projection(model) as diagnostic:
             result = model.transform(query)
     np.testing.assert_array_equal(query, original_query)
     np.testing.assert_array_equal(model.decomposition_.components_, original_basis)
     np.testing.assert_array_equal(model.training_coordinates_, original_training)
     assert (model.n_iter_, model.converged_, model.convergence_warnings_) == fit_state
-    assert model.last_transform_converged_ is True
-    assert model.last_transform_warnings_ == ()
-    assert model.last_transform_error_ is None
-    assert model.last_transform_seconds_ >= 0
+    assert diagnostic["last_transform_converged"] is True
+    assert diagnostic["last_transform_warnings"] == ()
+    assert diagnostic["last_transform_error"] is None
+    assert diagnostic["last_transform_seconds"] >= 0
     return result
 
 
@@ -240,14 +241,14 @@ def test_small_projection_retains_positive_tolerance_iteration_warning(dtype):
     model.decomposition_.max_iter = 1
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        with np.errstate(invalid="raise", divide="raise"):
+        with np.errstate(invalid="raise", divide="raise"), _capture_projection(model) as diagnostic:
             coordinates = model.transform(query)
     assert len(caught) == 1
     assert issubclass(caught[0].category, ConvergenceWarning)
     assert "iterations 1 reached" in str(caught[0].message)
-    assert model.last_transform_converged_ is False
-    assert len(model.last_transform_warnings_) == 1
-    assert model.last_transform_error_ is None
+    assert diagnostic["last_transform_converged"] is False
+    assert len(diagnostic["last_transform_warnings"]) == 1
+    assert diagnostic["last_transform_error"] is None
     assert_small_coordinates(coordinates, decimal_rank_one(query, model.decomposition_.components_))
 
 
@@ -260,10 +261,10 @@ def test_unrepresentable_small_basis_coordinates_raise_and_allow_recovery(dtype)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         with np.errstate(invalid="raise", divide="raise", over="raise"):
-            with pytest.raises(FloatingPointError, match="output dtype"):
+            with pytest.raises(FloatingPointError, match="output dtype"), _capture_projection(model) as diagnostic:
                 model.transform(query)
-    assert model.last_transform_converged_ is False
-    assert model.last_transform_error_.startswith("FloatingPointError:")
+    assert diagnostic["last_transform_converged"] is False
+    assert diagnostic["last_transform_error"].startswith("FloatingPointError:")
     np.testing.assert_array_equal(model.decomposition_.components_, original_basis)
     recovered = projection_without_warnings(model, np.asarray([[small, 0]], dtype=dtype))
     assert_small_coordinates(recovered, np.ones((1, 1), dtype=dtype))

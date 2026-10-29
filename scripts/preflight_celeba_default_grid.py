@@ -6,9 +6,6 @@ occurs here. A dimensionally eligible tuple can still fail numerical fitting.
 from __future__ import annotations
 
 import argparse
-from copy import deepcopy
-import hashlib
-import json
 from pathlib import Path
 import sys
 import time
@@ -63,7 +60,6 @@ def screen_setting(parameters):
 def materialize(protocol_path, output_path, audit_path):
     started = time.perf_counter()
     protocol = read(protocol_path)
-    original = deepcopy(protocol)
     checked_masks, jobs = {}, []
     for job in protocol["jobs"]:
         kept, excluded, seen = [], [], set()

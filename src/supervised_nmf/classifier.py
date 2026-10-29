@@ -1,11 +1,14 @@
 """Screening and NMF classification, based on Chang Cheng's original scripts."""
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+from copy import copy
 from numbers import Integral, Real
 import time
 import warnings
 
 import numpy as np
-from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin
 from sklearn.decomposition import NMF
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import LogisticRegression
@@ -18,12 +21,44 @@ from sklearn.utils.validation import check_is_fitted
 
 from .decomposition import FeatureSPA
 from ._mu import transform_mu
+from ._mu_rowwise import transform_mu_rowwise
 from ._projection import validate_projection_parameters
 from ._residual import reconstruction_error
 from .screening import BinaryScreening, _binary_data, _clear_fitted_attributes, _nonnegative_array
 
 
-def _record_warnings(operation):
+_projection_record = ContextVar("supervised_nmf_projection_record", default=None)
+
+
+def _uses_projection_diagnostics(estimator):
+    """Leave custom transform implementations on their own diagnostic contract."""
+    return (isinstance(estimator, NMFClassifier)
+            and getattr(getattr(estimator, "transform", None), "__func__", None)
+            is NMFClassifier.transform)
+
+
+@contextmanager
+def _capture_projection(estimator):
+    """Collect a standard estimator's projection evidence for one invocation.
+
+    The record belongs to the caller, never the fitted estimator. Context-local
+    storage preserves ordinary method delegation and nested call isolation; it
+    does not make Python warning capture or native thread controls thread-safe.
+    """
+    if not _uses_projection_diagnostics(estimator):
+        yield None
+        return
+    record = dict(last_transform_performed=False, last_transform_converged=None,
+                  last_transform_warnings=(), last_transform_error=None,
+                  last_transform_seconds=0.0)
+    token = _projection_record.set((estimator, record))
+    try:
+        yield record
+    finally:
+        _projection_record.reset(token)
+
+
+def _record_warnings(operation, *, diagnostics=None):
     caught = []
     succeeded = False
     try:
@@ -32,6 +67,9 @@ def _record_warnings(operation):
             result = operation()
         succeeded = True
     finally:
+        if diagnostics is not None:
+            diagnostics["last_transform_warnings"] = tuple(
+                str(w.message) for w in caught if issubclass(w.category, ConvergenceWarning))
         # Failed fits can emit useful diagnostics before raising. Forward those
         # too, so the comparison runner retains every failed attempt's warning.
         for warning in caught:
@@ -60,7 +98,7 @@ def _head_supports(method):
     return check
 
 
-class NMFClassifier(ClassifierMixin, BaseEstimator):
+class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
     """Binary supervised NMF classifier with an overridable practical default.
 
     ``solver='spa'`` and ``screening='absolute'`` are practical starting defaults
@@ -79,6 +117,12 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
     For CD/MU, accepted float32 factorization inputs remain float32. Using float64
     for both training and prediction can improve agreement at additional cost, without
     guaranteeing identical results or better classification accuracy.
+    When query and fitted-basis dtypes differ, projection uses float64 without
+    narrowing either array. A temporary estimator holds any widened basis;
+    the fitted basis and training coordinates retain their original values and
+    dtypes. Matching dtypes retain their output dtype; CD and batch MU keep
+    their existing calculation. Mixed-dtype
+    coordinates can differ from those obtained by explicitly downcasting a query.
 
     ``classifier='knn'`` retains the original final classifier.
     ``knn_normalization='none'`` preserves its original metric. Optional ``'sd'``
@@ -134,6 +178,20 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
     validated but unused by CD and MU. Unlike the fitted decision policy,
     projection execution settings may be changed without refitting.
 
+    ``mu_projection='batch'`` retains MU's shared query-batch stopping rule.
+    Optional ``'rowwise'`` gives each observation its own initialization and
+    stopping decision, with float64 working arithmetic for ordinary projection and guarded numerical
+    recovery. It preserves the fixed-basis Frobenius objective and projection
+    output dtype, but changes numerical coordinates and can cost more time.
+    Choose it when observations may be predicted individually or in different
+    batches. It removes shared stopping, not every possible floating-point
+    difference across batch shapes. ``mu_projection_`` records the fitted
+    policy for MU and is ``None`` for other solvers; ``'rowwise'`` requires MU.
+    This policy changes only on refit. Existing serialized models retain batch
+    projection. Joint factorization is unchanged. Explicitly combine rowwise
+    projection with ``training_coordinates='transform'`` to use the same
+    projection policy for classifier-training and query coordinates.
+
     ``training_coordinates='auto'`` uses fixed-basis ``'transform'`` coordinates
     for SPA and the historical ``'fit_transform'`` coordinates for CD and MU.
     Explicit ``'fit_transform'`` reproduces the scripts' convention;
@@ -141,6 +199,13 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
     same operation as prediction. ``training_coordinates_mode_`` records the
     resolved fitted choice; ``training_coordinates_`` holds the actual array.
     Changing this parameter takes effect on the next fit, not prediction.
+
+    ``fit_transform(X, y)`` fits the complete classifier, then returns
+    ``transform(X)``. Labels are required. These projected coordinates can
+    differ from ``training_coordinates_`` when the head uses factorization
+    or anchor coordinates. The method does not change the training-coordinate
+    policy and performs an additional projection after fitting.
+
     No operation on test data refits
     the screening or basis. ``components_`` is padded with zeros to the original
     feature count; ``selected_components_`` contains only retained columns.
@@ -150,7 +215,9 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
     to SciPy fallback; this is not a shared total-work budget. Batched pivot
     rounds and SciPy iterations are different units. Converged routines can
     terminate earlier. CD and MU use their respective
-    sklearn stopping criteria, so identical tolerances do not imply identical
+    sklearn stopping criteria for fitting and default projection; optional
+    rowwise MU projection checks residual improvement per observation.
+    Identical tolerances do not imply identical
     numerical accuracy. SPA's NNLS routine does not use ``tol``. Increasing the
     cap can change a previously truncated fit without changing its objective
     or stopping tolerance.
@@ -165,13 +232,19 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
     determine them. They do not independently certify stationarity, KKT
     conditions, global optimality or agreement across environments. A skipped
     training projection has ``training_projection_converged_=None``. For an
-    already fitted estimator, a failed transform records its latest error/status
-    without changing the fit's ``converged_``.
+    already fitted estimator, prediction leaves learned parameters and
+    package-owned inference state unchanged. Evaluation reports contain call-local
+    projection diagnostics; ``last_transform_*`` attributes are no longer written
+    on the model. A failed prediction does not change the fit's ``converged_``.
+    Third-party query counters may still change. Use separate processes for
+    concurrent evaluations requiring warning isolation; warning capture and
+    native thread controls do not provide a general thread-safety guarantee.
     """
 
     def __init__(self, n_components=2, *, solver="spa", screening="absolute", percentile=10.0,
                  score_threshold=2.0, n_neighbors=5, weights="uniform", max_iter=20000,
                  tol=1e-4, random_state=None, training_coordinates="auto",
+                 mu_projection="batch",
                  classifier="knn", knn_normalization="none",
                  logistic_C=1.0, logistic_max_iter=1000,
                  logistic_tol=1e-4, logistic_class_weight=None,
@@ -191,6 +264,7 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
         self.tol = tol
         self.random_state = random_state
         self.training_coordinates = training_coordinates
+        self.mu_projection = mu_projection
         self.classifier = classifier
         self.knn_normalization = knn_normalization
         self.logistic_C = logistic_C
@@ -208,6 +282,12 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
         self.projection_batch_size = projection_batch_size
         self.projection_native_threads = projection_native_threads
 
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.input_tags.positive_only = True
+        tags.classifier_tags.multi_class = False
+        return tags
+
     def __setstate__(self, state):
         # Legacy fitted models retain their original serial projection policy;
         # restoring constructor defaults also keeps get_params/clone usable.
@@ -217,9 +297,15 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
                             ("svm_C", 1.0), ("svm_max_iter", 20000),
                             ("svm_tol", 1e-5), ("svm_class_weight", None),
                             ("training_coordinates", "fit_transform"),
+                            ("mu_projection", "batch"),
                             ("projection_solver", "scipy"), ("projection_workers", 1),
                             ("projection_batch_size", 256), ("projection_native_threads", 1)):
             state.setdefault(name, value)
+        if "classifier_" in state and "mu_projection_" not in state:
+            # A missing fitted policy predates rowwise projection. Constructor
+            # parameters may have changed after fitting; preserve the saved map.
+            state["mu_projection_"] = (
+                "batch" if getattr(state.get("decomposition_"), "solver", None) == "mu" else None)
         if "classifier_" in state and "knn_normalization_" not in state:
             head = state["classifier_"]
             if isinstance(head, KNeighborsClassifier):
@@ -269,6 +355,11 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
         projection_settings = self._projection_settings()
         if self.solver not in {"cd", "spa", "mu"}:
             raise ValueError("solver must be 'cd', 'spa', or 'mu'.")
+        if not isinstance(self.mu_projection, str) or self.mu_projection not in {"batch", "rowwise"}:
+            raise ValueError("mu_projection must be 'batch' or 'rowwise'.")
+        if self.mu_projection == "rowwise" and self.solver != "mu":
+            raise ValueError("mu_projection='rowwise' requires solver='mu'.")
+        mu_projection_mode = self.mu_projection if self.solver == "mu" else None
         if self.screening not in {"percentile", "absolute", "none"}:
             raise ValueError("screening must be 'percentile', 'absolute', or 'none'.")
         if (not isinstance(self.training_coordinates, str)
@@ -361,7 +452,8 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
         stage = time.perf_counter()
         projection_warnings = ()
         if training_coordinates_mode == "transform":
-            W, projection_warnings = _record_warnings(lambda: transform_mu(decomposition, X_selected))
+            projection_transform = transform_mu_rowwise if mu_projection_mode == "rowwise" else transform_mu
+            W, projection_warnings = _record_warnings(lambda: projection_transform(decomposition, X_selected))
         training_projection_seconds = time.perf_counter() - stage
         stage = time.perf_counter()
         if self.classifier == "knn":
@@ -422,6 +514,7 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
         self.factorization_converged_ = not fitting_warnings
         self.training_projection_convergence_warnings_ = projection_warnings
         self.training_coordinates_mode_ = training_coordinates_mode
+        self.mu_projection_ = mu_projection_mode
         self.training_projection_performed_ = training_coordinates_mode == "transform"
         self.training_projection_converged_ = (not projection_warnings
                                               if self.training_projection_performed_ else None)
@@ -444,27 +537,53 @@ class NMFClassifier(ClassifierMixin, BaseEstimator):
 
     def transform(self, X):
         check_is_fitted(self, "classifier_")
-        start = time.perf_counter()
-        self.last_transform_converged_ = False
-        self.last_transform_warnings_ = ()
-        self.last_transform_error_ = None
+        active = _projection_record.get()
+        diagnostics = active[1] if active is not None and active[0] is self else None
+        if diagnostics is not None:
+            start = time.perf_counter()
+            diagnostics.update(last_transform_performed=True, last_transform_converged=False,
+                               last_transform_warnings=(), last_transform_error=None)
         try:
             projection_settings = self._projection_settings()
-            if isinstance(self.decomposition_, FeatureSPA):
-                self.decomposition_.set_params(**projection_settings)
+            decomposition = self.decomposition_
+            # SPA execution controls and sklearn NMF bookkeeping are call-local.
+            # Fitted arrays stay shared unless the existing dtype path widens them.
+            if isinstance(decomposition, (FeatureSPA, NMF)):
+                decomposition = copy(decomposition)
+            if isinstance(decomposition, FeatureSPA):
+                decomposition.set_params(**projection_settings)
             X = _nonnegative_array(X)
             if X.shape[1] != self.n_features_in_:
-                raise ValueError(f"X has {X.shape[1]} features; expected {self.n_features_in_}.")
+                raise ValueError(
+                    f"X has {X.shape[1]} features, but {type(self).__name__} is expecting "
+                    f"{self.n_features_in_} features as input."
+                )
             X_selected = X[:, self.selected_features_]
-            W, messages = _record_warnings(lambda: transform_mu(self.decomposition_, X_selected))
-            self.last_transform_warnings_ = messages
-            self.last_transform_converged_ = not messages
+            if type(decomposition) is NMF and "transform" not in vars(decomposition):
+                basis = decomposition.components_
+                if (type(basis) in (np.ndarray, np.memmap)
+                        and basis.dtype in (np.float32, np.float64)
+                        and X_selected.dtype != basis.dtype):
+                    # Widening preserves stored values, including positive queries
+                    # outside float32's range. Never downcast or refit the basis.
+                    X_selected = X_selected.astype(np.float64, copy=False)
+                    if basis.dtype != np.float64:
+                        decomposition.components_ = basis.astype(np.float64)
+            projection_transform = (transform_mu_rowwise
+                                    if getattr(self, "mu_projection_", "batch") == "rowwise"
+                                    else transform_mu)
+            W, messages = _record_warnings(
+                lambda: projection_transform(decomposition, X_selected), diagnostics=diagnostics)
+            if diagnostics is not None:
+                diagnostics["last_transform_converged"] = not messages
             return W
         except Exception as error:
-            self.last_transform_error_ = f"{type(error).__name__}: {error}"
+            if diagnostics is not None:
+                diagnostics["last_transform_error"] = f"{type(error).__name__}: {error}"
             raise
         finally:
-            self.last_transform_seconds_ = time.perf_counter() - start
+            if diagnostics is not None:
+                diagnostics["last_transform_seconds"] = time.perf_counter() - start
 
     def predict(self, X):
         check_is_fitted(self, "classifier_")

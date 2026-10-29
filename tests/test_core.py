@@ -16,7 +16,7 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from threadpoolctl import threadpool_limits
 
-from supervised_nmf.classifier import NMFClassifier, _record_warnings
+from supervised_nmf.classifier import NMFClassifier, _capture_projection, _record_warnings
 from supervised_nmf.decomposition import FeatureSPA
 from supervised_nmf.screening import BinaryScreening, _percentile_support
 
@@ -227,7 +227,8 @@ class ClassifierTests(CoreTestCase):
             np.testing.assert_array_equal(model.classes_[proba.argmax(axis=1)], predicted)
             restored = pickle.loads(pickle.dumps(model))
             np.testing.assert_array_equal(restored.predict(self.X), predicted)
-            model.predict(self.X * 1.1)
+            with _capture_projection(model) as diagnostic:
+                model.predict(self.X * 1.1)
             np.testing.assert_array_equal(model.components_, components)
             np.testing.assert_array_equal(model.decomposition_.components_, fitted_basis)
             np.testing.assert_array_equal(model.training_coordinates_, training_coordinates)
@@ -236,7 +237,8 @@ class ClassifierTests(CoreTestCase):
             np.testing.assert_array_equal(model.components_[:, ~model.get_support()], 0)
             self.assertGreaterEqual(model.fit_times_["total"], model.fit_times_["factorization"])
             self.assertTrue(all(np.isfinite(seconds) and seconds >= 0 for seconds in model.fit_times_.values()))
-            self.assertGreaterEqual(model.last_transform_seconds_, 0)
+            self.assertGreaterEqual(diagnostic["last_transform_seconds"], 0)
+            self.assertFalse(hasattr(model, "last_transform_seconds_"))
             copied = clone(model)
             self.assertEqual(copied.get_params(), model.get_params())
             self.assertFalse(hasattr(copied, "classifier_"))
@@ -355,11 +357,12 @@ class ClassifierTests(CoreTestCase):
             with self.subTest(solver=solver), warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 model = self.model(solver=solver, max_iter=1).fit(self.X, self.y)
-                model.transform(self.X)
+                with _capture_projection(model) as diagnostic:
+                    model.transform(self.X)
                 self.assertFalse(model.converged_)
-                self.assertFalse(model.last_transform_converged_)
+                self.assertFalse(diagnostic["last_transform_converged"])
                 self.assertTrue(model.convergence_warnings_)
-                self.assertTrue(model.last_transform_warnings_)
+                self.assertTrue(diagnostic["last_transform_warnings"])
                 self.assertTrue(any(issubclass(w.category, ConvergenceWarning) for w in caught))
 
     def test_warnings_preceding_solver_failure_remain_visible(self):

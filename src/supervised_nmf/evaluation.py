@@ -37,7 +37,7 @@ from sklearn.svm import LinearSVC
 from sklearn.utils.validation import check_X_y
 from threadpoolctl import threadpool_info, threadpool_limits
 
-from .classifier import _record_warnings
+from .classifier import _capture_projection, _record_warnings, _uses_projection_diagnostics
 from .screening import _clear_fitted_attributes
 from .validation import build_cv_folds, validate_metadata
 
@@ -175,8 +175,9 @@ def _warning_records(caught):
             for w in caught]
 
 
-def _diagnostics(estimator):
+def _diagnostics(estimator, projection=None):
     result = {}
+    call_local = _uses_projection_diagnostics(estimator)
     for attribute in ("n_iter_", "converged_", "convergence_warnings_",
                       "last_transform_converged_", "last_transform_warnings_", "last_transform_seconds_", "last_transform_error_",
                       "factorization_converged_", "factorization_convergence_warnings_",
@@ -184,8 +185,17 @@ def _diagnostics(estimator):
                       "classifier_n_iter_", "classifier_converged_", "classifier_convergence_warnings_",
                       "knn_normalization_", "training_coordinates_mode_",
                       "fit_times_", "n_features_in_"):
+        if attribute.startswith("last_transform_") and call_local:
+            continue
         if hasattr(estimator, attribute):
             result[attribute.rstrip("_")] = _jsonable(getattr(estimator, attribute))
+    if call_local:
+        # Fit-only records have no prediction to qualify. Old serialized models
+        # may retain obsolete last-call fields; never reuse those as evidence.
+        result.update(_jsonable(projection) if projection is not None else {
+            "last_transform_performed": False, "last_transform_converged": None,
+            "last_transform_warnings": [], "last_transform_error": None,
+            "last_transform_seconds": 0.0})
     # Constructor settings may have changed since fit. Identify the actual
     # fitted head, including an NMF head's optional scaler pipeline.
     head = estimator.steps[-1][1] if isinstance(estimator, Pipeline) and estimator.steps else estimator
@@ -228,13 +238,18 @@ def _diagnostics(estimator):
     return result
 
 
-def _nonconverged(estimator, caught):
+def _nonconverged(estimator, caught, projection=None):
     final_classifier = estimator.steps[-1][1] if isinstance(estimator, Pipeline) and estimator.steps else None
+    if _uses_projection_diagnostics(estimator):
+        projection_failed = (projection is not None
+                             and projection.get("last_transform_converged") is False)
+    else:
+        projection_failed = not bool(getattr(estimator, "last_transform_converged_", True))
     return (any(issubclass(w.category, ConvergenceWarning) for w in caught)
             or not bool(getattr(estimator, "converged_", True))
             or not bool(getattr(estimator, "classifier_converged_", True))
             or not bool(getattr(final_classifier, "converged_", True))
-            or not bool(getattr(estimator, "last_transform_converged_", True)))
+            or projection_failed)
 
 
 def support_recovery(estimator, signal_support):
@@ -384,6 +399,7 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
                     continue
                 record = {"fold": fold, "fit_seconds": 0.0, "prediction_seconds": 0.0}
                 fitted = None
+                projection = None
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
                     try:
@@ -395,19 +411,20 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
                             record["fit_seconds"] = time.perf_counter() - fit_start
                         inference_start = time.perf_counter()
                         try:
-                            predictions = fitted.predict(X[validation])
+                            with _capture_projection(fitted) as projection:
+                                predictions = fitted.predict(X[validation])
                         finally:
                             record["prediction_seconds"] = time.perf_counter() - inference_start
                         score = float(balanced_accuracy_score(y[validation], predictions))
                         if not math.isfinite(score):
                             raise ValueError("Nonfinite calibration score.")
                         record["balanced_accuracy"] = score
-                        record["status"] = "nonconverged" if _nonconverged(fitted, caught) else "valid"
+                        record["status"] = "nonconverged" if _nonconverged(fitted, caught, projection) else "valid"
                     except Exception as error:
                         record.update(status="failed", error_type=type(error).__name__, error=str(error))
                 record["warnings"] = _warning_records(caught)
                 if fitted is not None:
-                    record["diagnostics"] = _diagnostics(fitted)
+                    record["diagnostics"] = _diagnostics(fitted, projection)
                 candidate["folds"].append(record)
                 report["tuning_seconds"] = previous_seconds + time.perf_counter() - start
                 checkpoint()
@@ -564,7 +581,8 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
         min_groups=min_groups)
     positive = classes[1]
     start = time.perf_counter()
-    with threadpool_limits(limits=threads), warnings.catch_warnings(record=True) as caught:
+    with (threadpool_limits(limits=threads), warnings.catch_warnings(record=True) as caught,
+          _capture_projection(estimator) as projection):
         warnings.simplefilter("always")
         try:
             probability = margin = None
@@ -621,7 +639,7 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
         except Exception as error:
             return {"status": "failed", "error_type": type(error).__name__, "error": str(error),
                     "prediction_seconds": time.perf_counter() - start,
-                    "warnings": _warning_records(caught), "diagnostics": _diagnostics(estimator),
+                    "warnings": _warning_records(caught), "diagnostics": _diagnostics(estimator, projection),
                     "support_diagnostics": support_diagnostics, "training_majority_reference": majority_reference,
                     "data_sha256": data_fingerprint(X, y)}
     elapsed = time.perf_counter() - start
@@ -647,11 +665,11 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
                              for i, label in enumerate(classes)]}
     if not both_classes:
         metrics["undefined_reason"] = "Evaluation split contains only one class; balanced accuracy and ranking metrics omitted."
-    return {"status": "provisional_nonconvergence" if _nonconverged(estimator, caught) else "valid",
+    return {"status": "provisional_nonconvergence" if _nonconverged(estimator, caught, projection) else "valid",
             "metrics": metrics, "prediction_seconds": elapsed, "prediction_operation": prediction_operation,
             "ranking_score_type": score_type,
             "warnings": _warning_records(caught),
-            "diagnostics": _diagnostics(estimator), "data_sha256": data_fingerprint(X, y),
+            "diagnostics": _diagnostics(estimator, projection), "data_sha256": data_fingerprint(X, y),
             "support_diagnostics": support_diagnostics, "training_majority_reference": majority_reference,
             "evaluation_groups": _jsonable(groups),
             "predictions": {"sample_ids": _jsonable(np.arange(len(y)) if sample_ids is None else sample_ids),
@@ -729,6 +747,8 @@ def format_evaluation_summary(report):
         value = diagnostics.get(flag)
         state = "unavailable" if value is None else "passed" if value else "failed"
         if flag == "training_projection_converged" and diagnostics.get("training_projection_performed") is False:
+            state = "not performed"
+        if flag == "last_transform_converged" and diagnostics.get("last_transform_performed") is False:
             state = "not performed"
         lines.append(f"| {label} | {state} |")
         for message in diagnostics.get(warning_key, ()):

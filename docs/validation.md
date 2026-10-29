@@ -1,13 +1,175 @@
 # Validation status and historical checks
 
-Records through October 6, 2026. Author: Chang Cheng.
+Author: Chang Cheng.
 
-Environment: Python 3.12.14, NumPy 2.5.2,
+Historical study results and subsequent implementation checks are distinguished
+below. The projected-coordinate evidence summary was added on October 28, 2026
+from existing records; no study was rerun for that summary.
+
+The October 3–6 SPA classification studies below used anchor-derived training
+coordinates (`training_coordinates="fit_transform"`) and fixed-basis NNLS for
+queries. Their accuracy and timing belong to those frozen study sources.
+The default SPA classifier has projected training observations as well since
+[v0.3.0](release-0.3.0.md#spa-training-coordinates-migration). Later implementation
+checks and projected-coordinate studies are recorded separately and do
+not reattribute earlier study results to that default.
+
+October 3–6 environment: Python 3.12.14, NumPy 2.5.2,
 SciPy 1.18.0, scikit-learn 1.9.0, threadpoolctl 3.5.0, AOCL-BLAS 5.2.0,
 Windows. Comparison execution explicitly limited numerical libraries to one
 thread. These results do not establish compatibility with every allowed version.
 
-## Current implementation checks
+## Evidence for projected SPA training coordinates
+
+Completed studies evaluate the same coordinate-policy concept as the current
+SPA classifier: fit a basis on training data, then use fixed-basis NNLS for both
+training and query observations. They support this procedure as a usable option,
+with mixed classification outcomes. They do not establish that SPA is generally
+the best solver, or that the untuned current constructor reproduces their scores.
+Rank, screening cutoff and classifier settings still require training-only tuning.
+
+### October 12 official-partition evaluation
+
+This study completed all **300 planned and audited final outcomes**: ten methods,
+three CelebA attributes and ten 20,000-image training draws per attribute. Each
+draw used the same **19,962 official-test images**. Configuration selection used
+grouped five-fold CV on a separate 19,838-image development reserve. Identity and
+exact-image-duplicate exclusions separated the pools. Natural class proportions
+were preserved; no class-rebalancing or decision-threshold tuning was used.
+
+The frozen source was version **0.2.0 plus a study adapter** that projected SPA
+training observations. It was not the later public estimator implementation.
+The screening-only, sPCA and sNMF comparisons shared a training-fitted absolute
+t-score screen with a 35% retained-feature ceiling. Its cutoff maximized the equal
+mean of those three KNN procedures' best CV selection scores. Selection used
+accuracy for Smiling and Wearing_Lipstick, and balanced accuracy for
+Wearing_Necktie. KNN scaling was tuned over unscaled and training-fitted
+standard-deviation scaling; it was not fixed to the current unscaled default.
+
+The following are saved mean **balanced accuracies (%)** across the ten training
+draws. Unscreened NMF in this study also used SPA. Logistic regression denotes
+the separately tuned classifier extension.
+
+| Procedure | Smiling | Wearing_Necktie | Wearing_Lipstick |
+| --- | ---: | ---: | ---: |
+| Raw features + KNN | 71.197 | 58.127 | 77.406 |
+| Screening + KNN | 83.743 | 61.565 | 83.465 |
+| sPCA + KNN | 85.713 | 62.158 | 86.091 |
+| Unscreened NMF + KNN | 72.631 | 60.683 | 74.843 |
+| sNMF + KNN | 85.400 | 62.131 | 85.931 |
+| Raw features + logistic regression | 89.442 | 82.021 | 88.808 |
+| Screening + logistic regression | 86.018 | 81.898 | 86.862 |
+| sPCA + logistic regression | 85.825 | 79.977 | 86.603 |
+| Unscreened NMF + logistic regression | 78.968 | 74.818 | 77.564 |
+| sNMF + logistic regression | 85.757 | 80.651 | 86.346 |
+
+The selected sNMF KNN configurations were:
+
+| Attribute | Absolute cutoff | Rank | Neighbors | Coordinate scaling |
+| --- | ---: | ---: | ---: | --- |
+| Smiling | 32 | 20 | 21 | Standard deviation |
+| Wearing_Necktie | 8 | 30 | 1 | None |
+| Wearing_Lipstick | 32 | 20 | 12 | Standard deviation |
+
+sPCA KNN had slightly higher mean balanced accuracy and ordinary accuracy than
+sNMF KNN on all three attributes; these small descriptive differences do not
+establish statistical superiority or equivalence. Raw-feature logistic regression
+had the highest mean balanced accuracy among the ten procedures on all three
+attributes. For Wearing_Necktie, sNMF KNN's **91.117% ordinary accuracy** accompanied
+only **28.420% positive-class recall**. The imbalance problem is not resolved by
+the high ordinary accuracy.
+
+Selection was frozen before evaluation access within this run, but CelebA had
+already been explored in earlier work. The protocol explicitly describes the
+study as a descriptive reassessment, not fresh independent confirmation. Training
+draws can overlap and share one development selection and one test cohort.
+Variation across draws is conditional on those fixed data and settings; it does
+not measure uncertainty from new test subjects or repeated tuning. The finite
+search also does not establish globally optimal configurations.
+
+### October 20 public-estimator comparison
+
+A separate study used the frozen October 20 integration that preceded v0.3.0.
+Its common-coordinate arm exercised the public SPA estimator with absolute
+screening and unscaled KNN, more directly matching the current method choices.
+It used **5,002 previously exposed development images**, 253 identity/duplicate
+groups and three overlapping grouped outer splits, with five-fold inner tuning.
+It did not access the official test partition. The saved mean **balanced
+accuracies (%)** for its unscaled-KNN arm were:
+
+| Procedure | Smiling | Wearing_Necktie | Wearing_Lipstick |
+| --- | ---: | ---: | ---: |
+| Raw features + KNN | 62.56 | 59.48 | 70.08 |
+| Screening + KNN | 80.45 | 57.75 | 74.45 |
+| sPCA + KNN | 81.63 | 59.68 | 74.39 |
+| sNMF + KNN | 82.31 | 58.44 | 76.48 |
+
+sNMF led these KNN comparators on Smiling and Wearing_Lipstick, but trailed raw
+KNN and sPCA on Wearing_Necktie. Its positive-class recall on Wearing_Necktie
+was **21.42%**. The three splits and three attributes are not independent datasets.
+These scores cannot be compared directly with October 12 as a package improvement
+or regression: the cohorts, source, tuning and scaling conditions differ.
+
+Across all declared source arms and classifier choices, **135 final outcomes
+qualified**. This does not mean every attempted configuration succeeded: the
+initial search retained **198 failed representations affecting 1,112 fold-candidate
+evaluations**, alongside 14,818 successful initial and 1,155 successful refinement
+fold-candidate evaluations. The bounded rank grid was `{2, 10, 30}`, with cutoffs
+`{0, 2, 8}` and one classifier-only refinement. All selected sNMF ranks reached 30; higher
+feasible ranks remain unresolved. Completion of the bounded validation is not
+completion of tuning. Scientific fit/predict times came from concurrent
+scheduling and should not be read as isolated speed comparisons.
+
+### Relationship to the present implementation
+
+Subsequent engineering comparisons cover changes after those studies. The
+October 26 comparison against the released v0.3.2 wheel recorded **1,176 qualified
+saved-array source pairs** (888 measured and 288 warmup pairs) across the covered
+methods and configurations. Five additional pairs from an incomplete original
+attempt remain recorded separately. These are repeated execution comparisons,
+not independent datasets. Predicted labels, screening masks, SPA anchors and class
+ordering were unchanged on the qualified matched cases. It included ordinary
+inputs and numerical stress cases in four environments. Its CelebA workload used
+previously exposed Smiling data, with 1,600 training and 400 query observations
+and fixed settings.
+
+The frozen candidate's SPA basis-fitting, NNLS, projection, residual and screening
+modules match v0.3.3 by SHA-256. The October 28 source retains those numerical
+operations; later docstring clarifications in `decomposition.py` change its file
+hash without changing executable statements. The surrounding classifier has
+subsequent changes, including mixed-dtype handling and the optional MU projection
+policy. These engineering checks support the numerical
+implementation on the tested cases; they do not rerun the full October 12 or
+October 20 scientific comparisons or establish new classification superiority.
+
+Reproducing an entire historical table with current source would require freezing
+that source and replaying the saved data splits and selected settings under a
+separate protocol. Such a replay would measure reproducibility on already exposed
+data. Independent statistical confirmation would additionally
+require an appropriately reserved evaluation cohort. Neither is claimed here,
+and no default is changed by this record review.
+
+### Record provenance
+
+The summary above transcribes saved aggregate records, without recomputing
+predictions or altering the frozen studies. The archived records are separate
+from the package distributions:
+
+- October 12: `celeba-official-20261012/final-evidence/`, including `protocol.json`,
+  `source-context.json`, `source-binding.json`, `report/summary.json`,
+  `report/rows.json`, `report/results.json` and `prediction-audit.json`.
+  The aggregate `report/summary.json` has SHA-256
+  `1efdda358ec83c1ecee6f1456279ccf98b1e7010cafa06dabc1d6afe577b0a5f`.
+- October 20: `latest-vs-first-20261020/`, including `PROTOCOL.md`,
+  `frozen-sources-v1-manifest.json`, `final-report-v2/validation-report.txt`,
+  `celeba-completeness-notes.md` and the final `celeba-summary.md`.
+  The [v0.3.0 notes](release-0.3.0.md) also describe the implementation changes
+  and validation limits.
+- October 26: `final-release-comparison-20261026/REPORT.txt` and
+  `source-manifest.json`; the latter has SHA-256
+  `88bd04b5cbcda9f328ca1178449514377bd802e6e74b307c42732386703d8a2f`.
+
+## October 6 implementation checks
 
 - The [five-dataset expansion](multi-dataset-validation.md) adds **24 focused
   checks** in each numerical environment: six for the seven-method helper,
@@ -194,8 +356,9 @@ records. Two infeasible candidates account for all ten invalid fold records;
 their failures are retained. The independent pretest audit passed before the
 frozen configurations were evaluated on all planned test rows.
 
-The sNMF procedure obtained **81.40% accuracy and 81.37% balanced accuracy**;
-sPCA obtained **78.50% and 78.51%**, respectively. The primary paired balanced-
+The historical SPA `fit_transform` procedure obtained **81.40% accuracy and
+81.37% balanced accuracy**; sPCA obtained **78.50% and 78.51%**, respectively.
+The primary paired balanced-
 accuracy difference is **+2.86 percentage points**, with a 95% class-stratified
 bootstrap interval **[+0.68, +5.05]**. Screening-only KNN obtained 79.60% accuracy
 and 79.58% balanced accuracy; the sNMF contrast with that control remains

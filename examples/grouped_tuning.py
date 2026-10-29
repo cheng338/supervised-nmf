@@ -23,7 +23,7 @@ def main():
     X[:, :4] += y[:, None] * 0.7
     ids = np.arange(len(y))
     training, evaluation = subjects < 30, subjects >= 30
-    estimator = NMFClassifier(random_state=42)
+    estimator = NMFClassifier(screening="absolute", random_state=42)
     report = calibration_rank_search(
         estimator, {"n_components": [2, 4], "score_threshold": [0.0, 2.0],
                     "n_neighbors": [3, 5]},

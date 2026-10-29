@@ -52,7 +52,7 @@ from supervised_nmf.datasets import make_original_simulation
 from supervised_nmf.study import calibration_knn_grid
 from supervised_nmf.search import calibration_rank_search
 from supervised_nmf.validation import build_cv_folds
-from supervised_nmf.evaluation import format_evaluation_summary
+from supervised_nmf.evaluation import evaluate_classifier, format_evaluation_summary
 
 assert ".whl" in supervised_nmf.__file__, supervised_nmf.__file__
 assert supervised_nmf.__author__ == "Chang Cheng"
@@ -61,6 +61,19 @@ assert callable(calibration_knn_grid)
 assert callable(calibration_rank_search)
 assert callable(build_cv_folds)
 assert callable(format_evaluation_summary)
+
+
+def assert_prediction_report(estimator, X, y):
+    report = evaluate_classifier(estimator, X, y, threads=1)
+    assert report["status"] == "valid", report
+    diagnostics = report["diagnostics"]
+    assert estimator.converged_ and diagnostics["last_transform_converged"]
+    assert diagnostics["last_transform_performed"]
+    assert diagnostics["last_transform_error"] is None
+    assert diagnostics["last_transform_seconds"] >= 0
+    assert not any(name.startswith("last_transform_") for name in vars(estimator))
+
+
 defaults = NMFClassifier().get_params()
 assert defaults["solver"] == "spa", defaults
 assert defaults["screening"] == "absolute", defaults
@@ -91,8 +104,8 @@ assert model.solver == defaults["solver"] and model.screening == defaults["scree
 assert model.max_iter == 20000
 for name, value in override_parameters.items():
     assert override.get_params()[name] == value, name
-assert model.converged_ and model.last_transform_converged_
-assert override.converged_ and override.last_transform_converged_
+assert_prediction_report(model, data.data[:5], data.target[:5])
+assert_prediction_report(override, data.data[:5], data.target[:5])
 assert labels.shape == (5,)
 assert probabilities.shape == (5, 2)
 assert np.isfinite(probabilities).all()
@@ -102,13 +115,13 @@ assert override_probabilities.shape == (5, 2)
 assert np.isfinite(override_probabilities).all()
 np.testing.assert_allclose(override_probabilities.sum(axis=1), 1)
 assert mu.solver == "mu" and mu.decomposition_.solver == "mu"
-assert mu.converged_ and mu.last_transform_converged_
+assert_prediction_report(mu, data.data[:5], data.target[:5])
 assert mu_labels.shape == (5,) and mu_probabilities.shape == (5, 2)
 assert np.isfinite(mu_probabilities).all()
 np.testing.assert_allclose(mu_probabilities.sum(axis=1), 1)
 np.testing.assert_array_equal(mu.selected_components_, mu_basis)
 assert logistic.classifier == "logistic" and logistic.classifier_converged_
-assert logistic.converged_ and logistic.last_transform_converged_
+assert_prediction_report(logistic, data.data[:5], data.target[:5])
 assert logistic_labels.shape == (5,) and logistic_probabilities.shape == (5, 2)
 np.testing.assert_allclose(logistic_probabilities.sum(axis=1), 1)
 np.testing.assert_array_equal(logistic_labels, logistic.predict(data.data[:5]))
@@ -197,7 +210,7 @@ with threadpool_limits(limits=1):
     else:
         raise AssertionError("Linear SVM must reject a probability decision threshold.")
     for fitted in (model, legacy, sd, svm):
-        assert fitted.converged_ and fitted.last_transform_converged_
+        assert_prediction_report(fitted, query, np.concatenate([data.target[:3], data.target[-3:]]))
         assert fitted.classifier_converged_
         np.testing.assert_array_equal(fitted.selected_components_, basis)
 

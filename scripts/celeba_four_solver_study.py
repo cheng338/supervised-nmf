@@ -12,7 +12,6 @@ Historical CelebA runs are input provenance only and are never modified here.
 from __future__ import annotations
 
 import argparse
-from copy import deepcopy
 from datetime import datetime, timezone
 import json
 from numbers import Real

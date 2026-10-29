@@ -2,6 +2,14 @@
 
 Author: Chang Cheng. October 3, 2026.
 
+The saved source for this study used `training_coordinates="fit_transform"`:
+SPA classifiers trained on the original-scale anchor columns and predicted
+using fixed-basis NNLS. The accuracy and timing below apply to that convention.
+Since [v0.3.0](release-0.3.0.md#spa-training-coordinates-migration), the default
+SPA classifier also projects its training observations against the fitted basis.
+The historical selection does not by itself establish the performance of that
+later training procedure.
+
 The CelebA amendment selected **feature-anchor SPA with absolute-score screening**.
 The amendment prefers supervised PCA's screening design when accuracy is close.
 Both absolute-screening methods met the existing accuracy tolerances; SPA was
@@ -13,8 +21,12 @@ classification bounds do not favor one solver.
 The subsequent [four-solver comparison](nmf-solver-comparison.md#development-results)
 on Fashion-MNIST and CelebA also selected SPA with absolute screening and remains
 `selected_for_audit`. Both CelebA decisions and their evidence are preserved
-separately. No new CelebA final-test run has started; the interrupted prior attempt
-has no recorded test predictions or outcomes.
+separately. The final-test phase of this original default-selection protocol
+remains unfinished; its interrupted attempt has no recorded test predictions or
+outcomes. Later, separate studies did evaluate projected SPA training coordinates,
+including an October 12 official-partition study. Their settings, results and
+limits are summarized in [the validation record](validation.md#evidence-for-projected-spa-training-coordinates);
+they do not retroactively complete this frozen protocol.
 
 The original time-first rule selected SPA with percentile screening. The screening
 preference was amended after that development comparison and the theory review.
@@ -105,15 +117,141 @@ prevalence and confusion counts are retained in the detailed decision artifact.
 
 ## Sensitivity and scope
 
+### Original time-first rule
+
 Under the original time-first rule, SPA with percentile screening remains selected
 when any one training size or seed is omitted. With its accuracy tolerances, it
 also wins when prediction
 cost is multiplied by 0.1, 1 or 10. At **100 times the prediction workload**, CD
 with absolute screening wins when tuning cost is excluded. Adding the recorded
 parallel tuning compute returns SPA with percentile screening in all declared
-sensitivity cases; that mixed measurement is descriptive only. The primary
-time-first result remains archived; the subsequent preference amendment has its
-own recalculated sensitivity results.
+sensitivity cases; that mixed measurement is descriptive only. This original
+decision remains archived separately from the preference amendment below.
+
+### Amended screening-preference rule
+
+The following tables report all 32 sensitivity settings saved with the
+October 3 amendment. Each calculation applies the global accuracy gate before
+preferring eligible absolute-screening methods. The accuracy reference and
+cost normalization retain all operationally qualified methods. The preference
+cannot admit a method that fails that gate or numerical qualification.
+
+Margins are allowed balanced-accuracy shortfalls in **percentage points**;
+the per-attribute margin is twice the macro margin. Prediction weight multiplies
+the saved prediction time in each paired timing repeat. A weight of one is the
+primary workload: one fit plus prediction on the fixed 4,000-image validation
+set. These weights are cost-model sensitivities, not measured runs on larger
+prediction batches.
+
+**Serial fit and prediction cost, excluding tuning**
+
+| Macro / attribute margin (pp) | Prediction weight 0.1 | 1 | 10 | 100 |
+| --- | --- | --- | --- | --- |
+| 0 / 0 | SPA + percentile (fallback) | SPA + percentile (fallback) | SPA + percentile (fallback) | SPA + percentile (fallback) |
+| 0.5 / 1 | CD + absolute | CD + absolute | CD + absolute | CD + absolute |
+| 1 / 2 | SPA + absolute | SPA + absolute | CD + absolute | CD + absolute |
+| 2 / 4 | SPA + absolute | SPA + absolute | CD + absolute | CD + absolute |
+
+**Serial cost plus recorded parallel tuning compute**
+
+| Macro / attribute margin (pp) | Prediction weight 0.1 | 1 | 10 | 100 |
+| --- | --- | --- | --- | --- |
+| 0 / 0 | SPA + percentile (fallback) | SPA + percentile (fallback) | SPA + percentile (fallback) | SPA + percentile (fallback) |
+| 0.5 / 1 | CD + absolute | CD + absolute | CD + absolute | CD + absolute |
+| 1 / 2 | SPA + absolute | SPA + absolute | SPA + absolute | CD + absolute |
+| 2 / 4 | SPA + absolute | SPA + absolute | SPA + absolute | CD + absolute |
+
+At zero margins, no method meets both attribute optima. The original
+minimum-worst-regret fallback selects SPA with percentile screening; it does
+not satisfy a zero-loss accuracy gate, and the absolute preference is not
+applied. At every nonzero margin shown, the preference is applied only to
+absolute-screening methods that pass the gate.
+
+The second table adds accumulated parallel worker-wall tuning compute to serial
+fit/prediction cost. It is a mixed-measurement sensitivity, not elapsed serial
+or end-to-end runtime. Neither table replaces the primary amended choice at
+the 1/2-point margins and prediction weight one.
+
+The saved omission calculations use the primary margins and workload:
+
+| Omitted development configurations | Amended selection |
+| --- | --- |
+| Training size 2,000 | SPA + absolute |
+| Training size 4,000 | SPA + absolute |
+| Training size 8,000 | SPA + absolute |
+| Seed 43 | SPA + absolute |
+| Seed 44 | **CD + absolute** |
+| Seed 45 | SPA + absolute |
+
+Without seed 44, SPA with absolute screening has a macro BA shortfall of
+**1.019951 points**, slightly above the one-point allowance. Its per-attribute
+shortfalls remain within two points. This reversal is caused by the macro
+accuracy gate. The overlapping configurations and shared validation images
+make these descriptive sensitivities, not independent votes for a solver or
+estimates of a population selection probability.
+
+### Retrospective boundary investigation
+
+An October 28 investigation reconstructed all 72 evaluations and 216 timing
+profiles from the saved receipts and reproduced both rules' decisions. An
+independent implementation agreed across 5,321 checks in each of two numerical
+environments, including 20 hand-derived edge cases and 400 synthetic panels.
+These checks establish reproduction and agreement on the tested inputs; they
+add no new fitted models or predictive validation data. The boundaries below
+were investigated retrospectively and were not part of the original protocol.
+
+With macro allowance `delta` and per-attribute allowance `2 * delta`, each
+method enters the accuracy gate at the larger of its macro regret and half
+its largest attribute regret, apart from the declared numerical allowance:
+
+| Method | Macro allowance at gate entry (pp, approximately) | Controlling restriction |
+| --- | ---: | --- |
+| CD + percentile | 0.584725 | Macro accuracy |
+| CD + absolute | 0.141175 | Attribute accuracy |
+| SPA + percentile | 0.126365 | Attribute accuracy |
+| SPA + absolute | 0.558723 | Macro accuracy |
+
+SPA with absolute screening therefore fails the 0.5-point gate on the
+full-precision evidence. Rounding the published means does not explain the
+different selections at 0.5 and 1 point. These are practical policy thresholds,
+not tests of statistical equivalence or guarantees supplied by the theory.
+
+Costs use the median of paired `fit + weight * prediction` sums, not the sum
+of separate fit and prediction medians. The analysis accounted for changes in
+which repeat supplies that median. It also checked the common geometric
+normalization: relative method costs equal the geometric mean of their paired
+raw cost ratios, so retaining percentile methods in the normalization does not
+create a relative advantage between the two absolute-screening methods.
+
+At the adopted 1/2-point accuracy margins, the approximate cost boundaries are:
+
+| Cost model | CD enters SPA's 5% cost band | Equal aggregate cost | SPA leaves CD's 5% band; selection changes to CD |
+| --- | ---: | ---: | ---: |
+| Fit + weighted prediction | 3.804× | 4.230× | **4.711×** |
+| Same cost plus recorded parallel tuning compute | 39.379× | 45.833× | **53.213×** |
+
+CD becomes cheaper near 4.230×, but SPA retains the tuning-cost tie-break
+while it remains within CD's 5% band. The selected method changes near 4.711×.
+Numerical comparison slack affects microscopic boundary details; the displayed
+values are approximate. They extrapolate historical timings and do not measure
+hardware scaling or the later projected-training procedure.
+
+At the primary workload, each of the three individual timing repeats preserved
+SPA with absolute screening. Cost-band ratios from 1 to 3 also preserved it
+at the tested values. All nine individual training-size/seed block deletions
+preserved it, although deleting the whole seed-44 panel did not. The block
+results do not negate the seed sensitivity: deleting a seed removes its three
+nested-size configurations together.
+
+The amendment remains a preference-based historical choice under stated
+accuracy allowances, workload assumptions and development-panel weighting.
+The investigation preserves its primary selection and does not change the
+current estimator default or add an automatic solver-switching policy. A small
+crossing of a historical threshold is not, by itself, grounds for a new adoption
+decision. Such decisions also require methodological, theoretical, numerical
+and practical justification.
+
+### Scope of the evidence
 
 The training sizes are nested within seed, different seeds overlap, and all cases
 reuse the same validation images. These are repeated development configurations,
@@ -133,10 +271,19 @@ decision does not change the scope or results of this study.
 
 ## Reproduction and records
 
-The public machine-readable rule is
+The original frozen machine-readable rule is
 [`examples/celeba_default_decision_protocol.json`](../examples/celeba_default_decision_protocol.json).
 Its SHA-256 is
 `ac24396d7ddddef4f80adc875bfbba3456edffd929bc1e766993f10a6ac64d6d`.
+
+The file retains the historical environment label `py12_df_aocl` because the
+saved records identify its exact bytes. Version 0.3.3 replaced that label with
+`Python 3.12 with AOCL`, changing the hash without changing the decision rules.
+The original bytes are now restored at the same path. The label records the
+historical configuration; it does not select an environment for current work.
+Historical receipts and strict verification checks remain unchanged. Complete
+replay also requires the archived sources, data and compatible recorded paths.
+
 The Stage 2 declared-grid hash is
 `d6ee839c1a1c8f4a957a998444d0aab53d785a621236b5e28f9ea1a7cc37783e`;
 the feasible-grid hash is

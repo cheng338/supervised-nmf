@@ -197,11 +197,21 @@ class ProjectionExecutionTests(unittest.TestCase):
         expected = model.predict_proba(self.query)
         basis = model.decomposition_.components_.copy()
         head = model.classifier_
+        fitted_controls = {name: getattr(model.decomposition_, name) for name in PROJECTION_PARAMETERS}
+        original_transform = FeatureSPA.transform
+        observed_controls = []
+
+        def observe_projection(decomposition, incoming):
+            observed_controls.append({name: getattr(decomposition, name) for name in PROJECTION_PARAMETERS})
+            self.assertIsNot(decomposition, model.decomposition_)
+            return original_transform(decomposition, incoming)
+
         model.set_params(projection_solver="batched", projection_workers=2,
                          projection_batch_size=7, projection_native_threads=1)
-        np.testing.assert_allclose(model.predict_proba(self.query), expected, rtol=1e-7, atol=1e-9)
-        for name in PROJECTION_PARAMETERS:
-            self.assertEqual(getattr(model.decomposition_, name), getattr(model, name))
+        with patch.object(FeatureSPA, "transform", autospec=True, side_effect=observe_projection):
+            np.testing.assert_allclose(model.predict_proba(self.query), expected, rtol=1e-7, atol=1e-9)
+        self.assertEqual(observed_controls, [{name: getattr(model, name) for name in PROJECTION_PARAMETERS}])
+        self.assertEqual({name: getattr(model.decomposition_, name) for name in PROJECTION_PARAMETERS}, fitted_controls)
         np.testing.assert_array_equal(model.decomposition_.components_, basis)
         self.assertIs(model.classifier_, head)
         model.set_params(projection_workers=0)

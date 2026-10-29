@@ -7,6 +7,14 @@ commands refer to the retained local study workspace.
 
 Author: Chang Cheng.
 
+This October 6, 2026 reanalysis uses the frozen Fashion-MNIST study's SPA
+predictions. That study used anchor-derived training coordinates
+(`training_coordinates="fit_transform"`) and fixed-basis NNLS query projections.
+Since version 0.3.0, the default `NMFClassifier` projects SPA training
+observations as well. The comparisons below retain the historical convention;
+they do not evaluate the later default. See the
+[coordinate migration](release-0.3.0.md#spa-training-coordinates-migration).
+
 All 21 historical evaluation receipts passed checksum, qualification, paired-ID and recomputed-metric checks. No models were refitted and no official-test images were accessed.
 
 The comparison uses 8,000 training rows, seed 43, and 2,000 development-validation images for each of three binary tasks. Every method uses KNN with its own historical training-CV-selected parameters.

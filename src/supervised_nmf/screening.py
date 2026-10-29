@@ -23,18 +23,21 @@ def _clear_fitted_attributes(estimator):
 def _nonnegative_array(X):
     X = check_array(X, accept_sparse=False, dtype=[np.float64, np.float32])
     if np.any(X < 0):
-        raise ValueError("X must contain nonnegative values; preprocessing must be fitted on training data.")
+        raise ValueError("Negative values in data. X must contain nonnegative values; preprocessing must be fitted on training data.")
     return X
 
 
 def _binary_data(X, y):
     X, y = check_X_y(X, y, accept_sparse=False, dtype=[np.float64, np.float32])
     if np.any(X < 0):
-        raise ValueError("X must contain nonnegative values.")
+        raise ValueError("Negative values in data. X must contain nonnegative values.")
     check_classification_targets(y)
     classes, counts = np.unique(y, return_counts=True)
     if classes.size != 2:
-        raise ValueError("Binary classification requires exactly two classes.")
+        raise ValueError(
+            "Only binary classification is supported. Binary classification requires exactly two classes; "
+            f"got {classes.size} {'class' if classes.size == 1 else 'classes'}."
+        )
     if np.any(counts < 2):
         raise ValueError("At least two training observations per class are required.")
     return X, y, classes, counts
@@ -62,6 +65,12 @@ def _percentile_support(scores, eligible, percentile):
 class BinaryScreening(TransformerMixin, BaseEstimator):
     """Fit a binary ANOVA/pooled-t feature screen on training observations.
 
+    This standalone transformer defaults to ``screening="percentile"`` with
+    ``percentile=10.0``. NMFClassifier defaults to absolute screening instead.
+    Set ``screening`` explicitly when choosing or tuning either policy:
+    ``percentile`` controls percentile mode and ``score_threshold`` controls
+    absolute mode. Changing either parameter does not switch the mode.
+
     ``percentile`` follows sklearn SelectPercentile rounding and deterministic
     index-order tie handling for finite nonconstant scores. Its denominator is
     the original feature count. Globally constant features are always excluded.
@@ -84,6 +93,12 @@ class BinaryScreening(TransformerMixin, BaseEstimator):
         self.screening = screening
         self.percentile = percentile
         self.score_threshold = score_threshold
+
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.input_tags.positive_only = True
+        tags.target_tags.required = True
+        return tags
 
     def fit(self, X, y):
         _clear_fitted_attributes(self)
@@ -192,7 +207,10 @@ class BinaryScreening(TransformerMixin, BaseEstimator):
         check_is_fitted(self, "support_")
         X = _nonnegative_array(X)
         if X.shape[1] != self.n_features_in_:
-            raise ValueError(f"X has {X.shape[1]} features; expected {self.n_features_in_}.")
+            raise ValueError(
+                f"X has {X.shape[1]} features, but {type(self).__name__} is expecting "
+                f"{self.n_features_in_} features as input."
+            )
         return X[:, self.support_]
 
     def get_support(self, indices=False):

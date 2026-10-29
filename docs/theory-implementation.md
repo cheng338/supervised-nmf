@@ -67,6 +67,66 @@ The package adapts this design to binary pooled-t scores, an inclusive boundary
 and a classification criterion. It does not reproduce that paper's quantitative
 response score or claim its results automatically transfer.
 
+## SPA anchor selection and screening false positives
+
+Supervised screening uses training labels; the subsequent feature-anchor SPA
+step uses only the retained matrix. Its geometric anchors need not be the
+features most informative about the label.
+
+For a nonzero nonnegative training column \(x\) with \(n\) observations, define
+\(\bar{x}=n^{-1}\sum_i x_i>0\),
+\(s_0^2=n^{-1}\sum_i(x_i-\bar{x})^2\), and
+\(\mathrm{CV}(x)=s_0/\bar{x}\). These are empirical moments with variance divisor
+\(n\). With `normalize=True`, the squared norm used for the first SPA selection is
+
+\[
+\left\|\frac{x}{\|x\|_1}\right\|_2^2
+=\frac{\sum_i x_i^2}{(n\bar{x})^2}
+=\frac{1+\mathrm{CV}(x)^2}{n}.
+\]
+
+Thus the first anchor maximizes empirical CV, subject to ties and floating-point
+effects. Zero columns remain zero and cannot supply an independent anchor.
+This identity does not rank all later anchors. In exact arithmetic, writing
+\(z_j=x_j/\|x_j\|_1\) and letting \(Q\) contain the previously selected orthonormal
+directions, the next squared residual norm is
+
+\[
+\|(I-QQ^\top)z_j\|_2^2
+=\frac{1+\mathrm{CV}(x_j)^2}{n}-\|Q^\top z_j\|_2^2.
+\]
+
+A high-CV column nearly in the selected span can lose to a lower-CV signal
+column. This uses uncentered orthogonal geometry, not Pearson correlation.
+Consequently, it is incorrect to infer that every background column must be
+selected before every signal column merely from their initial CV ordering.
+
+The original simulation combines clipped high-variance background columns with
+lower-variance class-shifted signal columns. Background features that survive
+screening can occupy the available anchors at small rank. Empirical CV ranges
+from particular draws are observations, not distribution-wide bounds on every
+finite sample. The [October 20 diagnostic](wang-simulation-validation.md#october-20-anchor-and-information-diagnostic)
+documents representation loss despite full signal retention, together with
+cases where rank expansion or coordinate scaling is insufficient.
+
+The retention theorem does not promise to exclude every irrelevant feature.
+Likewise, SPA's recovery guarantees concern geometric anchors under separability,
+rank and noise assumptions, not supervised feature importance. Retaining the
+generating support and recovering an anchor representation are distinct from
+preserving the class posterior. Zero anchors from the generating support also
+does not prove that projected coordinates carry no signal: the fitted basis
+uses all retained columns. In correlated settings, features outside the
+designated generating support can be useful for conditional prediction.
+
+The present implementation and defaults are unchanged. A different anchor rule
+would require separate methodological and empirical justification. Multiplying
+a column by a positive screening weight before L1 normalization cancels exactly:
+\(w_jx_j/\|w_jx_j\|_1=x_j/\|x_j\|_1\). Zero weights remove candidates instead.
+Restricting candidates, weighting after normalization or disabling normalization
+changes the selection geometry; the existing recovery guarantees do not transfer
+automatically. Stronger screening, higher rank or another solver likewise needs
+training-only evaluation and cost assessment rather than an assumed remedy.
+
 ## Comparing the solver-specific proof burden
 
 CD matches the dissertation's historical joint Frobenius reconstruction
@@ -91,15 +151,38 @@ assumptions of Theorem 7.4.4.
 
 The mathematical SPA prediction map comprises independent fixed-basis NNLS
 problems. Its original SciPy execution solved one observation at a time.
-The sklearn CD transform uses a shared stopping criterion across a query batch.
+The sklearn CD transform and default MU `mu_projection="batch"` use shared
+stopping criteria across a query batch, although their fixed-basis Frobenius
+objectives separate by observation. Batch MU checks relative improvement in the
+whole batch's reconstruction error every ten iterations. Its stopping iteration,
+coordinates and potentially predicted
+labels can therefore depend on which observations share the call. The package's
+MU numerical recovery paths preserve this stopping rule in batch mode. A tighter
+tolerance does not guarantee batch invariance. Disabling early stopping removes this
+particular dependence but does not guarantee convergence or bitwise agreement
+across batch shapes.
+
+Optional `mu_projection="rowwise"` assigns each observation its own initializer
+and stopping decision. It retains the fixed-basis unregularized Frobenius
+objective, uses float64 working arithmetic for ordinary projection, and retains
+guarded per-observation recovery for numerical-range failures. This removes the
+shared stopping mechanism; finite precision, matrix-kernel shapes and iteration
+limits still require an approximation argument. It does not establish bitwise
+pointwise execution, an independently certified objective gap or convergence.
+The fitted policy is explicit and preserved with the model rather than chosen
+from incoming batch composition.
+
 A deterministic synthetic probe
 in the tested environment found a maximum batch-versus-single-row CD coefficient
 difference of `2.2843480110168457e-05`, with **no changed labels or probabilities**;
 SPA coefficients were identical in that probe. All fits and transforms qualified.
-This is a finite-tolerance implementation detail, not a refutation of the four
-proofs or evidence of an observed classification error. A strict pointwise CD
-theory-to-code statement should account for its numerical/batch context, or
-specify pointwise encoding. The package retains the original CD implementation.
+Those observations concern CD and SPA in that saved probe; they do not establish
+MU's sensitivity or exclude label changes in other settings. Batch coupling is
+a finite-tolerance implementation issue, not by itself a refutation of the four
+proofs. A strict pointwise CD or MU theory-to-code statement should account for
+its numerical/batch context, or specify pointwise encoding. CD and default MU
+retain the shared stopping criteria; the optional rowwise MU map also needs its
+numerical approximation specified.
 The same batch coupling needs attention before using an independent-residual
 Hoeffding bound unchanged. The current guarded batched SPA execution preserves
 independent NNLS objectives, but its kernel shape and acceleration/fallback
@@ -129,7 +212,10 @@ all classifier observations use the same fixed-basis map, and smoothness/local-m
 conditions hold. Its consistency conclusion also requires an appropriate growing
 neighbor count. The current SPA classifier default uses fixed-basis projection
 for both training and query coordinates; CD/MU defaults retain their fitted
-training coordinates. Older SPA models and generic `FeatureSPA` pipelines may
+training coordinates. To apply the rowwise MU policy to both sets of coordinates,
+select `mu_projection="rowwise"` and `training_coordinates="transform"` together.
+Selecting rowwise prediction alone does not change MU's default training map.
+Older SPA models and generic `FeatureSPA` pipelines may
 retain anchor-derived training coordinates. The classifier still reuses
 observations across fitting stages and tunes finite neighbor counts. A common
 coordinate map by itself does not make the sample-split corollary apply, nor is

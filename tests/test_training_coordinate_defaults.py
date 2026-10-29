@@ -148,11 +148,12 @@ class TrainingCoordinateDefaultTests(unittest.TestCase):
         model = self.model().fit(self.X, self.y)
         original_coordinates = model.training_coordinates_.copy()
         original_scores = model.predict_proba(self.query)
+        fitted_solver = model.decomposition_.projection_solver
         model.set_params(training_coordinates="fit_transform", projection_solver="scipy")
         np.testing.assert_array_equal(model.training_coordinates_, original_coordinates)
         np.testing.assert_allclose(model.predict_proba(self.query), original_scores)
         self.assertEqual(model.training_coordinates_mode_, "transform")
-        self.assertEqual(model.decomposition_.projection_solver, "scipy")
+        self.assertEqual(model.decomposition_.projection_solver, fitted_solver)
         model.fit(self.X, self.y)
         self.assertEqual(model.training_coordinates_mode_, "fit_transform")
         np.testing.assert_array_equal(model.training_coordinates_, model.decomposition_.fit_coordinates_)

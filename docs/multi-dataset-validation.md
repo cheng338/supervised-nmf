@@ -7,6 +7,13 @@ commands refer to the retained local study workspace.
 
 Author: Chang Cheng. Study preparation date: October 6, 2026.
 
+The frozen study used anchor-derived training coordinates
+(`training_coordinates="fit_transform"`) for screened and unscreened SPA,
+with fixed-basis NNLS projections for queries. Since version 0.3.0, the default
+`NMFClassifier` projects SPA training observations as well. The results and
+timings reported here refer to the October 6 procedure. See the
+[coordinate migration](release-0.3.0.md#spa-training-coordinates-migration).
+
 Status: **completed and independently audited**, with all 35 final evaluations
 qualified. See the [accuracy and timing tables](multi-dataset-results.md).
 No new model accuracy was used to select these datasets. The expansion fixes five datasets
@@ -40,7 +47,8 @@ source but has only ten expressers; FEI supplies substantially more subjects.
 
 The seven methods are screened SPA-NMF, screened CD-NMF, screened PCA,
 screening-only KNN, raw KNN, unscreened SPA-NMF and unscreened CD-NMF. Each
-factorized representation is followed by KNN. The package defaults are unchanged.
+factorized representation is followed by KNN. The study did not change the
+package defaults in force at its source freeze.
 
 ## Splits and tuning
 
@@ -55,6 +63,12 @@ CMU has 434 training images from 14 people and 190 reserved images from six
 people; FEI has 280 training images from 140 people and 120 reserved images
 from 60 people. The two source-native FEI size exceptions, `5a.jpg` and
 `158a.jpg`, receive the same fixed 32 by 44 resize; no images are dropped.
+
+The October 28 [CMU uncertainty sensitivity](multi-dataset-results.md#cmu-uncertainty-sensitivity)
+reanalyses the saved predictions from these six reserved subjects. It preserves
+the frozen protocol and historical intervals, adds subject-influence and
+alternative-interval summaries, and qualifies their nominal coverage. It does
+not add independent subjects or measure retraining uncertainty.
 
 The independent data audit reconstructs all 1,024 source images and 1,162,240
 prepared feature values exactly, with 11,557 assertions and zero discrepancies.

@@ -30,7 +30,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_X_y
 from threadpoolctl import threadpool_info, threadpool_limits
 
-from .classifier import NMFClassifier
+from .classifier import NMFClassifier, _capture_projection
 from ._neighbors import _KNNQueryReuse
 from .screening import BinaryScreening
 from .validation import build_cv_folds, validate_metadata
@@ -259,6 +259,7 @@ class _ScreeningCache:
 def _run_representation_fold(estimator, kind, neighbor_parameter, representation_parameters,
                              neighbors, X, y, train, validation, record, *, screening_cache=None):
     fitted = None
+    projection = None
     caught = []
     record.update(representation_fit_seconds=0.0, projection_seconds=0.0,
                   representation_fit_performed=False, neighbors={},
@@ -304,7 +305,8 @@ def _run_representation_fold(estimator, kind, neighbor_parameter, representation
                 failure_stage = "projection"
                 start = time.perf_counter()
                 try:
-                    validation_coordinates = _validation_representation(fitted, kind, X[validation])
+                    with _capture_projection(fitted) as projection:
+                        validation_coordinates = _validation_representation(fitted, kind, X[validation])
                 finally:
                     record["projection_seconds"] = time.perf_counter() - start
                 if not _finite(training_coordinates) or not _finite(validation_coordinates):
@@ -312,7 +314,7 @@ def _run_representation_fold(estimator, kind, neighbor_parameter, representation
                 record["training_representation_dtype"] = str(training_coordinates.dtype)
                 record["validation_representation_dtype"] = str(validation_coordinates.dtype)
                 record["representation_shape"] = list(training_coordinates.shape)
-                record["status"] = "nonconverged" if _nonconverged(fitted, caught) else "valid"
+                record["status"] = "nonconverged" if _nonconverged(fitted, caught, projection) else "valid"
             except Exception as error:
                 record.update(status="failed", error_type=type(error).__name__, error=str(error),
                               failure_stage=locals().get("failure_stage", "configuration"),
@@ -320,7 +322,7 @@ def _run_representation_fold(estimator, kind, neighbor_parameter, representation
     finally:
         record["warnings"] = _warning_records(caught)
         if fitted is not None:
-            record["diagnostics"] = _diagnostics(fitted)
+            record["diagnostics"] = _diagnostics(fitted, projection)
     if record["status"] != "valid":
         return
     models, fit_warnings = {}, {}

@@ -13,6 +13,13 @@ screening alone. In the prespecified weak and sparse additive examples, SPA was
 less accurate than screened PCA. The XOR oracle nearly solved a problem on
 which all tested marginal-screening pipelines remained near chance.
 
+These October 6, 2026 results use SPA's anchor-derived training coordinates
+(`training_coordinates="fit_transform"`) and fixed-basis NNLS query projections.
+The default `NMFClassifier` has projected SPA training observations too since
+version 0.3.0. The results and timings below retain the frozen study convention;
+they do not measure that later default. See the
+[coordinate migration](release-0.3.0.md#spa-training-coordinates-migration).
+
 The authoritative run is `runs/wang-simulations-blas-20261006`, using the BLAS
 implementation verified before this study. The protocol and source snapshot
 were frozen before its data were generated. The independent record audit
@@ -110,14 +117,16 @@ co-occurrence is not a controlled causal diagnosis of which stage caused the
 loss. No scientific result was replaced or retuned to repair these outcomes;
 all are included in the reported means and intervals. The saved
 diagnostic records (retained locally: `../runs/wang-simulations-blas-20261006/strong_display_diagnostics.json`)
-make the ranges and low-score cases reviewable.
+make the ranges and low-score cases reviewable. A later
+[October 20 mechanism diagnostic](#october-20-anchor-and-information-diagnostic)
+separates several contributing effects without replacing these historical results.
 
 A separately requested **exploratory numerical equivalence check** subsequently
 refitted the seven already-selected low-score SPA configurations (six draws)
-once with the current implementation and once with the saved pre-BLAS
-implementation. All 14 fits used the exact original parameters and seeds; there
-was no CV or new parameter search. Anchors, basis, training coordinates, fixed-
-basis training/test projections, labels and probabilities matched **bitwise**
+once with the study's recorded BLAS implementation and once with the saved
+pre-BLAS implementation. All 14 fits used the exact original parameters and
+seeds; there was no CV or new parameter search. Anchors, basis, training
+coordinates, fixed-basis training/test projections, labels and probabilities matched **bitwise**
 between implementations, and the predictions matched the original scientific
 records. No warnings occurred. This rules out a BLAS-induced difference for
 these checked fits; it does not establish a universal numerical guarantee or
@@ -133,6 +142,105 @@ is present in the interaction case, but the tested marginal-screening pipelines
 do not recover useful classification. The oracle uses information unavailable
 to a practical feature-selection method and is a diagnostic, not a deployable
 competitor. No theorem of universal consistency follows from these data.
+
+## October 20 anchor and information diagnostic
+
+This separate retrospective investigation completed **72 task outputs** across
+nine previously evaluated cohorts: six historical draws covering all seven
+original low-performing SPA configurations, plus three already inspected
+strong, moderate and sparse follow-up draws. Each cohort retained its original
+160 training observations, 480 test observations and 320 features. Data
+fingerprints matched the saved records. This is mechanism evidence on selected
+cases, not a new independent confirmation sample or a population success rate.
+
+Eight arms compared screened raw features; original-rank SPA with anchor-derived
+or projected training coordinates; projected SPA at twice and four times the
+original rank; centered PCA at the original rank; a generating-support oracle;
+and a selected-background-only control. Ordinary arms shared the same fold-local
+screening masks. The oracle used known generating support, and the background
+control restricted the selected mask to features outside that support. Neither
+control is a deployable feature-selection procedure.
+
+Screening cutoffs and representation ranks were fixed by this diagnostic, not
+chosen from its test outcomes. Five-fold training CV separately selected K or C
+for KNN, logistic regression and linear SVM, each with unscaled and
+training-fitted SD-scaled coordinates. Every learned screen, representation and
+scaler was fitted within its training fold. The K grid was
+`{1, 3, 5, 9, 15, 25, 41}` and the C grid `{0.01, 1, 100}`. These finite choices
+do not establish fully tuned pipelines. Earlier fixed-parameter reproductions
+remain separate from this independently retuned diagnostic.
+
+**426 of 432 planned final classifier configurations qualified.** In historical
+replication 24, the background-only arm had no selected features in three CV
+folds, leaving its six final head/scaling choices unavailable. The full-training
+mask having two background features did not justify bypassing failed CV. No
+fallback, changed cutoff or zero-score replacement was used. The records retain
+357/360 qualified CV representation attempts and 1,846/1,872 qualified
+five-fold classifier candidates. Of the 426 selected qualified heads, 230 were
+at grid endpoints. Completed task outputs do not imply every candidate qualified.
+
+The table includes all nine diagnostic cohorts for **SD-scaled KNN**, using
+projected SPA training and query coordinates. Entries are saved **test accuracy
+(%)**; the three SPA columns give the fixed original, doubled and quadrupled
+ranks. The anchor counts are the number belonging to the known generating
+support at those three ranks. Each arm selected its own K. SD scaling is an
+explicit classifier option, not the package default.
+
+| Cohort; SPA ranks | Signal anchors | SPA original | SPA doubled | SPA quadrupled | Screened raw | Same-rank PCA | Support oracle | Background control |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Historical 8; 4/8/16 | 0/2/10 | 56.667 | 98.542 | 100.000 | 100.000 | 53.958 | 100.000 | 47.917 |
+| Historical 11; 2/4/8 | 0/2/6 | 78.542 | 100.000 | 100.000 | 100.000 | 78.750 | 100.000 | 48.750 |
+| Historical 12; 4/8/16 | 1/5/13 | 98.958 | 100.000 | 100.000 | 100.000 | 99.792 | 100.000 | 51.042 |
+| Historical 15; 4/8/16 | 2/6/14 | 100.000 | 100.000 | 100.000 | 100.000 | 99.583 | 100.000 | 50.833 |
+| Historical 24; 2/4/8 | 0/2/6 | 76.875 | 100.000 | 100.000 | 100.000 | 74.583 | 100.000 | Unavailable |
+| Historical 25; 4/8/16 | 2/6/14 | 99.167 | 100.000 | 100.000 | 100.000 | 98.958 | 100.000 | 47.708 |
+| Follow-up strong; 4/8/16 | 0/4/12 | 73.125 | 100.000 | 100.000 | 100.000 | 61.667 | 100.000 | 49.167 |
+| Follow-up moderate; 4/8/16 | 0/0/5 | 51.875 | 51.250 | 86.458 | 96.458 | 48.750 | 97.083 | 52.292 |
+| Follow-up sparse; 2/4/8 | 0/0/0 | 50.000 | 49.167 | 47.083 | 79.167 | 50.625 | 90.625 | 50.208 |
+
+Historical replication 8 retained all 16 signal features and six background
+features, yet selected four background anchors at rank 4. Projecting both
+training and query observations did not resolve the low accuracy. With
+**unscaled KNN**, projected SPA obtained **57.500%, 62.292% and 81.250%** at
+ranks 4, 8 and 16, versus **88.542%** for screened raw features. At rank 4,
+anchor-derived training coordinates gave **47.292%** for unscaled KNN and
+**45.625%** for SD-scaled KNN. The improved SD-scaled results at higher rank
+therefore cannot be described as the effect of rank alone on the default KNN.
+At projected rank 8, logistic regression and linear SVM reached 100%; at
+projected rank 4 they remained near 62%.
+
+The adverse follow-up cohorts limit generalization. The moderate case retained
+all 16 signal features plus 11 backgrounds, but doubling rank still selected
+only background anchors and left accuracy near chance. The sparse case retained
+all four signal features plus 15 backgrounds; ranks 2, 4 and 8 all selected only
+background anchors and remained near chance. Screened raw and oracle controls
+retained useful predictive information. The untested higher ranks have no result,
+and increasing rank indefinitely is not an established solution. Same-rank PCA
+also performed poorly in these examples, so changing to PCA is not an automatic
+repair.
+
+These controls support low-rank representation loss and scale-sensitive KNN
+geometry as contributing mechanisms. They do not isolate a unique causal effect
+of coefficient of variation or signal-anchor membership: rank also changes
+dimension and geometry, and classifier parameters were selected separately.
+Zero signal anchors does not imply zero signal in the projected coordinates,
+whose fitted basis uses all selected features. The oracle/background distinction
+uses simulation knowledge unavailable for real data. The simulation does not
+establish separability or posterior sufficiency for CelebA.
+
+The [anchor-selection analysis](theory-implementation.md#spa-anchor-selection-and-screening-false-positives)
+explains why normalized SPA can prefer background columns with high CV. No
+solver, screening, rank or classifier default was changed by this diagnostic.
+Its timings came from concurrent execution and are not adoption-speed benchmarks.
+Any proposed remedy still needs a separate method rationale and validation on
+ordinary cases, these historical triggers and independent new draws.
+
+The source-bound protocol, complete per-arm/head/scaling tables and original
+receipts are retained locally under `output/reassessment-20261020/` as
+`ANCHOR-INFORMATION-PROTOCOL.txt`, `ANCHOR-INFORMATION-READOUT.txt`,
+`ANCHOR-INFORMATION-TABLES.txt` and `face-anchor-saved-analysis.json`, with the
+associated batch receipts. This summary was added from those existing records;
+the historical study results were not modified or rerun.
 
 ## Generating-support results
 
@@ -217,7 +325,7 @@ All transformations, screening and classifier parameters are fitted within
 each training CV fold. The selected full-training fit precedes test generation
 and evaluation. Logistic regression standardizes its representation using
 training-only moments; KNN retains the package's unscaled Euclidean geometry.
-SPA and CD retain the package's `fit_transform` training-coordinate convention.
+SPA and CD used the frozen study's `fit_transform` training-coordinate convention.
 Each full method tunes its own screening cutoff/rank/classifier parameters;
 comparisons assess the pipelines and are not a common-mask causal ablation of
 factorization alone. Candidates failing any fold or emitting convergence

@@ -7,6 +7,14 @@ commands refer to the retained local study workspace.
 
 Author: Chang Cheng. Development validation, October 2026.
 
+The October 5–6, 2026 SPA classification results use their frozen study sources:
+anchor-derived training coordinates (`training_coordinates="fit_transform"`)
+and fixed-basis NNLS projections for queries. Since version 0.3.0, the default
+`NMFClassifier` projects SPA training observations as well. The accuracy and
+timing results here describe the recorded procedures, rather than a rerun of
+that later default. See the
+[coordinate migration](release-0.3.0.md#spa-training-coordinates-migration).
+
 **Completed and independently audited: 900 simulation draws and 780 CelebA
 evaluations, with zero final-fit failures or audit discrepancies.** The
 evidence supports a classifier-dependent contribution, not a general NMF
@@ -105,10 +113,17 @@ and can extend outside the metric's [0,1] range.
 
 A separately labelled numerical check refitted seven already-selected
 low-score SPA configurations with their exact frozen parameters using both
-the pre-BLAS reference and current implementation. All anchors, factors,
-coordinates, labels and probabilities were bitwise identical and matched the
-saved study predictions. This rules out the BLAS change as the explanation
-for those cases; it is not additional tuning or a replacement result.
+the pre-BLAS reference and the study's recorded BLAS implementation. All
+anchors, factors, coordinates, labels and probabilities were bitwise identical
+and matched the saved study predictions. This rules out the BLAS change as the
+explanation for those cases; it is not additional tuning or a replacement result.
+
+The later [October 20 anchor and information diagnostic](wang-simulation-validation.md#october-20-anchor-and-information-diagnostic)
+examined all seven original low-score triggers and three already inspected
+follow-up cohorts. Its controls implicate low-rank representation loss and
+coordinate scaling, while retaining cases where rank expansion does not repair
+prediction. This retrospective evidence supplements the explanation; it does
+not replace the October 6 results or establish a universal remedy.
 
 ### CelebA: ten independently retuned training samples
 

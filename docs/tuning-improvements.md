@@ -29,7 +29,7 @@ from supervised_nmf import NMFClassifier
 from supervised_nmf.search import calibration_rank_search
 
 report = calibration_rank_search(
-    NMFClassifier(random_state=42),
+    NMFClassifier(screening="absolute", random_state=42),
     {"n_components": [2, 5, 10, 20],
      "score_threshold": [0.0, 2.0, 4.0],
      "n_neighbors": [3, 5, 9]},

@@ -1,9 +1,10 @@
 # API reference
 
-This page describes version 0.3.3. Optional QR projection and MU numerical
-recovery are new in this version. Optional KNN SD scaling and the linear-SVM
-head were introduced in 0.3.0. Historical release and validation records retain
-their original scope.
+This page describes the current development source. The optional MU
+per-observation projection policy is not part of release 0.3.3. That release
+introduced optional QR projection and MU numerical recovery. Optional KNN SD
+scaling and the linear-SVM head were introduced in 0.3.0. Historical release
+and validation records retain their original scope.
 
 ## Classifier
 
@@ -32,6 +33,7 @@ classifier = NMFClassifier(
     tol=1e-4,
     random_state=42,
     training_coordinates="auto",  # SPA: transform; CD/MU: fit_transform
+    mu_projection="batch",      # MU only: "batch" or "rowwise"
     projection_solver="auto",   # SPA only: "auto", "scipy", "batched", or "qr"
     projection_workers=1,        # maximum process count for large queries
     projection_batch_size=256,
@@ -145,6 +147,88 @@ pipeline named `scale`/`knn` for SD KNN, a pipeline named `scale`/`logistic` for
 logistic regression, or a bare `LinearSVC` for SVM. `knn_normalization_` records
 the fitted KNN metric and is `None` for other heads.
 
+### Prediction dtype
+
+CD and MU preserve float32 training inputs and fitted bases. At prediction,
+matching query and basis dtypes retain that output dtype. CD and the default MU
+batch policy keep their existing projection calculation; MU's optional rowwise
+policy uses float64 working arithmetic with guarded numerical recovery.
+If one is float32 and the other float64, projection uses float64 and returns
+float64 coordinates. Python lists and integer arrays are validated as float64.
+Widening preserves the stored values of both arrays; it avoids rounding tiny
+positive queries to zero or overflowing large queries by converting to float32.
+A widened basis belongs to a temporary estimator, so the fitted basis, training
+coordinates and learned classifier parameters are unchanged. Input validation
+still covers every feature before screening.
+
+Mixed-dtype projection can cost more than float32 projection and can produce
+different coordinates or predictions from an explicitly downcast query.
+It retains the fitted solver, objective and stopping settings; it does not
+guarantee numerical success for every extreme input. SPA retains its existing
+float64 projection behavior.
+
+### Prediction batches
+
+The fixed-basis Frobenius objective separates by observation, but CD and the
+default MU policy, `mu_projection="batch"`, use stopping criteria shared across
+the query batch. Batch MU checks the relative improvement in the whole batch's
+reconstruction error every ten iterations.
+Changing the other observations in a call can change the stopping iteration
+and therefore an observation's coordinates and, near a classifier boundary,
+its predicted label. This is dependence on batch composition, not random
+variation between otherwise identical calls. In batch mode, MU's numerical
+recovery paths retain the shared stopping rule.
+
+For MU predictions that may arrive individually or in changing batches, choose
+`mu_projection="rowwise"`. Each observation receives its own initializer and
+relative-error stopping decision, checked every ten iterations. This retains
+the fixed-basis unregularized Frobenius objective and the fitted basis while
+changing the numerical projection policy. Float64 working arithmetic reduces
+the sensitivity of stopping decisions to float32 rounding. Range guards retain
+the existing handling of exact zeros, tiny inputs and extreme values, including
+per-observation recovery when needed. The output dtype follows the rules above.
+
+The policy is explicit, never selected automatically from a query batch. It is
+recorded at fit time as `mu_projection_` and preserved by saving/loading the
+model. Changing `mu_projection` with `set_params` takes effect on the next fit.
+Legacy fitted MU models retain `"batch"`. For CD and SPA, `mu_projection_` is
+`None`; requesting `"rowwise"` with either solver raises an error at fit time.
+
+To use the same fixed-basis projection for classifier training and prediction,
+select both settings explicitly:
+
+```python
+model = NMFClassifier(
+    solver="mu",
+    mu_projection="rowwise",
+    training_coordinates="transform",
+    random_state=42,
+).fit(X_train, y_train)
+
+print(model.mu_projection_)             # "rowwise"
+print(model.training_coordinates_mode_)  # "transform"
+predictions = model.predict(X_new)
+```
+
+`training_coordinates="auto"` still retains MU's joint-fit training coordinates,
+including when rowwise prediction is selected. Reprojection adds fitting work
+and can change classifier predictions. The rowwise policy can also cost several
+times more projection time on ordinary workloads; the cost depends on the data
+and recovery path. Use batch mode to reproduce the existing convention or when
+its throughput benefit is appropriate and batch sensitivity is acceptable.
+
+Rowwise projection removes the shared stopping decision, but does not guarantee
+bitwise agreement across batch shapes, convergence at the iteration cap, or
+better classification accuracy. Matrix-kernel rounding can still differ.
+
+A smaller `tol` may reduce these differences but does not guarantee identical
+results across batch sizes. `tol=0` disables early stopping and uses the
+iteration cap; it does not certify convergence or bitwise batch invariance.
+Both settings also apply to factorization. Keep prediction batch construction
+in reproducibility records. See the
+[theory and implementation discussion](theory-implementation.md) for the
+distinction between the mathematical projection and its numerical execution.
+
 ### Fit diagnostics
 
 `fit_times_`, `n_iter_`, `converged_`, and `convergence_warnings_` expose fit
@@ -154,8 +238,8 @@ diagnostics. `n_iter_` remains the factorization iteration count.
 `classifier_n_iter_` is `None` for KNN. The overall convergence flag and warning
 list include factorization, any training reprojection and classifier fitting.
 Classifier fit timing includes scaler fitting for SD KNN or logistic regression.
-`last_transform_converged_` and `last_transform_warnings_` concern
-the most recent transform.
+Prediction diagnostics are recorded per call in evaluation reports, as described
+under [prediction state and diagnostics](#prediction-state-and-diagnostics).
 
 For MU, an entirely zero matrix after fitted feature selection has the exact
 fixed-basis solution of zero coordinates. The package returns that solution
@@ -165,29 +249,41 @@ including to discarded columns. This shortcut applies only to exact zeros.
 The fitted classifier then predicts from those coordinates using its existing
 scaler and decision rule.
 
-Ordinary inputs retain the scikit-learn calculation. For float32 queries,
-tiny fitted basis entries or a floating-point failure first trigger a retry
+With `mu_projection="batch"`, ordinary inputs retain the scikit-learn calculation.
+For float32 queries, tiny fitted basis entries or a floating-point failure first trigger a retry
 with float64 copies of the query and basis on a temporary estimator. Internal
 underflow remains an error; only final output rounding allows underflow.
 The fitted estimator and its arrays are not changed by this retry.
 
+For float64 queries with tiny positive basis entries, a bounded retry scales
+the basis by a power of two and the query by its square, then restores the
+coordinates. This coupled scaling preserves the uniform initializer and the
+relative-error stopping rule in exact arithmetic. It requires reversible
+scaling, conservative exponent bounds and valid positive products. These checks
+do not guarantee every subsequent floating-point operation; a numerical failure
+returns to logarithmic recovery. The retry uses a temporary estimator without
+changing the fitted basis or adding a public setting.
+
 Positive query entries below the square root of the input dtype's smallest
-normal value use logarithmic arithmetic directly. Tiny positive basis entries
-in float64, float64 arithmetic failures and failed float64 retries also use
-the logarithmic calculation. This preserves
-tiny input contributions without forcing ordinary float32 images into the
-more expensive path solely because their learned basis has tiny tails.
-Both recovery paths retain the MU update equations, uniform initialization and
-relative-error stopping rule. They preserve the fitted basis and return the
-input dtype; the widened path converts back only after solving. Nonzero inputs
-are not replaced with zeros; a coordinate below the output dtype's representable
+normal value use logarithmic arithmetic directly. Float64 problems outside the
+scaling bounds, ordinary float64 arithmetic failures and failed retries also
+use the logarithmic calculation. This preserves tiny input contributions while
+avoiding the more expensive path for qualified problems with tiny basis tails.
+The recovery paths retain the MU update equations, uniform initialization and
+relative-error stopping rule for the observations supplied to the recovery call.
+Rowwise mode invokes this recovery separately for affected observations. The
+paths preserve the fitted basis and return the projection dtype described above;
+the float32 recovery path converts back only after solving. Nonzero inputs are
+not replaced with zeros; a coordinate below the output dtype's representable
 range can still round to zero. Unrepresentably large coordinates raise an error.
 In the recovery paths, the rank-one closed-form first MU update supplies the
 final coordinates; subnormal outputs use exact input ratios to resolve
 round-to-nearest ties.
 Recovery can cost more time and can change rounding and stopping iterations
 relative to the ordinary calculation. An exhausted positive-tolerance iteration
-cap still emits a convergence warning.
+cap still emits a convergence warning. Each retry keeps the configured cap and
+tolerance; a failed attempt followed by recovery can do more total work than a
+single attempt.
 An explicit training reprojection uses the same correction as prediction;
 joint factorization and the training-coordinate policy remain unchanged.
 
@@ -195,11 +291,9 @@ For a stage that returns successfully, its convergence flag records the absence
 of a captured scikit-learn `ConvergenceWarning`. Other warning categories do not
 determine that flag. A skipped training projection has
 `training_projection_performed_=False` and `training_projection_converged_=None`.
-For an already fitted estimator, a failed transform raises its error, sets
-`last_transform_converged_=False` and records `last_transform_error_`; it does not
-change the preceding fit's `converged_`. Warnings emitted before a solver
-failure are forwarded, but may only be available to an external warning
-collector because the operation did not return its diagnostics.
+A failed transform raises its error without changing the preceding fit's
+`converged_`. Warnings emitted before a solver failure are forwarded;
+`evaluate_classifier` retains them together with the failure in its call record.
 
 These flags do not independently verify stationarity, KKT conditions, global
 optimality, statistical consistency or agreement across environments. CD and MU
@@ -209,6 +303,52 @@ Identical `tol` values or iteration counts therefore do not imply equal numerica
 accuracy. See [numerical reproducibility](compatibility.md#cdmu-numerical-reproducibility)
 for input precision and runtime considerations.
 
+### Prediction state and diagnostics
+
+In current source, standard `NMFClassifier` prediction preserves learned arrays
+and package-owned fitted state. Projection uses a shallow local decomposition
+object for execution settings and temporary bookkeeping; it shares the learned
+basis rather than copying it. Existing dtype recovery still makes numerical
+copies when needed. Changes to projection execution controls between calls take
+effect without updating the stored decomposition during prediction.
+
+The `last_transform_converged_`, `last_transform_warnings_`,
+`last_transform_error_` and `last_transform_seconds_` estimator attributes used
+by version 0.3.3 are no longer created or updated. For labeled evaluation, read
+the corresponding fields from that call's report instead:
+
+```python
+from supervised_nmf.evaluation import evaluate_classifier
+
+report = evaluate_classifier(model, X_validation, y_validation)
+diagnostics = report["diagnostics"]
+print(diagnostics["last_transform_converged"])
+print(diagnostics["last_transform_error"])
+print(diagnostics["last_transform_seconds"])
+```
+
+The report retains `last_transform_warnings` and adds
+`last_transform_performed`. When projection was not attempted, the latter is
+`False` and `last_transform_converged` is `None`; a fit-only report must not
+reuse an earlier prediction's status. Projection failure is distinct from a
+classifier failure after successful projection. Calibration and shared
+representation study reports use the same call-local convention.
+
+Older serialized models may still contain `last_transform_*` attributes.
+Prediction leaves those historical values untouched, and standard evaluation
+ignores them when reporting a new call. Do not use them to infer that call's
+convergence. Custom estimators with their own diagnostic contract retain their
+existing handling. Direct prediction methods keep their usual return values,
+warning forwarding and exception behavior.
+
+This state contract does not make simultaneous calls in one process generally
+thread-safe. Warning capture and some native thread-limit controls can interfere
+across threads. Use process workers with a per-worker numerical-thread budget
+for concurrent evaluations that require reliable warning and convergence
+records. Do not refit or change parameters while another call is running.
+Third-party KNN query counters may change during prediction even though learned
+parameters do not; byte-identical serialization after prediction is not promised.
+
 ### Training coordinates
 
 Version 0.3.0 defaults to `training_coordinates="auto"`.
@@ -217,7 +357,9 @@ For SPA, this resolves to `"transform"`: after fitting the nonnegative basis,
 the classifier re-encodes its training observations by fixed-basis NNLS.
 Training and prediction therefore use the same fitted basis and projection map.
 For CD and MU, `"auto"` resolves to `"fit_transform"`, retaining the coordinates
-returned by factorization.
+returned by factorization. Selecting `mu_projection="rowwise"` does not alter
+this resolution. For a common MU training/query projection policy, also select
+`training_coordinates="transform"`.
 
 An explicit `"transform"` re-encodes training observations for any solver.
 An explicit `"fit_transform"` retains the previous convention, including SPA's
@@ -229,6 +371,53 @@ comparing fits or reproducing historical results.
 
 `reconstruction_err_` refers to the classifier's actual training coordinates;
 `factorization_reconstruction_err_` preserves the initial factorization diagnostic.
+
+### Fitting and transforming together
+
+`NMFClassifier.fit_transform(X, y)` fits the complete supervised classifier,
+including screening, factorization and the classification head, then returns
+`transform(X)`. Labels are required. The returned array contains projected,
+unscaled NMF coordinates; it can differ from `training_coordinates_` when the
+head was trained on factorization or anchor coordinates.
+
+The `fit_transform` method and the `training_coordinates="fit_transform"`
+parameter have different roles: the method returns projections after fitting,
+while the parameter selects the coordinates used to train the head. Calling
+the method preserves that policy and adds a projection after `fit`; this
+additional projection is outside the recorded fit time. Use `fit(X, y)` when
+only a fitted classifier is needed.
+
+## Scikit-learn metadata
+
+The estimators declare their input requirements through scikit-learn's public
+tag interface:
+
+| Estimator | Input requirement | Target requirement |
+| --- | --- | --- |
+| `NMFClassifier` | Nonnegative features | Required, binary labels |
+| `FeatureSPA` | Nonnegative features | Optional; labels are ignored |
+| `BinaryScreening` | Nonnegative features | Required; binary labels are validated during fitting |
+
+`NMFClassifier` retains both classifier and transformer capabilities.
+`BinaryScreening` remains a supervised feature transformer, without classifier
+tags or prediction methods. Scikit-learn has no general binary-only target tag
+for transformers, so callers must still supply valid binary labels. A pipeline's
+final classifier tags do not summarize restrictions imposed by earlier steps.
+
+These declarations describe existing requirements. Runtime validation also
+checks finiteness, dimensions, class sample counts and usable training features.
+Tags do not replace these checks or change fitting, projection or prediction.
+
+`NMFClassifier` and `BinaryScreening` require exactly two classes, with at least
+two training observations per class. After array and shape validation, negative
+feature values are rejected before target-type and class-count checks. When
+negative features and multiclass labels occur together, the negative-input
+error takes precedence. Generic scikit-learn checks can supply this combination
+while expecting a target error; multiclass rejection is tested separately with
+nonnegative features.
+
+The tags do not imply that every generic estimator check passes; the standalone
+SPA coordinate convention below still applies.
 
 ## Screening and SPA separately
 
@@ -332,7 +521,8 @@ pool or cached fitted basis is serialized with an estimator. First use pays
 startup cost, and joblib retires idle workers. `projection_native_threads=1`
 limits numerical threads per projection process and restores previous limits
 afterward. The controller discovers NumPy/SciPy libraries at first projection.
-Thread limits are process-wide; use process workers for concurrent work.
+Some native thread-limit controls affect shared process state; use process
+workers for concurrent work.
 QR admission applies separately inside each worker and scaling group. A worker
 chunk or final chunk with fewer than 32 rows can therefore use the current
 solver even when the full query batch is large. Splitting a query also repeats
@@ -372,6 +562,41 @@ They do not revise saved study results or establish an accuracy improvement.
 
 ### Screening and anchor details
 
+The two estimators retain their existing screening defaults:
+
+| Estimator | Default screening | Active selection parameter |
+| --- | --- | --- |
+| `NMFClassifier()` | `"absolute"` | `score_threshold=2.0`, an inclusive cutoff on the absolute pooled-t score |
+| `BinaryScreening()` | `"percentile"` | `percentile=10.0`, using the percentile and tie rules below |
+
+Set the mode explicitly when composing a standalone screen:
+
+```python
+from supervised_nmf import BinaryScreening
+
+percentile_screen = BinaryScreening(screening="percentile", percentile=10.0)
+absolute_screen = BinaryScreening(screening="absolute", score_threshold=2.0)
+```
+
+Changing `percentile` or `score_threshold`, including through `set_params` or
+a parameter grid, does not switch `screening`. Both values must be valid, but
+only the parameter for the selected mode affects feature selection. For example,
+`BinaryScreening(score_threshold=3.0)` still uses percentile screening.
+
+For a classifier pipeline with a screening step named `screen`, compare modes
+with separate grid dictionaries so that each parameter is active:
+
+```python
+screening_grid = [
+    {"screen__screening": ["percentile"], "screen__percentile": [5.0, 10.0, 25.0]},
+    {"screen__screening": ["absolute"], "screen__score_threshold": [1.0, 2.0, 3.0]},
+]
+```
+
+Pass the complete pipeline and grid to the search so screening is fitted inside
+each training fold. Neither mode guarantees that any features survive or that
+enough remain for a requested factorization rank.
+
 `BinaryScreening` is a sklearn transformer with `fit`, `transform`, and
 `get_support`. It exposes signed `t_scores_`, squared `scores_`, selected indices,
 class counts and constant/infinite-score counts. In version 0.3.0,
@@ -389,19 +614,70 @@ denominator and follows deterministic feature-index tie breaking. Degenerate
 features and empty selection are explicit; near-zero variance is not silently
 regularized.
 
+### Standalone SPA coordinates
+
 `FeatureSPA` is the separately defined feature-anchor transformer, with
 `anchor_indices_`, conditioning diagnostics, and a fixed `components_` basis.
 Its `normalize=True` option normalizes training feature columns only during
 anchor selection. See [the mathematical specification](methodology.md).
 
-The standalone `FeatureSPA` API is unchanged: `fit_transform(X)` returns
-anchor-derived training coordinates, whereas `transform(X)` projects against
-the fitted basis. A generic sklearn `Pipeline` containing `FeatureSPA` still
-uses `fit_transform` to train its next step. To use consistent fixed-basis
-coordinates for classification, use `NMFClassifier(solver="spa")`, an adapter
-that explicitly projects training data, or call `spa.fit(X_train)` followed by
-`spa.transform(X_train)` before fitting the classifier. The classifier's new
-default does not change generic pipelines automatically.
+**Anchor-selection limitation:** after supervised screening, SPA chooses anchors
+without using the labels. With L1 column normalization, its first anchor maximizes
+empirical coefficient of variation; later choices maximize residual norms after
+projection. Surviving background features with high CV can therefore dominate
+the selected anchors. Retaining all signal features does not guarantee that the
+low-rank representation preserves their classification information. This also
+applies when `NMFClassifier` projects both training and query observations.
+See the [mathematical qualifications](theory-implementation.md#spa-anchor-selection-and-screening-false-positives)
+and [retrospective diagnostic](wang-simulation-validation.md#october-20-anchor-and-information-diagnostic).
+
+**Pipeline caveat:** a generic sklearn pipeline containing `FeatureSPA` trains
+its next step on anchor columns but predicts using NNLS coordinates. These can
+differ materially on noisy data, including when predicting the training rows.
+The standalone API intentionally retains the factorization's anchor coordinates:
+
+| Operation | Output |
+| --- | --- |
+| `spa.fit_transform(X_train)` | Original-scale selected columns, also stored in `fit_coordinates_` |
+| `spa.fit(X_train).transform(X_train)` | Training observations projected by NNLS against the fitted `components_` |
+| `spa.transform(X_query)` | Query observations projected against that same fitted basis |
+
+The basis is fitted with the anchor coordinates held fixed. Projection instead
+holds the basis fixed and solves for coordinates. The two operations need not
+return the same training coefficients. Exact minimization of the latter problem
+cannot increase reconstruction error against that basis, but does not guarantee
+better classification. Numerical tolerances still apply. Standalone
+`reconstruction_err_` describes the anchor-coordinate factorization; calling
+`transform` does not replace it or `fit_coordinates_` with projected results.
+
+For the supported classification heads, use `NMFClassifier(solver="spa")` with
+the default `training_coordinates="auto"` or explicit `"transform"`. Both use
+fixed-basis projection for classifier training and prediction. Explicit
+`training_coordinates="fit_transform"` retains the historical anchor convention.
+These classifier choices do not change generic pipelines automatically.
+
+When composing screening, SPA and a classifier manually, project both sets of
+observations. For example, with nonnegative training and validation arrays:
+
+```python
+from sklearn.neighbors import KNeighborsClassifier
+from supervised_nmf import BinaryScreening, FeatureSPA
+
+screen = BinaryScreening(screening="absolute", score_threshold=2.0)
+X_train_selected = screen.fit_transform(X_train, y_train)
+spa = FeatureSPA(n_components=2).fit(X_train_selected)
+Z_train = spa.transform(X_train_selected)
+head = KNeighborsClassifier(n_neighbors=3).fit(Z_train, y_train)
+
+Z_validation = spa.transform(screen.transform(X_validation))
+predictions = head.predict(Z_validation)
+```
+
+The cutoff, rank and neighbor count above are illustrative; enough features and
+independent anchors must survive screening for the requested rank. For CV,
+refit the screen, basis and classifier inside every training fold, then transform
+that fold's validation observations with those fitted objects. Do not precompute
+screening or SPA coordinates on the full dataset before splitting into folds.
 
 ## Calibration and reporting
 
@@ -418,18 +694,19 @@ calibrated = calibration_search(
 validation = evaluate_classifier(calibrated.estimator, X_validation, y_validation)
 ```
 
-The grid above is an example; suitable ranges depend on the dataset. Any
+The cutoff grid above uses the absolute-screening `classifier` configured at
+the start of this page. Suitable ranges depend on the dataset. Any
 failed or nonconverged required fold disqualifies its candidate. The report
 retains each attempt, parameters, warnings, folds, selected dimensions, and
 timings. If every candidate fails, a clearly labeled training-majority fallback
 is returned. It must not be reported as the requested method's successful fit.
 
-For logistic regression, pass `NMFClassifier(classifier="logistic")` and replace
+For logistic regression, pass `NMFClassifier(classifier="logistic", screening="absolute")` and replace
 `n_neighbors` with `logistic_C`, for example `[0.01, 0.1, 1.0, 10.0, 100.0]`.
 Each fold fits its own screening, NMF, scaler and classifier. A logistic
 convergence warning disqualifies a candidate just as a factorization warning
 does; raising the logistic cap requires a recorded numerical configuration.
-For linear SVM, use `NMFClassifier(classifier="linear_svm")` and the grid key
+For linear SVM, use `NMFClassifier(classifier="linear_svm", screening="absolute")` and the grid key
 `svm_C`. Its cap and tolerance qualify the primal solve; they are not substitutes
 for tuning C. SVM warnings are retained and disqualify candidates in the same
 way. Optional KNN SD scaling is fitted separately within each training fold.
@@ -544,7 +821,8 @@ report = calibration_knn_grid(
 )
 ```
 
-This function evaluates the declared grid and returns a JSON-compatible report,
+This example also uses the absolute-screening `classifier` configured above.
+The function evaluates the declared grid and returns a JSON-compatible report,
 with provisional CV ranking and grid-refinement diagnostics. It performs no
 full-training refit, validation evaluation, majority fallback, or default
 selection. All required folds must qualify for a candidate to be ranked.
@@ -630,6 +908,13 @@ Even when `search_complete` is true for this upper-rank policy,
 `tuning_complete` remains false: screening and neighbor choices have not been
 jointly reoptimized and no global optimum is claimed. This helper supports the
 shared evaluator's KNN layouts and performs no refit or outer evaluation.
+
+An accepted pipeline containing `FeatureSPA` keeps its anchor-derived training
+coordinates and fixed-basis query projection. Rank search evaluates that declared
+procedure; it does not convert the pipeline to the SPA classifier's common map.
+Use `NMFClassifier(solver="spa")` with `training_coordinates="auto"` or
+`"transform"` when that map is intended. See
+[standalone SPA coordinates](#standalone-spa-coordinates).
 
 Run `python examples/grouped_tuning.py --output runs/grouped-example` for a
 small synthetic subject-separated example.

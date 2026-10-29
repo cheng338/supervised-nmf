@@ -15,6 +15,12 @@ without access to validation performance values, but the overall study was not
 blinded to those earlier results. The completed results and subsequent preference
 amendment are recorded in [CelebA default results](celeba-default-results.md).
 
+Retrospective note: the [amended sensitivity results](celeba-default-results.md#amended-screening-preference-rule)
+report the later preference rule separately. The October 28
+[boundary investigation](celeba-default-results.md#retrospective-boundary-investigation)
+adds calculations from saved evidence; those boundaries were not prespecified
+in this protocol and do not change its historical instructions.
+
 ## Data and comparisons
 
 Use training sizes **2,000, 4,000, and 8,000**, each with seeds **43, 44, and 45**.

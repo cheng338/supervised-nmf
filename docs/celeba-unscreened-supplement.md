@@ -7,6 +7,13 @@ commands refer to the retained local study workspace.
 
 Author: Chang Cheng. Supplement designed 6 October 2026 (UTC).
 
+The October 6 frozen sources used anchor-derived training coordinates
+(`training_coordinates="fit_transform"`) for both screened and unscreened SPA;
+queries used fixed-basis NNLS. These results precede the default SPA classifier's
+[version 0.3.0 change](release-0.3.0.md#spa-training-coordinates-migration)
+to projecting training observations as well. They describe the historical
+procedures actually evaluated.
+
 The subsequent [screened CD supplement](celeba-screened-cd-supplement.md) adds
 screening followed by CD-NMF and KNN as a seventh method, retaining all six
 results below. That report compares the two independently tuned screened
@@ -49,7 +56,7 @@ The previous face validation focused on screened SPA, screened PCA, screening-on
 | Unscreened SPA NMF+KNN | All 4,096 grayscale pixels; FeatureSPA; KNN | Compare screening choices while retaining the current SPA solver family. |
 | Standard CD NMF+KNN | All 4,096 grayscale pixels; coordinate-descent NMF; KNN | Restore the dissertation's standard unsupervised NMF baseline family. |
 
-Both use `screening='none'`, uniform KNN votes, and the existing `fit_transform` training-coordinate convention. The final estimator is the public `NMFClassifier`; its predictions are checked against the matching calibration pipeline. SPA uses an NNLS iteration cap of 20,000. CD uses NNDSVDa initialization, Frobenius loss, tolerance `1e-4`, iteration cap 20,000, and fixed seed 62006. No learned pixel rescaling or coefficient normalization is introduced.
+Both use `screening='none'`, uniform KNN votes, and the study's `fit_transform` training-coordinate convention. The final estimator is the frozen source's public `NMFClassifier`; its predictions are checked against the matching calibration pipeline. SPA uses an NNLS iteration cap of 20,000. CD uses NNDSVDa initialization, Frobenius loss, tolerance `1e-4`, iteration cap 20,000, and fixed seed 62006. No learned pixel rescaling or coefficient normalization is introduced.
 
 The higher CD cap is deliberate. The [earlier historical numerical diagnostic](wang-historical-diagnosis.md) found that the original cap of 400 could materially distort a synthetic standard-NMF comparison when fit and projection had not converged. A cap of 20,000 does not itself establish convergence or a global optimum: warnings and convergence status must still be checked, and unqualified candidates cannot win. That earlier diagnosis does not establish the cause of the dissertation's CelebA result.
 

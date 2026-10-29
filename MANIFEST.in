@@ -2,7 +2,7 @@ include CITATION.cff
 include LICENSE
 include THIRD_PARTY_NOTICES
 recursive-include docs *.md
-recursive-include examples *.py *.json
+recursive-include examples *.py *.json *.csv
 recursive-include provenance *.json *.py *.md
 recursive-include tests *.py
 recursive-include scripts *.py

@@ -7,6 +7,14 @@ commands refer to the retained local study workspace.
 
 Author: Chang Cheng. First expanded benchmark, 6 October 2026 (UTC).
 
+Both screened and unscreened SPA used anchor-derived training coordinates
+(`training_coordinates="fit_transform"`) and fixed-basis NNLS query projections
+in the frozen October 6 source. Since version 0.3.0, the default
+`NMFClassifier` projects SPA training observations as well. The accuracy and
+timing tables below describe the historical procedures and have not been
+relabeled as results of that later default. See the
+[coordinate migration](release-0.3.0.md#spa-training-coordinates-migration).
+
 Both independent audit gates passed with zero errors. All **35 planned method/dataset outcomes** are retained: **35 qualified**, **0 unqualified or not evaluated**. The five dataset/tasks and seven pipelines were fixed before new model results; earlier CelebA outcomes were already known. This is one reserved split per dataset, not repeated nested cross-validation or a complete resolution of Wang's replication concern R6.
 
 **Accuracy (%)**
@@ -59,7 +67,7 @@ Accuracy is the fraction of correct reserved-set predictions, in percent. The la
 | Spambase | 2942 | 1262 | [1769, 1173] | [759, 503] | Individual cases | 57 | maxabs |
 | WDBC | 398 | 171 | [250, 148] | [107, 64] | Individual cases | 30 | maxabs |
 
-CMU predicts documented open-eyes versus sunglasses filename labels. Its reserved cohort contains only **six subjects**, so grouped uncertainty can be wide and must not be replaced by image-level independence. FEI predicts provided frontal filename condition **a=0 versus b=1**; neutral/smile semantic orientation remains unverified and is not inferred from the outcomes. The nonface caches retain their original development/reserved splits and label mappings.
+CMU predicts documented open-eyes versus sunglasses filename labels. Its reserved cohort contains only **six subjects**. Nominal 95% subject-bootstrap coverage is not assured with so few independent units; treating individual images as independent would not resolve this limitation. The [CMU uncertainty sensitivity](#cmu-uncertainty-sensitivity) supplements the historical intervals without replacing them. FEI predicts provided frontal filename condition **a=0 versus b=1**; neutral/smile semantic orientation remains unverified and is not inferred from the outcomes. The nonface caches retain their original development/reserved splits and label mappings.
 
 Face splits hold out whole subjects using the frozen seed; the same person never crosses a training/test or inner-CV boundary. Face cache preparation decoded all source images, but reserved model evaluation was gated until all 35 training searches completed and the global freeze passed audit. The three nonface reserved archives were not decoded by the runner before that gate. Exact duplicate checks do not establish the absence of near duplicates or dataset-specific sampling bias.
 
@@ -167,7 +175,7 @@ The frozen searches retain **38,854 candidates** and **37,411 failed candidate-f
 
 ## Paired differences: screened SPA minus each comparator
 
-All differences below are percentage points; signs always mean screened SPA minus the named comparator. Intervals are descriptive, unadjusted 95% percentile intervals from 10,000 paired bootstrap draws with the declared seed. Nonface draws resample cases within class; face draws resample entire subjects with every image and its multiplicity retained. Any single-class group draw is counted and omitted as specified in its receipt, not replaced by an adaptive extra draw. Face-image McNemar tests are not used because images within a subject are dependent.
+All differences below are percentage points; signs always mean screened SPA minus the named comparator. Intervals are descriptive, marginal, unadjusted percentile intervals with nominal 95% coverage, from 10,000 paired bootstrap draws with the declared seed. Nonface draws resample cases within class; face draws resample entire subjects with every image and its multiplicity retained. Any single-class group draw is counted and omitted as specified in its receipt, not replaced by an adaptive extra draw. Face-image McNemar tests are not used because images within a subject are dependent.
 
 | Dataset | Comparator | Accuracy difference [95% interval] | BA difference [95% interval] | SPA-only / comparator-only correct |
 | --- | --- | ---: | ---: | ---: |
@@ -204,10 +212,128 @@ All differences below are percentage points; signs always mean screened SPA minu
 
 These intervals condition on the selected training cohort, fitted models and observed dataset. They do not measure full retraining uncertainty, constitute multiplicity-adjusted confirmation, or establish general solver superiority. An interval crossing zero is inconclusive, not evidence of equivalence. The complete dataset-by-method table retains negative results and numerical failures; this study did not continue searching until a favorable dataset appeared.
 
+## CMU uncertainty sensitivity
+
+A reanalysis on October 28 reproduced the saved CMU metrics and historical
+paired intervals for all six comparisons. It used the original predictions, subject IDs
+and class counts; it did not refit models or revise tuning or the reserved
+split. All seven pipelines were fixed before the CMU outcomes. These remain
+results of the historical anchor-derived SPA training coordinates, and the
+screened SPA rank-80 upper search boundary remains unresolved.
+
+The 190 test images belong to six subjects, each containing both classes.
+Accuracy pools correct predictions over images; balanced accuracy averages
+the two pooled class recalls. Averaging subject-specific accuracies instead
+would generally change the estimand when subject sizes differ. The following
+alternatives retain the pooled estimands and the pairing within subjects.
+
+For six subjects, all 46,656 ordered bootstrap samples can be represented by
+462 count vectors with their multinomial probabilities. The exact empirical
+percentile intervals below use weighted inverse-CDF quantiles; the historical
+table uses 10,000 draws and linear quantiles. Small endpoint differences reflect
+these conventions and Monte Carlo sampling. Exact enumeration eliminates
+resampling Monte Carlo error, not uncertainty from having only six subjects.
+
+The basic interval reflects the empirical bootstrap quantiles around the
+observed estimate. Jackknife–t uses the delete-subject standard error and five
+degrees of freedom. BCa uses bias correction and delete-subject acceleration,
+with midpoint handling of floating-point ties. None guarantees nominal coverage
+with six subjects. All intervals are marginal and unadjusted, conditional on
+the fitted models; they exclude training and tuning variability.
+
+**Accuracy sensitivity (percentage points)**
+
+| Comparator | Difference | Exact empirical percentile | Basic | Jackknife–t | BCa | Delete-subject estimate range |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Screened CD sNMF + KNN | +0.53 | [-14.14, +14.29] | [-13.23, +15.19] | [-19.84, +20.89] | [-15.10, +13.23] | [-3.77, +6.33] |
+| Screened PCA + KNN | -2.11 | [-6.38, +2.11] | [-6.32, +2.17] | [-8.64, +4.42] | [-6.42, +2.09] | [-3.80, -0.63] |
+| Screening-only KNN | +0.00 | [-5.76, +4.79] | [-4.79, +5.76] | [-7.56, +7.56] | [-6.28, +4.23] | [-1.89, +2.53] |
+| Raw-feature KNN | +3.68 | [-3.68, +10.00] | [-2.63, +11.05] | [-6.47, +13.84] | [-4.74, +9.47] | [+1.27, +6.96] |
+| Unscreened SPA NMF + KNN | -3.68 | [-12.17, +3.14] | [-10.51, +4.80] | [-14.66, +7.29] | [-14.29, +2.13] | [-5.70, +0.00] |
+| Unscreened CD NMF + KNN | +7.37 | [+1.05, +14.29] | [+0.45, +13.68] | [-2.35, +17.09] | [+1.58, +15.18] | [+4.43, +9.43] |
+
+**Balanced-accuracy sensitivity (percentage points)**
+
+| Comparator | Difference | Exact empirical percentile | Basic | Jackknife–t | BCa | Delete-subject estimate range |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Screened CD sNMF + KNN | +0.47 | [-14.10, +13.72] | [-12.79, +15.03] | [-19.63, +20.56] | [-15.10, +12.82] | [-3.79, +6.19] |
+| Screened PCA + KNN | -2.13 | [-6.45, +2.08] | [-6.34, +2.20] | [-8.63, +4.37] | [-6.57, +2.08] | [-3.81, -0.63] |
+| Screening-only KNN | +0.01 | [-5.73, +4.73] | [-4.71, +5.75] | [-7.48, +7.50] | [-6.25, +4.21] | [-1.86, +2.52] |
+| Raw-feature KNN | +3.68 | [-3.63, +9.98] | [-2.62, +10.99] | [-6.41, +13.77] | [-4.69, +9.42] | [+1.27, +6.94] |
+| Unscreened SPA NMF + KNN | -3.75 | [-12.35, +3.10] | [-10.59, +4.86] | [-14.77, +7.28] | [-14.42, +2.08] | [-5.75, -0.02] |
+| Unscreened CD NMF + KNN | +7.35 | [+0.88, +14.42] | [+0.28, +13.82] | [-2.32, +17.01] | [+1.46, +15.10] | [+4.46, +9.46] |
+
+Deletion omits one test subject from the saved predictions; it is influence
+analysis, not retrained leave-one-subject-out cross-validation. Against
+unscreened CD, SPA has 14 net additional correct predictions. Subject-level
+contributions are 0, +4, -1, +7, +3 and +1. Removing the subject contributing
+half the net advantage still leaves +4.43 accuracy points. This establishes
+stability to deletion of any one observed subject, not to unobserved subject
+types or a broader population. The jackknife–t intervals include zero, while
+the bootstrap alternatives exclude it. Population superiority remains
+unconfirmed; interval methods should not be selected according to which
+conclusion they produce.
+
+The unscreened-CD percentile intervals remained positive for both metrics
+across 100 additional seeds with 10,000 draws each. The original positive
+lower endpoint is therefore not explained by one favorable resampling seed.
+More bootstrap repetitions cannot supply information about additional people.
+
+### Coverage simulations
+
+Eleven specified populations were evaluated at 6, 14 and 60 subjects, with
+3,000 independent simulated cohorts per combination: 99,000 cohorts in total.
+They included homogeneous null and improvement cases, heterogeneous subjects,
+rare adverse subjects, unequal and informative subject sizes, class imbalance,
+subjects containing only one class, all ties, rare harm invisible in many
+samples, and increased images per subject. Six-subject resampling was
+enumerated; larger cohorts used 1,999 bootstrap draws. Repeating the same
+cohorts under AOCL and MKL gave identical numerical results and did not increase
+the independent simulation sample size.
+
+Selected six-subject accuracy results follow. Coverage is the percentage of
+all simulated cohorts that produced an available interval containing the known
+population value. These simulations demonstrate behavior under their specified
+populations; they do not estimate actual CMU coverage.
+
+| Population | Percentile coverage (%) | Jackknife–t coverage (%) | BCa coverage (%) | BCa availability (%) |
+| --- | ---: | ---: | ---: | ---: |
+| Homogeneous null | 87.43 | 94.57 | 87.67 | 99.97 |
+| Symmetric subject heterogeneity | 86.67 | 94.87 | 87.10 | 100.00 |
+| Highly unequal, noninformative subject sizes | 83.37 | 80.73 | 81.90 | 100.00 |
+| Rare invisible harm | 47.73 | 48.77 | 47.73 | 48.87 |
+
+Monte Carlo standard errors near 85–95% coverage are about 0.4–0.7 percentage
+points. The rare-harm case has 90% tied subjects and 10% adverse subjects:
+a six-person sample misses the adverse type with probability 0.9^6, or 53.14%.
+BCa coverage conditional on an available interval was 97.68%, but fewer than
+half the cohorts yielded such an interval. Reporting only that conditional
+coverage would conceal the failures to provide an interval. Missing-class and
+degenerate cases were retained, without a silent replacement method.
+
+Jackknife–t was near 95% in several scenarios but not with highly unequal
+subject sizes; BCa did not consistently improve coverage. Increasing independent
+subjects generally helped. Increasing images per subject did not resolve the
+six-subject limitation, and these scenarios establish no universal minimum
+subject count or universally preferable interval method.
+
+A separate check of exact rational versus floating-point BCa tie comparisons
+left all CMU bounds unchanged. It affected some simulated intervals, so a future
+public BCa implementation would need explicit tie and unavailable-case handling.
+The existing percentile method is retained. The historical estimates and
+intervals remain descriptive evidence, supplemented by the sensitivity results
+above. Stronger population claims require additional independent subjects and
+a study protocol fixed before their outcomes are examined.
+
+The reanalysis used the saved predictions bound to the aggregate result hash
+below. Its detailed calculations, simulations and numerical checks are retained
+locally. They supplement the original audits; no model refitting or current-default
+accuracy validation was performed.
+
 ## Audit and reproducibility
 
 Pretest audit: **passed**, zero errors. Posttest audit: **passed**, zero errors. The posttest receipt explicitly binds this exact aggregate result file. The audits check frozen sources/data, group/fold plans, full candidate receipts, selection arithmetic, predictions and paired comparisons; they do not independently refit the scientific models or regenerate CV predictions.
 
 Saved evidence: protocol (retained locally: `../runs/multi-dataset-validation-20261006/protocol.json`), preparation (retained locally: `../runs/multi-dataset-validation-20261006/preparation.json`), final settings freeze (retained locally: `../runs/multi-dataset-validation-20261006/final-freeze.json`), results (retained locally: `../runs/multi-dataset-validation-20261006/results.json`), pretest audit (retained locally: `../runs/multi-dataset-validation-20261006/pretest-audit.json`), posttest audit (retained locally: `../runs/multi-dataset-validation-20261006/posttest-audit.json`).
 
-Result SHA256: `8703d9556bc544703b54f21d71d2d944b8f3b3e676059c1ce7954c3f9d4a1112`. Posttest-audit SHA256: `d3e5806c2ddad35e2dbbb2e979875bb19b871ca69ffb5a54e678eab1e1b23533`. Report-generator SHA256: `f29af7ed42e981eedfb73648e86fa8c74e21e87ee0383190df265e4b8edab5ee`.
+Result SHA256: `8703d9556bc544703b54f21d71d2d944b8f3b3e676059c1ce7954c3f9d4a1112`. Posttest-audit SHA256: `d3e5806c2ddad35e2dbbb2e979875bb19b871ca69ffb5a54e678eab1e1b23533`. Historical report-generator SHA256: `f29af7ed42e981eedfb73648e86fa8c74e21e87ee0383190df265e4b8edab5ee`.

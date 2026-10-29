@@ -4,6 +4,14 @@ These comments concern an earlier 104-page dissertation draft. This tracker reco
 package-development evidence and remaining work. Some comments have already been
 addressed in the October 1 revision; the status below is limited to package work.
 
+The October 3–6 SPA classification evidence summarized here used the saved
+study sources and anchor-derived `fit_transform` training coordinates, with
+fixed-basis NNLS for prediction. Since
+[v0.3.0](release-0.3.0.md#spa-training-coordinates-migration), the default SPA
+classifier also projects its training observations. The historical results
+support the procedures evaluated then; they do not measure the later default's
+accuracy or timing.
+
 Author: Chang Cheng. The [completed validation report](wang-validation-report.md)
 adds **900 independently retuned simulation draws and 780 CelebA fits**, all
 numerically qualified and independently audited with zero discrepancies.
@@ -60,8 +68,12 @@ ties on WDBC, and loses on the other three tasks. FEI's +2.50-point difference
 has an interval of [-0.83, +6.67], so it is inconclusive. Chance and training-majority
 references accompany the complete tables. This broadens R7/R21 evidence and
 partly addresses R6 through additional datasets; one holdout per dataset still
-does not measure repeated-training uncertainty. CMU has only six test subjects,
-and FEI's filename a/b expression orientation remains unverified.
+does not measure repeated-training uncertainty. CMU has only six test subjects;
+its [uncertainty sensitivity analysis](multi-dataset-results.md#cmu-uncertainty-sensitivity)
+preserves the historical intervals and adds subject influence and alternative
+intervals for every comparison. This improves reporting but does not establish
+population superiority or resolve R6. FEI's filename a/b expression orientation
+remains unverified.
 
 The earlier repeated development comparison completed 72 valid evaluations,
 216 exact-match serial profiling repeats and 2,050 qualified CV candidates.
@@ -69,8 +81,12 @@ The original automatic rule selected SPA with percentile screening.
 The author's later supervised-PCA alignment preference selects **SPA with an
 absolute pooled-t cutoff**, within the same global accuracy tolerance. The
 original decision is preserved; the amendment is disclosed after development
-results and before official-test predictions/outcomes. See the
-[default results](celeba-default-results.md) and
+results and before official-test predictions/outcomes. Its selection is
+conditional on the accuracy allowances, assumed workload and development
+configurations: the [amended sensitivities](celeba-default-results.md#amended-screening-preference-rule)
+include a reversal when seed 44 is omitted and when prediction cost receives
+greater weight. These results do not establish a universally preferred solver.
+See the [default results](celeba-default-results.md) and
 [theory/implementation scope](theory-implementation.md).
 
 The earlier [four-solver comparison](nmf-solver-comparison.md#development-results)
@@ -88,8 +104,8 @@ did not evaluate official-test outcomes.
 | Standard NMF 32.42%, R8 | [Original-size controlled reconstruction](wang-historical-diagnosis.md): 32.75% at cap 400; changing only the cap to 2,000 gives 92.92%, converging at iteration 1,226 without warnings. | Below-chance behavior closely reproduced and a numerical cause demonstrated in the current environment. Exact historical versions/predictions remain unavailable; the clipping/topological-inversion explanation is not established. |
 | Wearing Necktie imbalance, R9 | Both completed CelebA designs tune with balanced accuracy and preserve natural class proportions. Report ROC AUC, AP/PR curves, positive precision/recall/F1, exact confusion counts and the majority baseline on the same 4,000 validation images, including 292 positives. | Across ten fully retuned fits, SPA KNN recall is 0.152; SPA logistic recall rises to 0.721 at precision 0.167. This tradeoff does not establish the best procedure: PCA and raw/screened-pixel logistic baselines have stronger overall comparisons. Always-negative accuracy is 92.7% but recall is zero. Validation reuse and unknown person overlap limit generalization claims. |
 | Constant/near-constant features | Explicit score policy; no hidden variance floor; invalid fits recorded. | Numerical unit checks pass; theoretical denominator assumptions remain separate. |
-| Harder simulations, R16 | Completed 27 signal-strength/support/correlation cells plus cross-block correlation, null and XOR; 30 independent training/test draws per regime, each with full five-fold tuning. Each draw uses 160 training rows, 480 test rows and 320 features. All 9,930 final method evaluations qualify. | Null and XOR screened methods remain near chance; the separately labelled generating-support XOR KNN oracle reaches 99.87% BA. Strong-signal SPA fits can still fail predictively despite numerical qualification and full support inclusion. These reduced-dimensional generators test specific regimes, not large-scale behavior or the theorem's assumptions. |
-| Replication, R6 | Completed 30 independent draws per simulation regime, 20 fixed-setting CelebA training resamples after a disjoint tuning pilot, and ten fully retuned resamples. Saved paired predictions support mean/Monte Carlo SE and pointwise paired t intervals; fixed-case image bootstraps are reported separately. The later [five-dataset expansion](multi-dataset-results.md) adds 35 qualified method/dataset evaluations with whole-subject face splits. | Earlier CelebA resamples overlap and reuse the same validation reservoir; their uncertainty is conditional. The five additional datasets broaden empirical coverage, with all outcomes retained, but each uses only one reserved split. Repeated-training uncertainty and broad population generalization remain unresolved; CMU has only six held-out subjects. |
+| Harder simulations, R16 | Completed 27 signal-strength/support/correlation cells plus cross-block correlation, null and XOR; 30 independent training/test draws per regime, each with full five-fold tuning. Each draw uses 160 training rows, 480 test rows and 320 features. All 9,930 final method evaluations qualify. A separate [October 20 mechanism diagnostic](wang-simulation-validation.md#october-20-anchor-and-information-diagnostic) covers all seven original low-score triggers and three previously observed follow-up cohorts. | Null and XOR screened methods remain near chance; the separately labelled generating-support XOR KNN oracle reaches 99.87% BA. The later controls implicate low-rank/anchor representation loss and KNN scaling despite full signal retention; rank expansion and common coordinates do not repair every case. That retrospective diagnostic has 426/432 qualified final classifier configurations and does not establish a universal remedy. These reduced-dimensional generators test specific regimes, not large-scale behavior or the theorem's assumptions. |
+| Replication, R6 | Completed 30 independent draws per simulation regime, 20 fixed-setting CelebA training resamples after a disjoint tuning pilot, and ten fully retuned resamples. Saved paired predictions support mean/Monte Carlo SE and pointwise paired t intervals; fixed-case image bootstraps are reported separately. The later [five-dataset expansion](multi-dataset-results.md) adds 35 qualified method/dataset evaluations with whole-subject face splits. [CMU sensitivity results](multi-dataset-results.md#cmu-uncertainty-sensitivity) add subject-deletion and interval comparisons using saved predictions. | Earlier CelebA resamples overlap and reuse the same validation reservoir; their uncertainty is conditional. The five additional datasets broaden empirical coverage, with all outcomes retained, but each uses only one reserved split. Repeated-training uncertainty and broad population generalization remain unresolved. CMU has only six held-out subjects; nominal 95% coverage is not assured, and the sensitivity analysis is not a new independent evaluation. |
 | Tuning cost, R18 | Retain 113,156 CV candidates and 565,780 candidate-fold receipts, with shared real-data representations counted once for stage costs. Separate tuning, screening, representation, classifier and prediction timings. The [BLAS benchmark](blas-optimization.md) compares four training-only workloads in 28 paired repeats. | Direct public BLAS calls plus NNLS layout reuse reduce median fit-plus-projection time by 12.6–16.6%, with identical paired outputs. A separate native memory supplement records whole-worker lifetime peaks of about 265–535 MiB, essentially unchanged; these include imports/data/screening. Shared-host study wall times are not isolated speed comparisons. Whole-CV peak memory and broad scaling remain unmeasured. |
 | Reproducibility, R21 | Frozen source snapshots, data hashes, IDs, seeds, folds, complete grids, selected settings, failure records and predictions are preserved. The combined audit (`runs/wang-validation-audit-20261006/all-audit.json`, retained locally) checks 10,710 final evaluation records, recomputes metrics from 7,886,400 saved predictions and reproduces all 48 fixed-case bootstrap intervals. | Complete audit passed with zero discrepancies; final fits all qualify, with infeasible CV attempts retained. CV fold scores are checked from receipts, not independently refitted; checksums/timestamps establish internal consistency, not external preregistration. The final 303 tests pass in both numerical environments. Source is available in the [cheng338/supervised-nmf repository](https://github.com/cheng338/supervised-nmf). Chang Cheng's original work is All Rights Reserved while the distribution license remains undecided; separate third-party notices are preserved. |
 | KNN versus parametric classifier, R14 | Completed KNN versus L2-logistic comparisons with training-fold scaling, independent C tuning and, for CelebA, tuned class weights. In the ten retuned CelebA samples, SPA logistic exceeds SPA KNN by 3.39 BA points on Smiling and 15.21 on Necktie. | The evidence supports including parametric baselines, while other logistic representations outperform SPA logistic. Contrasts concern independently selected complete procedures, not an isolated link-function effect. Classifier-specific theoretical analysis remains unresolved; the study does not automatically change the package's KNN default. |

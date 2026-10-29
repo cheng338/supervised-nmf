@@ -31,7 +31,7 @@ generator preserves the original random draw order with a local RandomState.
 | Independent baseline tuning and PCA/screening-only comparisons | Prevents unscreened NMF from inheriting a rank optimized for the screened pipeline; tests the contribution of factorization. |
 | Broader metrics, timing, and run records | Separates classification under imbalance, model-selection expense, fit expense, and numerical reliability. |
 | Official CelebA partition loader | Replaces selecting the first sorted files then randomly splitting. This is a new evaluation protocol, not historical reproduction. Grayscale resizing and intensity scale are retained. |
-| Optional fixed-basis training-coordinate recomputation | A diagnostic alternative to the original returned training coefficients. It is explicit and cannot be relabeled as a confirmed correction before controlled diagnosis. |
+| Fixed-basis SPA classifier training coordinates since v0.3.0 | The default `training_coordinates="auto"` projects SPA training observations against the fitted basis, matching its prediction map. CD/MU retain their fitted training coefficients unless `"transform"` is requested. Explicit `"fit_transform"` retains the earlier coordinate convention. Historical accuracy and timing results apply to the convention actually evaluated; retraining under the new default can change both. See the [migration notes](release-0.3.0.md#spa-training-coordinates-migration). |
 | Controlled simulation extensions | Independent within-block noise factors vary signal/background correlations; an explicit all-features mode tests cross-block correlation. The exact original generator remains separate. XOR is an additional marginal-screening failure case. |
 | Explicit per-method parameter grids | Tune NMF/PCA rank, the applicable screening parameter, and either KNN neighbors or logistic inverse regularization strength on the same training folds. Record grid revisions and numerical qualification before final evaluation. |
 
@@ -43,6 +43,13 @@ selection. Successive projections select linearly independent residual columns.
 The original-scale selected columns supply training coefficients; nonnegative
 least squares estimates their basis across retained features. New observations
 are encoded by nonnegative least squares against that fixed basis.
+
+Those anchor columns remain the training output of standalone
+`FeatureSPA.fit_transform`. The default `NMFClassifier` has instead used
+fixed-basis NNLS projections for both classifier training and prediction since
+v0.3.0. The October 3–6 classification studies used the earlier anchor-derived
+training coordinates. Their frozen results and source records retain that
+convention.
 
 Selection normalization does not normalize observations or CD coefficients.
 Comparisons report each solver's normalization convention.

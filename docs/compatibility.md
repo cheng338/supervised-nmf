@@ -39,9 +39,13 @@ execution and memory costs. It does not guarantee identical results or higher
 classification accuracy. Solver defaults, initialization, tolerances and input
 precision remain explicit parts of the study configuration.
 
+Mixed float32/float64 queries and fitted bases use float64 projection without
+narrowing either array. Matching dtypes keep their original calculation. See
+[prediction dtype](api.md#prediction-dtype) for output precision and costs.
+
 The fixed-basis MU numerical fallback uses float64 logarithms for extreme-range
-queries and returns coordinates in the query dtype. It does not promote training
-factorization inputs or change the fitted basis. See the
+queries and returns coordinates in that projection dtype. It does not promote
+training factorization inputs or change the fitted basis. See the
 [projection diagnostics](api.md#fit-diagnostics) for its scope and cost.
 
 See [fit diagnostics](api.md#fit-diagnostics) for the meaning of convergence

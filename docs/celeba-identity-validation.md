@@ -2,10 +2,18 @@
 
 This report preserves a historical study. Detailed records, data caches and
 figures are retained locally and are not included in the public repository.
-Study scripts marked 'retained locally' are also excluded; reproduction
-commands refer to the retained local study workspace.
+Study scripts marked 'retained locally' are also excluded. The
+[paired-statistics example](#reproducing-the-paired-statistics) includes the
+saved labels and predictions needed to reproduce the comparisons below;
+full study reproduction requires the retained local workspace.
 
 Author: Chang Cheng. Study date: 6 October 2026 (UTC).
+
+The October 6 frozen source trained SPA's classifier on anchor-derived
+coordinates (`training_coordinates="fit_transform"`) and projected queries
+against the fitted basis with NNLS. Since [version 0.3.0](release-0.3.0.md#spa-training-coordinates-migration),
+the default SPA classifier also projects its training observations. The results
+below describe the frozen study procedure; they do not measure that later default.
 
 The later [unscreened NMF supplement](celeba-unscreened-supplement.md) adds the
 dissertation's standard CD-NMF+KNN baseline and unscreened SPA-NMF+KNN. It brings
@@ -18,11 +26,11 @@ screening followed by CD-NMF and KNN as a seventh method. It retains the same
 cohort and independently tunes the same screened grids; all six earlier fits
 and predictions remain frozen. Its design also follows known test outcomes.
 
-**Complete: both independent audits passed.** On the frozen 1,000-identity official-test cohort, the current package's sNMF+KNN achieved **81.3725% balanced accuracy**, versus **78.5094% for sPCA+KNN**. The paired advantage was **2.8631 percentage points**, with a prespecified bootstrap 95% interval of **[0.6822, 5.0481]**. Accuracy improved by 2.9 points. This supports a positive, study-specific comparison with sPCA. The advantage over screening-only KNN was smaller and its interval crossed zero.
+**Complete: both independent audits passed.** On the frozen 1,000-identity official-test cohort, the October 6 study's sNMF+KNN achieved **81.3725% balanced accuracy**, versus **78.5094% for sPCA+KNN**. The paired advantage was **2.8631 percentage points**, with a prespecified bootstrap 95% interval of **[0.6822, 5.0481]**. Accuracy improved by 2.9 points. This supports a positive, study-specific comparison with sPCA. The advantage over screening-only KNN was smaller and its interval crossed zero.
 
 Only the dense-neighbor successor's frozen configurations and test results support that conclusion. The original coarse-neighbor calibration is preserved below as superseded exploratory tuning evidence. KNN tuning was broadened after that calibration and before new official-test access. The successor retained the same training cache, planned test identities, task, rank/cutoff grids, and folds. No parameters, cohort, seed, or task were changed using the test outcomes.
 
-The question is whether the current package's absolute-screening SPA sNMF followed by KNN improves on absolute-screening PCA followed by KNN for CelebA's binary **Smiling** annotation. Smiling was selected because an earlier, disclosed development comparison favored SPA+KNN by approximately 1.90 balanced-accuracy percentage points. The present task choice therefore used earlier outcomes. The new evaluation tested that promising finding on separate official-test identities; it was not a blind search across datasets.
+The study asked whether its frozen absolute-screening SPA sNMF followed by KNN improves on absolute-screening PCA followed by KNN for CelebA's binary **Smiling** annotation. Smiling was selected because an earlier, disclosed development comparison favored SPA+KNN by approximately 1.90 balanced-accuracy percentage points. The present task choice therefore used earlier outcomes. The new evaluation tested that promising finding on separate official-test identities; it was not a blind search across datasets.
 
 A nonface shortlist and data preparation preceded the selection of face data for this study. No nonface classifiers were fitted in that search. The prepared nonface records remain separate and provide no supporting performance evidence for this study. Earlier simulation and real-data results, including unfavorable comparisons, remain in their original reports; this study does not replace them.
 
@@ -77,6 +85,51 @@ Final training-fit diagnostics confirm the requested configurations were used:
 The screened methods reported zero constant features and zero infinite screening scores. sNMF reported successful fit and test-coordinate convergence. Its public `NMFClassifier` output agreed with the equivalent search pipeline: identical predicted labels and selected-feature masks, with maximum absolute probability difference **0.0**. Selected pixel lists and all diagnostics remain in the per-method evaluation receipts (retained locally: `../runs/celeba-identity-validation-dense-knn-20261006/evaluations`). Pixel retention is not evidence of recovering a known ground-truth biological or facial-feature support.
 
 The result figure is available as PNG (retained locally: `../runs/celeba-identity-validation-dense-knn-20261006/identity-validation.png`) and SVG (retained locally: `../runs/celeba-identity-validation-dense-knn-20261006/identity-validation.svg`), with a figure provenance receipt (retained locally: `../runs/celeba-identity-validation-dense-knn-20261006/figure-manifest.json`).
+
+## Reproducing the paired statistics
+
+Run the [reproduction example](../examples/celeba_identity_reproduction/reproduce.py)
+from the repository root:
+
+```bash
+python examples/celeba_identity_reproduction/reproduce.py
+```
+
+The example needs NumPy and SciPy, both package dependencies. It can also run
+independently with its three files in one directory. The
+[prediction table](../examples/celeba_identity_reproduction/predictions.csv)
+contains the true label and four predicted labels for each of the 1,000 rows,
+in the original evaluation order. Class 0 means not Smiling and class 1 means
+Smiling. Columns `snmf`, `spca`, `screen` and `raw` correspond to the four
+methods above. The table omits image and identity identifiers, pixels and
+probabilities. Repeated label/prediction rows are expected; they do not indicate
+repeated identities and must not be removed.
+
+The script reproduces the confusion matrices, class recalls, accuracy, balanced
+accuracy and all three paired comparisons. It preserves the original seed
+62107, resets it for each comparison, draws 10,000 bootstrap replicates within
+class 0 and then class 1, and uses linear percentile interpolation. Row order
+and pairing matter for replaying these particular seeded intervals. Replacing
+rows with aggregate counts can preserve the theoretical bootstrap distribution
+while changing its Monte Carlo endpoints.
+
+[Expected results](../examples/celeba_identity_reproduction/expected.json)
+retain full precision, extraction details, historical source hashes and library
+versions. Effects and intervals in the JSON use proportions, so multiply by
+100 for the percentage points reported here. The script checks the fixture's
+checksum of the ordered label table, serialized with LF line endings, and prints the recalculated
+statistics with an `exact_historical_match` flag. A mismatch returns a nonzero
+exit status while retaining the calculated output; library roundoff or sampling
+changes may cause a mismatch. This is a historical replay check, not a package
+compatibility test. No new constraints are placed on package dependencies.
+
+This example uses fixed historical predictions. It does not reproduce fitting,
+calibration, probability-based scores, or verification of identity separation.
+Its intervals remain conditional on the fitted models and the study design;
+replay does not establish population coverage. The screening-only and raw
+comparisons remain descriptive with unadjusted intervals, and McNemar applies
+to accuracy. The repeated-subject CMU data require their separate grouped
+procedure.
 
 ## Cohort and provenance
 
@@ -186,4 +239,4 @@ The posttest audit (retained locally: `../runs/celeba-identity-validation-dense-
 | Four-method test results completed | 04:29:55 |
 | Independent posttest audit passed | 04:30:10 |
 
-This completed validation provides a documented real-data case where the current sNMF package beats the independently tuned sPCA pipeline under the declared finite tuning procedure. Its scope is the selected Smiling task, the preserved image preprocessing, one image per heldout identity, and these fitted models. It does not certify all package settings, general superiority, the formal screening/separability assumptions, or that every concern in Wang's theoretical review has been resolved.
+This completed validation provides a documented real-data case where the frozen October 6 sNMF procedure outperformed the independently tuned sPCA pipeline under the declared finite tuning procedure. Its scope is the selected Smiling task, the preserved image preprocessing, one image per heldout identity, and these fitted models. It does not certify all package settings, general superiority, the formal screening/separability assumptions, or that every concern in Wang's theoretical review has been resolved.

@@ -305,6 +305,69 @@ def _project_float64_mu(decomposition, selected, basis):
     return result
 
 
+def _project_scaled_float64_mu(decomposition, selected, basis):
+    """Retry a bounded float64 problem using coupled power-of-two scaling.
+
+    H' = 2**k H and X' = 2**(2k) X imply W' = 2**k W, including
+    sklearn's uniform initializer. The MU recurrence and relative-error stop
+    are unchanged in exact arithmetic. These conservative admission bounds
+    and product checks are not a certificate for every later floating-point
+    operation; a reported numerical failure still needs logarithmic recovery.
+    """
+    positive_x = selected[selected > 0]
+    positive_h = basis[basis > 0]
+    x_min = math.frexp(float(positive_x.min()))[1] - 1
+    x_max = math.frexp(float(positive_x.max()))[1] - 1
+    h_min = math.frexp(float(positive_h.min()))[1] - 1
+    h_max = math.frexp(float(positive_h.max()))[1] - 1
+    del positive_x, positive_h
+    # Keep stored positives at least 2**-500, with headroom for dense products
+    # and residual squares. The shape margin grows with the contraction size.
+    shape_bits = max(1, (max(selected.size, basis.size, len(basis)) - 1).bit_length())
+    lower = max(0, -500 - h_min, math.ceil((-500 - x_min) / 2))
+    upper = min(240 - shape_bits - h_max,
+                math.floor((400 - shape_bits - x_max) / 2))
+    if lower > upper:
+        raise FloatingPointError("No admissible coupled MU scaling exponent.")
+    exponent = int(lower)
+    with np.errstate(invalid="raise", divide="raise", over="raise", under="raise"):
+        scaled_x = np.ldexp(selected, 2 * exponent)
+        scaled_h = np.ldexp(basis, exponent)
+        if (not np.array_equal(np.ldexp(scaled_x, -2 * exponent), selected)
+                or not np.array_equal(np.ldexp(scaled_h, -exponent), basis)):
+            raise FloatingPointError("MU scaling is not exactly reversible.")
+        gram = scaled_h @ scaled_h.T
+        cross = scaled_x @ scaled_h.T
+    # BLAS need not report every underflow through np.errstate. Independently
+    # check support so a positive contraction cannot silently become zero.
+    gram_support = (scaled_h > 0) @ (scaled_h.T > 0)
+    cross_support = (scaled_x > 0) @ (scaled_h.T > 0)
+    if np.any(gram_support & (gram == 0)) or np.any(cross_support & (cross == 0)):
+        raise FloatingPointError("A positive MU contraction was rounded to zero.")
+    for product in (gram, cross):
+        if (not np.isfinite(product).all() or np.any(product < 0)
+                or np.any((product > 0) & (product < np.finfo(np.float64).tiny))):
+            raise FloatingPointError("MU scaling produced an unsafe contraction.")
+    # These are admission checks, not solver caches. Release their temporary
+    # arrays before the public transform allocates its own products.
+    del gram, cross, gram_support, cross_support, product
+    temporary = copy(decomposition)
+    temporary.components_ = scaled_h
+    with np.errstate(invalid="raise", divide="raise", over="raise", under="raise"):
+        result = temporary.transform(scaled_x)
+    if (result.shape != (len(selected), len(basis))
+            or not np.isfinite(result).all() or np.any(result < 0)):
+        raise FloatingPointError("Scaled MU coordinates are invalid.")
+    if len(basis) == 1:
+        return _rank_one_output(selected, basis)
+    with np.errstate(invalid="raise", divide="raise", over="raise", under="raise"):
+        restored = np.ldexp(result, -exponent)
+    if (not np.isfinite(restored).all() or np.any(restored < 0)
+            or np.any((result > 0) & (restored == 0))):
+        raise FloatingPointError("MU coordinates cannot be restored safely.")
+    return restored
+
+
 def transform_mu(decomposition, selected):
     """Preserve ordinary projection and correct qualified MU range failures."""
     basis = _standard_mu_basis(decomposition, selected)
@@ -324,6 +387,11 @@ def transform_mu(decomposition, selected):
     if selected.dtype == np.float32 and not small_input:
         try:
             return _project_float64_mu(decomposition, selected, basis)
+        except FloatingPointError:
+            pass
+    if selected.dtype == np.float64 and small_basis and not small_input:
+        try:
+            return _project_scaled_float64_mu(decomposition, selected, basis)
         except FloatingPointError:
             pass
     return _project_log_mu(selected, basis, decomposition.max_iter, decomposition.tol)

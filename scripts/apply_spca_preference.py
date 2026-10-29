@@ -55,10 +55,11 @@ def amended_choose(rows, protocol, **kwargs):
     return result
 
 
-def amendment_rule():
+def amendment_rule(protocol):
+    decision, timing = protocol["decision_rule"], protocol["timing"]
     return {
         "schema_version": 1, "author": "Chang Cheng", "amendment_id": "supervised-pca-screening-preference-v1",
-        "timing_of_preference": "Disclosed after development results; not preregistered. Before official-test predictions or outcomes, per chronology audit.",
+        "timing_of_preference": "Disclosed after development results; not preregistered. See the supplied chronology audit for recorded observations and limitations.",
         "decision_context": [
             "Narrow predictive differences favor alignment with supervised PCA's absolute-score screening, subject to the unchanged accuracy gate.",
             "The theoretical review considers the dissertation's four proofs, Wang's comments and the difficulty of establishing the required assumptions for each solver and screening choice.",
@@ -69,11 +70,13 @@ def amendment_rule():
             "If any absolute-screening method passes that gate, retain only the absolute methods that pass it before comparing cost.",
             "If no absolute method passes the gate, retain the original gate result; if the gate is empty, retain the original minimum-regret fallback.",
             "Keep per-case cost and tuning normalization across all originally qualified methods, including percentile methods.",
-            "Within the retained set apply original 5% serial-cost band, normalized recorded tuning, macro balanced accuracy and stable method order.",
+            "Within the retained set apply the protocol's declared serial-cost band, normalized recorded tuning, macro balanced accuracy and stable method order.",
         ],
-        "unchanged": {"macro_margin": .01, "attribute_margin": .02, "serial_cost_ratio": 1.05,
-                      "workload": "one selected-model fit plus prediction on the fixed 4000 validation images",
-                      "case_cost": "median of three per-repeat fit-plus-prediction sums"},
+        "unchanged": {"macro_margin": decision["macro_regret_tolerance"],
+                      "attribute_margin": decision["attribute_regret_tolerance"],
+                      "serial_cost_ratio": timing["primary_cost_closeness_ratio"],
+                      "workload": f"one selected-model fit plus prediction on the fixed {protocol['sampling']['validation_sample_count']} validation images",
+                      "case_cost": f"median of {timing['additional_repeats_per_selected_model']} per-repeat fit-plus-prediction sums"},
         "theory_scope": [
             "Both reconstruction and reference-basis proof routes are conditional and do not force CD or SPA.",
             "Absolute screening has the simpler connection to the threshold theorem; a CV cutoff is not automatically its prescribed threshold.",
@@ -104,28 +107,108 @@ def summarize_amendment(original, protocol):
     return result
 
 
-def markdown(report):
+def _method_names(methods):
+    return ", ".join(selector.table_cell(selector.LABELS[method]) for method in methods) or "None"
+
+
+def _decision_stages(decision, protocol):
+    """Describe recorded stages without recomputing gates or tie-breaks."""
+    winner, qualified, scores = decision["winner"], decision["qualified_methods"], decision["scores"]
+    names = ("accuracy_acceptable_methods", "methods_before_cost",
+             "methods_within_cost_band", "methods_after_tuning_tie_break")
+    stages = [decision.get(name, []) if winner is None else decision[name] for name in names]
+    for methods in (qualified, *stages):
+        selector.require(isinstance(methods, list) and all(isinstance(m, str) for m in methods)
+                         and len(methods) == len(set(methods)) and set(methods) <= selector.LABELS.keys(),
+                         "Invalid recorded method set.")
+    selector.require(set(scores) == set(qualified), "Scores differ from the qualified methods.")
+    preference, fallback = decision["screening_preference_applied"], decision["fallback_used"]
+    selector.require(type(preference) is bool and type(fallback) is bool, "Invalid preference/fallback flags.")
+    acceptable, retained, band, tuning = stages
+    if winner is None:
+        selector.require(not qualified and not any(stages) and not preference and not fallback,
+                         "A blocked decision contains selection results.")
+    else:
+        selector.require(set(acceptable) <= set(qualified) and set(retained) <= set(qualified)
+                         and set(band) <= set(retained) and set(tuning) <= set(band) and winner in tuning,
+                         "Winner and recorded selection stages disagree.")
+        selector.require(fallback == (not acceptable), "Fallback flag differs from the accuracy gate.")
+        selector.require(not preference or (not fallback and set(retained) <= set(acceptable)
+                         and all(m.endswith("_absolute") for m in retained)),
+                         "Absolute preference differs from the recorded methods.")
+    for key in ("macro_margin", "attribute_margin"):
+        selector.finite(100 * selector.finite(decision[key], key), key + " (pp)")
+    ratio = selector.finite(protocol["timing"]["primary_cost_closeness_ratio"], "cost ratio")
+    selector.require(ratio >= 1, "Cost ratio must be at least one.")
+    percentage = selector.finite(100 * (ratio - 1), "cost band (%)")
+    for score in scores.values():
+        for key in ("macro", "macro_regret", "normalized_serial_cost", "normalized_tuning_compute",
+                    "geometric_workload_seconds"):
+            selector.finite(score[key], key, unit_interval=key in ("macro", "macro_regret"))
+        for key in ("attributes", "attribute_regrets"):
+            selector.require(set(score[key]) == set(protocol["attributes"]), "Score attributes differ from the protocol.")
+            for value in score[key].values():
+                selector.finite(value, key, unit_interval=True)
+    return [
+        ("Operationally qualified", _method_names(qualified)),
+        ("Passed the accuracy gate", _method_names(acceptable)),
+        ("Absolute preference applied", "Yes" if preference else "No"),
+        ("Minimum-regret fallback used", "Yes" if fallback else "No"),
+        ("Retained before cost comparison", _method_names(retained)),
+        (f"Within the {percentage:g}% cost band", _method_names(band)),
+        ("Retained after tuning-cost comparison", _method_names(tuning)),
+        ("Selected combination", _method_names([winner]) if winner is not None else "No qualified method"),
+    ]
+
+
+def _markdown(report):
     decision = report["primary"]
+    protocol = report["decision_protocol"]
     winner = decision["winner"]
+    selector.require(report.get("winner_method", winner) == winner, "Recorded winners disagree.")
+    stages = _decision_stages(decision, protocol)
     score = decision["scores"].get(winner, {})
+    original = report.get("original_primary")
+    original_choice = ("Unavailable in this report" if original is None else
+                       _method_names([original["winner"]]) if original["winner"] is not None else "No qualified method")
+    rows = report["cases"]
+    selector.require(isinstance(rows, list), "Recorded cases must be a list.")
+    for row in rows:
+        selector.require(type(row["qualified"]) is bool and isinstance(row["timing_pairs"], list)
+                         and (row["metrics"] is None or isinstance(row["metrics"], dict)), "Invalid recorded case evidence.")
+    sample_count = protocol.get("sampling", {}).get("validation_sample_count")
+    selector.require(sample_count is None or (type(sample_count) is int and sample_count > 0),
+                     "Invalid validation sample count.")
     lines = ["# CelebA default: disclosed screening-preference amendment", "", "Author: Chang Cheng.", "",
-             f"**Selected combination: {selector.LABELS.get(winner, 'No qualified method')}.**", "",
-             "The original automatic decision selected SPA + percentile. It remains unchanged in its original directory. "
+             f"**Selected combination: {selector.table_cell(selector.LABELS.get(winner, 'No qualified method'))}.**", "",
+             f"Original recorded choice: {original_choice}.", "",
              "After development results were reviewed, the screening preference was amended to favor supervised PCA's absolute-score approach "
              "when predictive differences are narrow. The accompanying theoretical review considers the dissertation's four proofs and Wang's "
-             "comments for the CD-versus-SPA comparison. This preference was disclosed before official-test predictions or outcomes; "
-             "it was not preregistered and introduces no new experiment.", "",
-             "The unchanged global gate permits at most 1 percentage point of macro balanced-accuracy regret and 2 points for either "
-             "attribute, relative to the best of all operationally qualified methods. Among methods passing that gate, absolute screening "
-             "is preferred before the unchanged cost rule. All four methods remain in cost normalization. No accuracy equivalence is claimed.", "",
+             "comments for the CD-versus-SPA comparison. This is a disclosed post-development preference; "
+             "it was not preregistered and introduces no new experiment. The original decision is preserved separately.", "",
+             f"The primary accuracy margins are {100*decision['macro_margin']:g} pp for macro balanced accuracy and "
+             f"{100*decision['attribute_margin']:g} pp for each attribute, relative to the best qualified score. "
+             "Absolute screening is preferred among methods passing that gate before applying the cost rule. "
+             "Cost normalization uses all operationally qualified methods. No accuracy equivalence is claimed.", "",
+             "| Recorded decision stage | Result |", "| --- | --- |"]
+    lines += [f"| {label} | {value} |" for label, value in stages]
+    if winner is None:
+        lines += ["", "Selection is blocked because no method is operationally qualified."]
+    elif decision["fallback_used"]:
+        lines += ["", "No method passed the accuracy gate; the recorded choice uses the minimum-regret fallback."]
+    lines += ["", "The stage sets are recorded decision outputs. Displayed numeric summaries are rounded; selection uses stored precision.", "",
              "| Method | Qualified cases | Macro BA (%) | Smiling BA (%) | Necktie BA (%) | Macro regret (pp) | Normalized serial cost | Geometric fit + predict (s) |",
              "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
     for row in report["methods"]:
+        expected, qualified = row["expected_cases"], row["qualified_cases"]
+        selector.require(type(expected) is int and type(qualified) is int
+                         and 0 <= qualified <= expected, "Invalid recorded method counts.")
+        label = selector.table_cell(str(row["label"]).replace("\r", " "))
         value = decision["scores"].get(row["method"])
         if value is None:
-            lines.append(f"| {selector.table_cell(row['label'])} | {row['qualified_cases']} / {row['expected_cases']} | N/A | N/A | N/A | N/A | N/A | N/A |")
+            lines.append(f"| {label} | {row['qualified_cases']} / {row['expected_cases']} | N/A | N/A | N/A | N/A | N/A | N/A |")
             continue
-        lines.append(f"| {selector.table_cell(row['label'])} | {row['qualified_cases']} / {row['expected_cases']} | "
+        lines.append(f"| {label} | {row['qualified_cases']} / {row['expected_cases']} | "
                      f"{100*value['macro']:.4f} | {100*value['attributes']['Smiling']:.4f} | "
                      f"{100*value['attributes']['Wearing_Necktie']:.4f} | {100*value['macro_regret']:.4f} | "
                      f"{value['normalized_serial_cost']:.4f} | {value['geometric_workload_seconds']:.4f} |")
@@ -133,9 +216,7 @@ def markdown(report):
         lines += ["", f"The selected method's macro deficit is {100*score['macro_regret']:.4f} percentage points; "
                   f"its attribute deficits are {100*score['attribute_regrets']['Smiling']:.4f} (Smiling) and "
                   f"{100*score['attribute_regrets']['Wearing_Necktie']:.4f} (Wearing Necktie). "
-                  "Both absolute methods pass the unchanged gate. SPA-absolute alone is inside the preferred set's 5% cost band; "
-                  "no secondary tie-break is needed. CD-absolute remains an alternative with macro BA only 0.0148 points below "
-                  "the overall best, but higher measured serial cost. Rank, cutoff and KNN neighbors remain tunable."]
+                  "Rank, cutoff and KNN neighbors remain tunable."]
     lines += ["", "## Sensitivity to the declared accuracy margin and workload", "",
               "The preference is reapplied after the global gate in each descriptive sensitivity; these do not change the primary choice. "
               "Added CV compute is a parallel worker-wall sum and is not an isolated serial timing measurement.", "",
@@ -147,25 +228,43 @@ def markdown(report):
                      f"{selector.table_cell(selector.LABELS.get(value['winner'], 'None qualified'))} | "
                      f"{'yes' if value['screening_preference_applied'] else 'no'} |")
     lines += ["", "Leave-one-size/seed checks:", ""]
-    lines += [f"- Omit {row['omitted_field']}={row['omitted_value']}: {selector.LABELS.get(row['decision']['winner'], 'None qualified')}."
+    lines += [f"- Omit {selector.table_cell(row['omitted_field'])}={selector.table_cell(row['omitted_value'])}: "
+              f"{selector.table_cell(selector.LABELS.get(row['decision']['winner'], 'None qualified'))}."
               for row in report["leave_one_out"]]
     lines += ["", "## Theory and scope", ""]
     lines += [f"- {item}" for item in report["amendment_rule"]["theory_scope"]]
-    lines += ["", "The 72 evaluations and 216 timing repeats reuse one 4,000-image validation sample. Training samples overlap; "
+    lines += ["", f"Recorded evidence contains {len(rows)} case rows, "
+              f"{sum(row['metrics'] is not None for row in rows)} cases with evaluation metrics, "
+              f"{sum(row['qualified'] for row in rows)} qualified cases, and "
+              f"{sum(len(row['timing_pairs']) for row in rows)} recorded timing repeats.",
+              f"The protocol records a validation sample of {sample_count} images." if sample_count is not None
+              else "Validation sample size is unavailable in this report.",
+              "The frozen study reuses one validation sample and overlapping training samples; "
               "these are not independent datasets. No universal optimum, statistical superiority, unseen-person guarantee or completed "
               "full simulation study is claimed. The original report retains all metrics, selected parameters, failure records and nested "
               "stage timings; this JSON preserves those cases and recomputes the preference decisions.", "",
               "## Test chronology and provenance", "",
-              "The interrupted original final-test attempt completed eight exact development revalidations and entered test loading. "
-              "The chronology audit found no persisted test cache, prediction attempts, evaluations or final comparison. Partial in-memory "
-              "decoding cannot be ruled out. Interruption was confirmed with exit code 1. No official-test outcomes were inspected "
-              "or used for this amendment. The original attempt remains preserved and a new freeze is required.", "",
-              f"Original decision SHA-256: `{report['original_decision_sha256']}`.", "",
-              f"Amendment rule SHA-256: `{report['amendment_rule_sha256']}`.", "",
-              f"Chronology audit SHA-256: `{report['chronology_sha256']}`.", "",
-              "`input_sha256` binds the original evidence, original decision, unchanged decision protocol, amendment rule, "
-              "chronology audit and decision-helper source. No package source/default is changed by this helper.", ""]
+              "Consult the referenced chronology audit for observed files, events and limitations. "
+              "Absence of persisted test outcomes does not establish absence of in-memory access or verify process termination. "
+              "No official-test outcomes enter the decision calculation. Historical attempts remain preserved; "
+              "a new freeze is required before a new final-test evaluation.", "",
+              f"Original decision SHA-256: `{report.get('original_decision_sha256', 'Unavailable')}`.", "",
+              f"Amendment rule SHA-256: `{report.get('amendment_rule_sha256', 'Unavailable')}`.", "",
+              f"Chronology audit SHA-256: `{report.get('chronology_sha256', 'Unavailable')}`.", ""]
+    if report.get("input_sha256"):
+        lines += ["`input_sha256` binds the original evidence, original decision, unchanged decision protocol, amendment rule, "
+                  "chronology audit and decision-helper source.", ""]
+    else:
+        lines += ["Input checksums are unavailable in this report.", ""]
+    lines += ["No package source/default is changed by this helper.", ""]
     return "\n".join(lines)
+
+
+def markdown(report):
+    try:
+        return _markdown(report)
+    except (KeyError, TypeError, AttributeError) as error:
+        raise ValueError(f"Missing or malformed amendment report evidence: {error}") from error
 
 
 def write_amendment(original_path, protocol_path, chronology_path, output):
@@ -193,24 +292,30 @@ def write_amendment(original_path, protocol_path, chronology_path, output):
     counts = chronology["observed_counts"]
     selector.require(counts["test_prediction_attempts"] == 0 and counts["test_evaluation_files"] == 0
                      and counts["final_comparison_exists"] is False, "Chronology does not support pre-outcome amendment.")
-    rule = amendment_rule()
+    rule = amendment_rule(protocol)
     result = summarize_amendment(original, protocol)
     result.update(author="Chang Cheng", created_utc=datetime.now(timezone.utc).isoformat(),
                   original_decision=str(original_path), original_decision_sha256=sha(original_path),
                   amendment_rule=rule, chronology_audit=str(chronology_path), chronology_sha256=sha(chronology_path),
                   amendment_source_sha256=sha(__file__), original_decision_preserved=True,
-                  interpretation="Disclosed post-development preference amendment before official-test outcomes; theoretical routes remain conditional.",
+                  interpretation="Disclosed post-development preference amendment; consult the supplied chronology audit for observations and limitations. Theoretical routes remain conditional.",
                   test_outcomes_used_for_selection=False, final_test_evaluated=False, package_defaults_modified=False)
-    output.mkdir(parents=True, exist_ok=True)
     rule_path = output / "amendment-rule.json"
-    rule_path.write_text(json.dumps(rule, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
-    hashes[str(rule_path)] = sha(rule_path)
-    result.update(amendment_rule_sha256=sha(rule_path), input_sha256=hashes)
+    rule_bytes = (json.dumps(rule, indent=2, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
+    rule_hash = hashlib.sha256(rule_bytes).hexdigest()
+    result.update(amendment_rule_sha256=rule_hash, input_sha256={**hashes, str(rule_path): rule_hash})
+    # Prepare all content before creating files. In particular, malformed
+    # reporting evidence must not leave outputs that prevent a corrected retry.
+    markdown_bytes = markdown(result).encode("utf-8")
+    decision_bytes = (json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
     inputs.verify_unchanged()
     for path, expected in hashes.items():
         selector.require(sha(path) == expected, f"Evidence changed while amending: {path}")
-    (output / "decision.json").write_text(json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
-    (output / "decision.md").write_text(markdown(result), encoding="utf-8")
+    output.mkdir(parents=True, exist_ok=True)
+    rule_path.write_bytes(rule_bytes)
+    selector.require(sha(rule_path) == rule_hash, "Amendment rule changed while writing.")
+    (output / "decision.json").write_bytes(decision_bytes)
+    (output / "decision.md").write_bytes(markdown_bytes)
     return result
 
 

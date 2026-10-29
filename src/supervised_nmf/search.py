@@ -111,6 +111,12 @@ def calibration_rank_search(estimator, param_grid, X, y, *, rank_parameter=None,
     records, numerical failures and other parameter-boundary diagnostics. No
     full-training fit or held-out prediction occurs. Only the KNN estimators
     supported by the shared-grid evaluator are accepted.
+
+    A pipeline containing FeatureSPA retains anchor-derived training
+    coordinates and fixed-basis NNLS query coordinates. This search evaluates
+    that procedure without changing its coordinate policy. For a common SPA
+    training/query map, use ``NMFClassifier(solver='spa')`` with
+    ``training_coordinates='auto'`` or ``'transform'``.
     """
     start = time.perf_counter()
     max_expansions = _positive_integer(max_expansions, "max_expansions", minimum=0)

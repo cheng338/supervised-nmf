@@ -1,0 +1,176 @@
+{
+  "author": "Chang Cheng",
+  "extraction": "True labels and the four predicted-label vectors, in the original evaluation row order. Image identifiers, identity identifiers, pixels and probabilities are omitted.",
+  "fixture_hash_encoding": "Parsed CSV rows serialized as comma-separated ASCII labels in the listed column order, with LF line endings including the final newline",
+  "fixture_sha256": "a1ded0d0b846d21ccf8379562eaae53138286b43d80a84bba54194a2c740462c",
+  "historical_source_sha256": {
+    "dense_study_driver": "4da96ab43110f70cf22c7230b05ad58a60b961216852cb49ccc6281c67c33b6b",
+    "evaluations": {
+      "raw": "f49283295a74759f9605d61625c6d118a95c270f2a13db8ab6c14819546ab077",
+      "screen": "3d8d08a85a31e9e4d1393c865854231ddfbc69839f025fdf73749290e5072637",
+      "snmf": "6e351f082b97fffb0c44958fd80049fcf0fa07150d6074e12a62e07dd33d9309",
+      "spca": "f0917d551c31388beee007369f893bac61df23a1ccdfbc85eacaddeecd088a08"
+    },
+    "posttest_audit": "5be097bc7a484196b991d3f7bd4ac148e3c83e4dc736166be6545474a9dc378e",
+    "protocol": "6a9e6f51ed7b95cd4e0928b6d19d0756037941f3738abd41175eb53d9ee8ec83",
+    "results": "092587c825cd0490bc5f798553e49e129e2ea763ae36e9908349c657be087f9d"
+  },
+  "historical_versions": {
+    "numpy": "2.5.2",
+    "python": "3.12.14",
+    "scipy": "1.18.0"
+  },
+  "inference": {
+    "bootstrap_replicates": 10000,
+    "bootstrap_seed": 62107,
+    "class_draw_order": [
+      0,
+      1
+    ],
+    "difference_direction": "snmf minus comparator",
+    "primary_contrast": "spca",
+    "quantile_method": "linear",
+    "scope": "Paired class-stratified resampling of unique-identity rows, conditional on fixed fitted models; other contrasts descriptive with unadjusted intervals. McNemar concerns accuracy.",
+    "seed_reset": "Each comparison",
+    "units": "Proportions, not percentage points"
+  },
+  "label_coding": {
+    "0": "not Smiling",
+    "1": "Smiling"
+  },
+  "method_names": {
+    "raw": "Raw-feature KNN",
+    "screen": "Screening-only KNN",
+    "snmf": "Screened SPA-NMF + KNN",
+    "spca": "Screened PCA + KNN"
+  },
+  "statistics": {
+    "class_counts": [
+      490,
+      510
+    ],
+    "methods": {
+      "raw": {
+        "accuracy": 0.622,
+        "balanced_accuracy": 0.6198479391756703,
+        "class_recalls": [
+          0.5122448979591837,
+          0.7274509803921568
+        ],
+        "confusion_matrix": [
+          [
+            251,
+            239
+          ],
+          [
+            139,
+            371
+          ]
+        ]
+      },
+      "screen": {
+        "accuracy": 0.796,
+        "balanced_accuracy": 0.7957583033213285,
+        "class_recalls": [
+          0.7836734693877551,
+          0.807843137254902
+        ],
+        "confusion_matrix": [
+          [
+            384,
+            106
+          ],
+          [
+            98,
+            412
+          ]
+        ]
+      },
+      "snmf": {
+        "accuracy": 0.814,
+        "balanced_accuracy": 0.8137254901960784,
+        "class_recalls": [
+          0.8,
+          0.8274509803921568
+        ],
+        "confusion_matrix": [
+          [
+            392,
+            98
+          ],
+          [
+            88,
+            422
+          ]
+        ]
+      },
+      "spca": {
+        "accuracy": 0.785,
+        "balanced_accuracy": 0.785094037615046,
+        "class_recalls": [
+          0.789795918367347,
+          0.7803921568627451
+        ],
+        "confusion_matrix": [
+          [
+            387,
+            103
+          ],
+          [
+            112,
+            398
+          ]
+        ]
+      }
+    },
+    "snmf_minus_comparator": {
+      "raw": {
+        "accuracy_ci95": [
+          0.159,
+          0.226
+        ],
+        "accuracy_difference": 0.192,
+        "balanced_accuracy_ci95": [
+          0.1604421768707483,
+          0.22753101240496199
+        ],
+        "balanced_accuracy_difference": 0.19387755102040816,
+        "comparator_only_correct": 71,
+        "mcnemar_exact_two_sided_accuracy_p": 4.595007034371506e-27,
+        "snmf_only_correct": 263
+      },
+      "screen": {
+        "accuracy_ci95": [
+          -0.004,
+          0.041
+        ],
+        "accuracy_difference": 0.018,
+        "balanced_accuracy_ci95": [
+          -0.004361744697879151,
+          0.04115646258503401
+        ],
+        "balanced_accuracy_difference": 0.0179671868747499,
+        "comparator_only_correct": 58,
+        "mcnemar_exact_two_sided_accuracy_p": 0.14166174981277432,
+        "snmf_only_correct": 76
+      },
+      "spca": {
+        "accuracy_ci95": [
+          0.007,
+          0.051
+        ],
+        "accuracy_difference": 0.029,
+        "balanced_accuracy_ci95": [
+          0.006821728691476591,
+          0.05048119247699079
+        ],
+        "balanced_accuracy_difference": 0.02863145258103241,
+        "comparator_only_correct": 48,
+        "mcnemar_exact_two_sided_accuracy_p": 0.01195901352323824,
+        "snmf_only_correct": 77
+      }
+    }
+  },
+  "study_date_utc": "2026-10-06",
+  "task": "CelebA Smiling"
+}

@@ -11,6 +11,14 @@ and tests the choice between KNN and a parametric logistic classifier. It is a
 development validation study; it cannot establish person-independent accuracy or
 the conditional theoretical assumptions of the dissertation.
 
+Both completed October 6, 2026 study protocols specify
+`training_coordinates="fit_transform"`: SPA supplies anchor-derived coordinates
+for classifier training and fixed-basis NNLS projections for queries. Since
+version 0.3.0, the default `NMFClassifier` projects SPA training observations
+as well. The results and timings here describe the frozen study procedure;
+they are not measurements of that later default. See the
+[coordinate migration](release-0.3.0.md#spa-training-coordinates-migration).
+
 The initial run was paused before validation predictions
 to investigate BLAS acceleration. Its 109 completed CV checkpoints and source
 snapshot remain under `runs/wang-real-20261006/`; it produced no validation

@@ -14,6 +14,7 @@ from sklearn.exceptions import NotFittedError
 from threadpoolctl import threadpool_limits
 
 from supervised_nmf import FeatureSPA, NMFClassifier
+from supervised_nmf.classifier import _capture_projection
 from supervised_nmf.evaluation import calibration_search
 from supervised_nmf.study import calibration_knn_grid
 
@@ -175,17 +176,19 @@ class DecisionThresholdTests(unittest.TestCase):
     def test_execution_controls_change_without_refit_but_do_not_change_basis(self):
         model = self.model().fit(self.X, self.y)
         basis = model.components_.copy()
+        fitted_solver = model.decomposition_.projection_solver
+        fitted_batch_size = model.decomposition_.projection_batch_size
         expected = model.predict_proba(self.query)
         model.set_params(projection_solver="batched", projection_batch_size=7)
         np.testing.assert_allclose(model.predict_proba(self.query), expected, atol=1e-12)
-        self.assertEqual(model.decomposition_.projection_solver, "batched")
-        self.assertEqual(model.decomposition_.projection_batch_size, 7)
+        self.assertEqual(model.decomposition_.projection_solver, fitted_solver)
+        self.assertEqual(model.decomposition_.projection_batch_size, fitted_batch_size)
         np.testing.assert_array_equal(model.components_, basis)
         model.set_params(projection_workers=0)
-        with self.assertRaisesRegex(ValueError, "projection_workers"):
+        with self.assertRaisesRegex(ValueError, "projection_workers"), _capture_projection(model) as diagnostic:
             model.predict(self.query)
-        self.assertFalse(model.last_transform_converged_)
-        self.assertIn("projection_workers", model.last_transform_error_)
+        self.assertFalse(diagnostic["last_transform_converged"])
+        self.assertIn("projection_workers", diagnostic["last_transform_error"])
         model.set_params(projection_workers=1)
         np.testing.assert_allclose(model.predict_proba(self.query), expected, atol=1e-12)
 

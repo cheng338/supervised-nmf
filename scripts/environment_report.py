@@ -6,9 +6,9 @@ import os
 import platform
 import sys
 from threadpoolctl import threadpool_info
-import numpy  # Load BLAS before querying thread pools.
-import scipy
-import sklearn
+import numpy  # noqa: F401 -- Load numerical runtimes before querying thread pools.
+import scipy  # noqa: F401 -- Load numerical runtimes before querying thread pools.
+import sklearn  # noqa: F401 -- Load numerical runtimes before querying thread pools.
 
 print(json.dumps({
     "python": sys.version,

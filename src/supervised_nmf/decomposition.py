@@ -47,6 +47,14 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
     or refitting on new observations. ``fit_transform`` returns the anchor
     coordinates W; ``transform(X_train)`` may differ on noisy data.
 
+    A generic sklearn Pipeline therefore trains its next step on anchor
+    coordinates and predicts using projected coordinates. For a common SPA
+    classification map, use ``NMFClassifier(solver='spa')`` with
+    ``training_coordinates='auto'`` or ``'transform'``, or explicitly call
+    ``fit`` then ``transform`` on the training data before fitting a separate
+    classifier. Refit all learned
+    steps inside each training fold when performing cross-validation.
+
     This is a separate estimator from coordinate-descent NMF. Its recovery
     theory requires feature separability, a full-rank anchor matrix and noise
     conditions; success on a classification example does not establish them.
@@ -96,6 +104,11 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
         self.projection_workers = projection_workers
         self.projection_batch_size = projection_batch_size
         self.projection_native_threads = projection_native_threads
+
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.input_tags.positive_only = True
+        return tags
 
     def __setstate__(self, state):
         # Make get_params/clone work for models serialized before these
@@ -195,15 +208,30 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
         return self
 
     def fit_transform(self, X, y=None, **fit_params):
+        """Fit the anchor factorization and return a copy of its anchor columns.
+
+        This returns ``fit_coordinates_``, not a fixed-basis NNLS projection.
+        It can differ from ``fit(X, y).transform(X)`` on noisy data. A generic
+        pipeline passes these anchor coordinates to its next step during fit.
+        """
         if fit_params:
             raise TypeError(f"Unsupported fit parameters: {', '.join(fit_params)}")
         return self.fit(X, y).fit_coordinates_.copy()
 
     def transform(self, X):
+        """Project observations by NNLS against the fitted basis.
+
+        Training inputs use this projection too; their returned coordinates
+        can differ from ``fit_coordinates_``. Projection does not update the
+        stored anchor coordinates or their ``reconstruction_err_`` diagnostic.
+        """
         check_is_fitted(self, "components_")
         X = _nonnegative_array(X).astype(np.float64, copy=False)
         if X.shape[1] != self.n_features_in_:
-            raise ValueError(f"X has {X.shape[1]} features; expected {self.n_features_in_}.")
+            raise ValueError(
+                f"X has {X.shape[1]} features, but {type(self).__name__} is expecting "
+                f"{self.n_features_in_} features as input."
+            )
         # scipy.optimize.nnls requests a C-order design matrix. Prepare the
         # shared fixed basis once, rather than copying its transpose per row.
         # Never overwrite the fitted basis. The guarded batched path falls

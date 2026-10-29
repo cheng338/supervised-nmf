@@ -44,7 +44,7 @@ def check(output):
                           {"score_threshold": 2, "n_components": rank, "n_neighbors": 5})
             model.set_params(**parameters)
             record = {"method": method, "rank": rank, "status": "failed"}
-            start, caught = time.perf_counter(), []
+            start = time.perf_counter()
             with threadpool_limits(limits=1), warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 try:

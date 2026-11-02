@@ -34,16 +34,29 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 
+import hashlib as _cycle_hashlib
 from numbers import Integral, Real
+from pathlib import Path
+import sys
 import warnings
 
 import numpy as np
+from numpy import ndarray as _ndarray
 from scipy import linalg
 from scipy.linalg.lapack import get_lapack_funcs
+from sklearn import get_config as _diagnostic_get_config
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.decomposition._nmf import _initialize_nmf
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.utils.validation import check_array, check_is_fitted
+
+# Prefer the matching package in a source checkout. A copied standalone
+# script requires a compatible supervised_nmf installation.
+_SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src"
+if (_SOURCE_ROOT / "supervised_nmf").is_dir():
+    sys.path.insert(0, str(_SOURCE_ROOT))
+from supervised_nmf._aocl import nnls_matmul, padded_matmul, _PreparedRightOperand
+from supervised_nmf._padding_roles import make_output_workspace
 
 
 def _positive_integer(value, name):
@@ -91,18 +104,69 @@ def projected_gradient_kkt(X, W, H):
     X, W, H = _array(X, nonnegative=True), _array(W), _array(H)
     if W.shape[0] != X.shape[0] or H.shape[1] != X.shape[1] or W.shape[1] != H.shape[0]:
         raise ValueError("Incompatible X, W and H shapes.")
-    residual = W @ H - X
-    raw = _pg_values(W, H, residual @ H.T, W.T @ residual)
-    scales = linalg.norm(H, axis=1)
+    _diagnostic_check_finite = _diagnostic_get_config()["assume_finite"]
+    matmul = nnls_matmul()
+    residual = _diagnostic_residual(matmul, W, H, X)
+    raw = _diagnostic_pg_values(W, H, matmul(residual, H.T), matmul(W.T, residual))
+    scales = linalg.norm(H, axis=1, check_finite=_diagnostic_check_finite)
     scales = np.where(scales > 0, scales, 1.0)
     canonical_W, canonical_H = W * scales, H / scales[:, None]
-    canonical = _pg_values(canonical_W, canonical_H,
-                           residual @ canonical_H.T, canonical_W.T @ residual)
-    error, norm_X = float(linalg.norm(residual)), float(linalg.norm(X))
+    canonical = _diagnostic_pg_values(canonical_W, canonical_H,
+                           matmul(residual, canonical_H.T), matmul(canonical_W.T, residual))
+    error, norm_X = float(linalg.norm(residual)), float(linalg.norm(X, check_finite=_diagnostic_check_finite))
     return {"raw": raw, "canonical": canonical, "reconstruction_error": error,
             "relative_reconstruction_error": error / norm_X if norm_X else (0.0 if error == 0 else None),
             "objective": 0.5 * error ** 2, "dtype": "float64",
             "convention": "full unregularized Frobenius NMF; descriptive only; canonical H row L2=1 on copies"}
+
+def _diagnostic_pg_values(W, H, grad_W, grad_H):
+    projected_W = np.where((W > 0) | (grad_W < 0), grad_W, 0.0)
+    projected_H = np.where((H > 0) | (grad_H < 0), grad_H, 0.0)
+    norm_kw = {"check_finite": False} if (np.isfinite(grad_W).all() and np.isfinite(grad_H).all()) else {}
+    pg = float(np.hypot(linalg.norm(projected_W, **norm_kw), linalg.norm(projected_H, **norm_kw)))
+    total = float(np.hypot(linalg.norm(grad_W, **norm_kw), linalg.norm(grad_H, **norm_kw)))
+    return {"projected_gradient_norm": pg, "gradient_norm": total,
+            "relative_projected_gradient": pg / total if total else 0.0,
+            "primal_violation": float(max(0.0, -W.min(), -H.min()))}
+
+def _diagnostic_residual(base, left, right, X):
+    """Produce the original owned C residual, with identical protected GEMM.
+
+    Inputs already passed the diagnostic's original validation/shape checks.
+    The output never aliases inputs or the padded native product. Ineligible
+    routes/backends retain the original product followed by in-place subtract.
+    """
+    if base is not padded_matmul:
+        residual = base(left, right)
+        residual -= X
+        return residual
+    m, k = left.shape
+    n = right.shape[1]
+    mp, npad = (m + 7) & ~7, (n + 7) & ~7
+    # Exactly the existing one-axis borrow-left predicate, after its aligned
+    # direct route. A merely strided user operand is not made borrowable.
+    if not (mp == m and npad != n
+            and type(left) is _ndarray and left.flags.c_contiguous
+            and left.dtype == np.float64 and left.flags.aligned
+            and left.strides == (k * 8, 8)):
+        residual = base(left, right)
+        residual -= X
+        return residual
+    b = product = residual = None
+    try:
+        # Same allocation, population and full-K native product as current.
+        b = np.zeros((k, npad), dtype=np.float64)
+        b[..., :n] = right
+        product = np.matmul(left, b)
+        # One owned C allocation, with subtraction populating it directly.
+        # Current first copies this crop, then subtracts X into that copy.
+        residual = np.empty((m, n), dtype=np.float64, order='C')
+        np.subtract(product[:m, :n], X, out=residual)
+        return residual
+    finally:
+        # Release helper-held temporaries even if an exception traceback is
+        # retained. Foreign/wrapper frames can still retain their arguments.
+        b = product = residual = None
 
 
 def _minimum_norm_lstsq(A, B):
@@ -192,13 +256,53 @@ def nnls_block_pivot(A, B, *, init=None, max_iter=None, tol=1e-10):
     On numerical nonconvergence a feasible clipped candidate and success=False
     are returned WITH ConvergenceWarning. No alternate NNLS algorithm is used.
     """
+    return _nnls_block_pivot(A, B, init=init, max_iter=max_iter, tol=tol)
+
+
+class _FixedTrainingRHS:
+    """One fit-local target role, never a cache for arbitrary solve inputs.
+
+    ``solve`` always uses this exact logical target, and the core still calls
+    _array on every solve. The caller may prepare C-order training targets
+    once; this role prepares only the cross product's native RHS.
+    The fit does not mutate training data, and no state survives in the model.
+    """
+
+    def __init__(self, targets):
+        self._targets = targets
+        self._prepared = None
+
+    def solve(self, A, *, init=None, max_iter=None, tol=1e-10):
+        return _nnls_block_pivot(A, self._targets, init=init, max_iter=max_iter,
+                                 tol=tol, cross_rhs=self)
+
+    def _cross_product(self, left, normalized_right, operation):
+        if operation is not padded_matmul:
+            # A later solve still follows its own selector, even if a prior
+            # solve used preparation. Never retain a backend-specific route.
+            self._prepared = None
+            return operation(left, normalized_right)
+        m, _ = left.shape
+        n = normalized_right.shape[1]
+        if m % 8 == 0 and n % 8 == 0:
+            return operation(left, normalized_right)
+        if self._prepared is None:
+            self._prepared = _PreparedRightOperand(normalized_right)
+        return self._prepared.matmul(left)
+
+
+def _nnls_block_pivot(A, B, *, init=None, max_iter=None, tol=1e-10, cross_rhs=None):
+    """Shared core; cross_rhs is supplied only by its bound training role."""
     A, B = _array(A), _array(B)
     if A.shape[0] != B.shape[0]:
         raise ValueError("A and B must have equal row counts.")
     tol = _tolerance(tol, "tol")
     count, rhs = A.shape[1], B.shape[1]
     cap = max(100, 5 * count) if max_iter is None else _positive_integer(max_iter, "max_iter")
-    gram, cross = A.T @ A, A.T @ B
+    matmul = nnls_matmul()
+    gram = matmul(A.T, A)
+    cross = (matmul(A.T, B) if cross_rhs is None
+             else cross_rhs._cross_product(A.T, B, matmul))
     if not np.isfinite(gram).all() or not np.isfinite(cross).all():
         raise ValueError("NNLS products overflowed; rescale the input.")
     passive = np.zeros((count, rhs), dtype=bool)
@@ -211,7 +315,7 @@ def nnls_block_pivot(A, B, *, init=None, max_iter=None, tol=1e-10):
         coefficients, solves, direct_solves = _passive_solve(A, B, gram, cross, passive)
     else:
         coefficients = np.zeros_like(cross)
-    gradient = gram @ coefficients - cross
+    gradient = matmul(gram, coefficients) - cross
     # Relative to the zero-solution gradient for each RHS; no arbitrary unit
     # floor, so rescaling observations does not silently change qualification.
     gradient_scale = np.maximum(np.max(np.abs(cross), axis=0), np.finfo(float).tiny)
@@ -245,14 +349,15 @@ def nnls_block_pivot(A, B, *, init=None, max_iter=None, tol=1e-10):
         coefficients[:, pending] = solved
         solves += groups
         direct_solves += direct
-        gradient[:, pending] = gram @ solved - cross[:, pending]
+        gradient[:, pending] = matmul(gram, solved) - cross[:, pending]
         iterations = iteration + 1
     # Check the feasible returned candidate against ORIGINAL A/B, not just the
     # potentially cancellation-prone normal equations or passive-set status.
     unclipped_primal = float(max(0.0, -coefficients.min()))
     coefficients = np.maximum(coefficients, 0.0)
-    residual = A @ coefficients - B
-    gradient = A.T @ residual
+    residual = matmul(A, coefficients)
+    residual -= B
+    gradient = matmul(A.T, residual)
     projected = np.where((coefficients > 0) | (gradient < 0), gradient, 0.0)
     relative_by_rhs = np.max(np.abs(projected), axis=0) / gradient_scale
     relative = float(relative_by_rhs.max())
@@ -270,8 +375,90 @@ def nnls_block_pivot(A, B, *, init=None, max_iter=None, tol=1e-10):
     if not success:
         warnings.warn("ANLS-BPP inner NNLS failed its iteration/KKT qualification; "
                       f"iterations={iterations}/{cap}, relative projected gradient={relative:.3g}.",
-                      ConvergenceWarning, stacklevel=2)
+                      ConvergenceWarning, stacklevel=3)
     return coefficients, info
+
+
+class _ExactFactorCycle:
+    """Fit-local exact repeats of accepted, immutable float64 factor pairs.
+
+    The fit allocates new factors at each accepted sweep, so retaining their
+    references does not copy operands. Hashes only select collision buckets;
+    every repeat verifies both complete bit patterns. Contiguous factors use
+    full history; other layouts use a continuously advanced Brent checkpoint.
+    This detects represented states, not recurrence of hidden native state.
+    """
+
+    def __init__(self):
+        self.checkpoint = None
+        self.power = 1
+        self.distance = 0
+        self.history = {}
+
+    @staticmethod
+    def _equal(left, right):
+        _, left_w, left_h = left
+        _, right_w, right_h = right
+        if (left_w.dtype != np.float64 or left_h.dtype != np.float64
+                or right_w.dtype != np.float64 or right_h.dtype != np.float64):
+            raise TypeError("Cycle comparison requires float64 factors.")
+        return (left_w.shape == right_w.shape and left_h.shape == right_h.shape
+                and np.array_equal(left_w.view(np.uint64), right_w.view(np.uint64))
+                and np.array_equal(left_h.view(np.uint64), right_h.view(np.uint64)))
+
+    @staticmethod
+    def _contiguous(pair):
+        return pair[1].flags.c_contiguous and pair[2].flags.c_contiguous
+
+    @staticmethod
+    def _fingerprint(w, h):
+        # Deliberately patchable in tests to force collisions. No .tobytes(),
+        # contiguous conversion, factor normalization or full factor copy.
+        digest = _cycle_hashlib.blake2b(digest_size=16)
+        digest.update(memoryview(w).cast("B"))
+        digest.update(memoryview(h).cast("B"))
+        return digest.digest()
+
+    def _key(self, pair):
+        _, w, h = pair
+        return (w.shape, w.dtype.str, h.shape, h.dtype.str,
+                self._fingerprint(w, h))
+
+    def _event(self, current, matched, detector):
+        return dict(method="fingerprint", detector=detector,
+                    detected_iteration=current[0], matched_iteration=matched[0],
+                    period=current[0]-matched[0])
+
+    def observe(self, w, h, iteration):
+        if w.dtype != np.float64 or h.dtype != np.float64:
+            raise TypeError("Cycle comparison requires float64 factors.")
+        current = (iteration, w, h)
+        contiguous = self._contiguous(current)
+        key = self._key(current) if contiguous else None
+        if self.checkpoint is None:
+            self.checkpoint = current
+            if contiguous:
+                self.history[key] = [current]
+            return None
+        self.distance += 1
+        if contiguous:
+            # Keep all collision candidates. A collision can add comparisons
+            # but cannot cause a false match or evict a genuine matching pair.
+            for previous in self.history.get(key, ()):
+                if self._equal(previous, current):
+                    return self._event(current, previous, "fingerprint")
+        # A contiguous checkpoint is already represented in the hash table;
+        # repeat equality would be redundant. Unsupported layouts use Brent.
+        if (not contiguous or not self._contiguous(self.checkpoint)):
+            if self._equal(self.checkpoint, current):
+                return self._event(current, self.checkpoint, "brent_layout_fallback")
+        if self.distance == self.power:
+            self.checkpoint = current
+            self.power *= 2
+            self.distance = 0
+        if contiguous:
+            self.history.setdefault(key, []).append(current)
+        return None
 
 
 class ANLSBPP(TransformerMixin, BaseEstimator):
@@ -284,6 +471,15 @@ class ANLSBPP(TransformerMixin, BaseEstimator):
     projected-gradient norm <= tol times its initial norm, not MU's objective
     improvement rule. All failure/cap paths warn or raise; no silent fallback.
     The common external diagnostic is descriptive, not this stopping criterion.
+
+    Rank-one fits with positive ``tol`` also stop when an accepted factor pair
+    repeats exactly. This finite-precision effort stop leaves ``converged_``
+    false, warns with reason ``repeated_iterate``, and records scalar details
+    in ``cycle_event_``. It does not assert optimality or relax the original
+    relative-gradient criterion. ``tol=0`` and higher ranks bypass detection.
+    Full-history hashing scans both factors per accepted sweep and retains
+    their arrays until fit exit, using up to O(max_iter * (n_samples +
+    n_features)) factor storage for rank one, plus indexing overhead.
     """
 
     def __init__(self, n_components=2, *, max_iter=1000, tol=1e-4,
@@ -314,11 +510,12 @@ class ANLSBPP(TransformerMixin, BaseEstimator):
         _tolerance(self.nnls_tol, "nnls_tol")
         if self.nnls_max_iter is not None:
             _positive_integer(self.nnls_max_iter, "nnls_max_iter")
+        matmul = nnls_matmul()
         W, H = _initialize_nmf(X, rank, init="nndsvda", random_state=self.random_state)
-        grad_W = W @ (H @ H.T) - X @ H.T
-        grad_H = (W.T @ W) @ H - W.T @ X
+        grad_W = matmul(W, matmul(H, H.T)) - matmul(X, H.T)
+        grad_H = matmul(matmul(W.T, W), H) - matmul(W.T, X)
         initial_pg = _pg_values(W, H, grad_W, grad_H)["projected_gradient_norm"]
-        initial_error = float(linalg.norm(X - W @ H))
+        initial_error = float(linalg.norm(X - matmul(W, H)))
         history = [0.5 * initial_error ** 2]
         pg_history = [initial_pg]
         inner_summary = {"solves": 0, "pivot_iterations": 0, "direct_lstsq_groups": 0,
@@ -327,44 +524,91 @@ class ANLSBPP(TransformerMixin, BaseEstimator):
         converged = initial_pg == 0
         reason = "initial_stationarity" if converged else "outer_iteration_limit"
         iterations = 0
-        for iteration in range(cap):
-            if converged:
-                break
-            next_W, info_W = nnls_block_pivot(H.T, X.T, init=W.T,
-                                              max_iter=self.nnls_max_iter, tol=self.nnls_tol)
-            if info_W["success"]:
-                next_H, info_H = nnls_block_pivot(next_W.T, X, init=H,
-                                                  max_iter=self.nnls_max_iter, tol=self.nnls_tol)
-                records = (info_W, info_H)
-            else:
-                info_H = {"success": False}
-                records = (info_W,)
-            for record in records:
-                inner_summary["solves"] += 1
-                inner_summary["pivot_iterations"] += record["n_iter"]
-                inner_summary["direct_lstsq_groups"] += record["direct_lstsq_groups"]
-                inner_summary["single_pivots"] += record["single_pivots"]
-                inner_summary["failed_solves"] += int(not record["success"])
-                inner_summary["maximum_relative_projected_gradient"] = max(
-                    inner_summary["maximum_relative_projected_gradient"], record["projected_gradient_relative"])
-            if not info_W["success"] or not info_H["success"]:
-                reason = "inner_nnls_failure"
-                break
-            new_W, new_H = next_W.T, next_H
-            residual = new_W @ new_H - X
-            objective = 0.5 * float(linalg.norm(residual)) ** 2
-            monotonic_allowance = 256 * np.finfo(float).eps * max(1.0, history[0])
-            if not np.isfinite(objective) or objective > history[-1] + monotonic_allowance:
-                reason = "objective_increase_or_nonfinite"
-                break
-            W, H = new_W, new_H
-            iterations = iteration + 1
-            history.append(objective)
-            current_pg = _pg_values(W, H, residual @ H.T, W.T @ residual)["projected_gradient_norm"]
-            pg_history.append(current_pg)
-            converged = current_pg <= tol * initial_pg
-            if converged:
-                reason = "relative_projected_gradient"
+        self.cycle_event_ = None
+        _cycle_detector = (_ExactFactorCycle()
+                           if rank == 1 and tol > 0 and not converged else None)
+        training_W_rhs = training_H_rhs = transpose_targets = None
+        outer_reconstruction = outer_gradient_w = outer_gradient_h = None
+        try:
+            for iteration in range(cap):
+                if converged:
+                    break
+                if transpose_targets is None:
+                    transpose_targets = np.ascontiguousarray(X.T)
+                if matmul is padded_matmul:
+                    if training_W_rhs is None:
+                        training_W_rhs = _FixedTrainingRHS(transpose_targets)
+                    next_W, info_W = training_W_rhs.solve(H.T, init=W.T,
+                        max_iter=self.nnls_max_iter, tol=self.nnls_tol)
+                else:
+                    next_W, info_W = nnls_block_pivot(H.T, transpose_targets, init=W.T,
+                                                      max_iter=self.nnls_max_iter, tol=self.nnls_tol)
+                if info_W["success"]:
+                    if matmul is padded_matmul:
+                        if training_H_rhs is None:
+                            training_H_rhs = _FixedTrainingRHS(X)
+                        next_H, info_H = training_H_rhs.solve(next_W.T, init=H,
+                            max_iter=self.nnls_max_iter, tol=self.nnls_tol)
+                    else:
+                        next_H, info_H = nnls_block_pivot(next_W.T, X, init=H,
+                                                          max_iter=self.nnls_max_iter, tol=self.nnls_tol)
+                    records = (info_W, info_H)
+                else:
+                    info_H = {"success": False}
+                    records = (info_W,)
+                for record in records:
+                    inner_summary["solves"] += 1
+                    inner_summary["pivot_iterations"] += record["n_iter"]
+                    inner_summary["direct_lstsq_groups"] += record["direct_lstsq_groups"]
+                    inner_summary["single_pivots"] += record["single_pivots"]
+                    inner_summary["failed_solves"] += int(not record["success"])
+                    inner_summary["maximum_relative_projected_gradient"] = max(
+                        inner_summary["maximum_relative_projected_gradient"], record["projected_gradient_relative"])
+                if not info_W["success"] or not info_H["success"]:
+                    reason = "inner_nnls_failure"
+                    break
+                new_W, new_H = next_W.T, next_H
+                if outer_reconstruction is None:
+                    outer_reconstruction = matmul if new_W.shape[0] % 8 == 0 and new_H.shape[1] % 8 == 0 else make_output_workspace(matmul)
+                    outer_gradient_w = matmul if X.shape[0] % 8 == 0 and new_H.shape[0] % 8 == 0 else make_output_workspace(matmul)
+                    outer_gradient_h = matmul if new_W.shape[1] % 8 == 0 and X.shape[1] % 8 == 0 else make_output_workspace(matmul)
+                residual = outer_reconstruction(new_W, new_H)
+                residual -= X
+                objective = 0.5 * float(linalg.norm(residual)) ** 2
+                monotonic_allowance = 256 * np.finfo(float).eps * max(1.0, history[0])
+                if not np.isfinite(objective) or objective > history[-1] + monotonic_allowance:
+                    reason = "objective_increase_or_nonfinite"
+                    break
+                W, H = new_W, new_H
+                iterations = iteration + 1
+                history.append(objective)
+                current_pg = _pg_values(W, H, outer_gradient_w(residual, H.T), outer_gradient_h(W.T, residual))["projected_gradient_norm"]
+                pg_history.append(current_pg)
+                converged = current_pg <= tol * initial_pg
+                if converged:
+                    reason = "relative_projected_gradient"
+                elif _cycle_detector is not None:
+                    event = _cycle_detector.observe(W, H, iterations)
+                    if event is not None:
+                        self.cycle_event_ = event
+                        reason = "repeated_iterate"
+                        converged = False
+                        break
+        except BaseException:
+            if _cycle_detector is not None:
+                # A retained traceback may hold observe's collision iterator.
+                # Empty its lists as well as the index; current/previous frame
+                # locals can still retain their own individual factor pairs.
+                for bucket in _cycle_detector.history.values():
+                    bucket.clear()
+                _cycle_detector.history.clear()
+                _cycle_detector.checkpoint = None
+            raise
+        finally:
+            _cycle_detector = None
+            for workspace in (outer_reconstruction, outer_gradient_w, outer_gradient_h):
+                if workspace is not None and workspace is not matmul:
+                    workspace.clear()
         self.n_features_in_, self.n_components_ = X.shape[1], rank
         self.components_, self.training_coordinates_ = H.copy(), W.copy()
         self.n_iter_, self.converged_ = iterations, bool(converged)
@@ -372,7 +616,7 @@ class ANLSBPP(TransformerMixin, BaseEstimator):
         self.objective_history_, self.projected_gradient_history_ = history, pg_history
         self.initial_projected_gradient_ = initial_pg
         self.relative_projected_gradient_ = pg_history[-1] / initial_pg if initial_pg else 0.0
-        self.reconstruction_err_ = float(linalg.norm(X - W @ H))
+        self.reconstruction_err_ = float(linalg.norm(X - matmul(W, H)))
         self.nnls_diagnostics_, self.computation_dtype_ = inner_summary, "float64"
         if not converged:
             warnings.warn(f"ANLS-BPP did not converge: {reason}; outer sweeps={iterations}/{cap}, "

@@ -175,6 +175,103 @@ class EvaluationReportingTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     evaluate_classifier(self.model, self.X, self.y, **metadata)
 
+    def test_cross_split_identifier_type_mismatch_rejected_before_prediction(self):
+        for name in ("sample_ids", "groups"):
+            for training_strings in (False, True):
+                for offset in (0, 100):
+                    training = np.arange(20) + offset
+                    evaluation = np.arange(20)
+                    if training_strings:
+                        training = [str(value) for value in training]
+                    else:
+                        evaluation = [str(value) for value in evaluation]
+                    metadata = {name: evaluation, f"train_{name}": training}
+                    with self.subTest(name=name, training_strings=training_strings, offset=offset):
+                        with (patch.object(self.model, "predict") as predict,
+                              patch.object(self.model, "predict_proba") as predict_proba):
+                            with self.assertRaisesRegex(
+                                    ValueError, "must use the same identifier type.*numeric or string"):
+                                evaluate_classifier(self.model, self.X, self.y, **metadata)
+                            predict.assert_not_called()
+                            predict_proba.assert_not_called()
+
+    def test_numeric_identifier_family_preserves_integer_and_fractional_ids(self):
+        direct = evaluate_classifier(self.model, self.X, self.y)
+        for evaluation, training in (
+                (np.arange(20), np.arange(20, dtype=float) + 100),
+                (np.arange(20), np.arange(20, dtype=float) + 100.5),
+                (np.arange(20, dtype=float) + .5, np.arange(20) + 100)):
+            with self.subTest(evaluation=evaluation[0], training=training[0]):
+                report = evaluate_classifier(
+                    self.model, self.X, self.y, sample_ids=evaluation, train_sample_ids=training,
+                    groups=evaluation, train_groups=training)
+                self.assertEqual(report["status"], "valid")
+                self.assertEqual(report["metrics"], direct["metrics"])
+                self.assertEqual(report["predictions"]["sample_ids"], evaluation.tolist())
+                self.assertEqual(report["evaluation_groups"], evaluation.tolist())
+                self.assertTrue(report["support_diagnostics"]["sample_overlap_checked"])
+                self.assertTrue(report["support_diagnostics"]["group_overlap_checked"])
+
+    def test_same_family_identifier_overlap_still_rejected_before_prediction(self):
+        integers = np.arange(20)
+        floats = np.arange(20, dtype=float) + 100
+        floats[0] = 1.0
+        fractional = np.arange(20, dtype=float) + .5
+        strings = [f"subject-{value}" for value in integers]
+        for name in ("sample_ids", "groups"):
+            for evaluation, training in (
+                    (integers, floats), (floats, integers),
+                    (fractional, fractional.copy()), (strings, strings.copy())):
+                with self.subTest(name=name, evaluation=evaluation[0], training=training[0]):
+                    with (patch.object(self.model, "predict") as predict,
+                          patch.object(self.model, "predict_proba") as predict_proba):
+                        with self.assertRaisesRegex(ValueError, "must not overlap"):
+                            evaluate_classifier(self.model, self.X, self.y,
+                                                **{name: evaluation, f"train_{name}": training})
+                        predict.assert_not_called()
+                        predict_proba.assert_not_called()
+
+    def test_string_identifiers_preserve_leading_zeros_without_numeric_coercion(self):
+        evaluation = [f"0{value}" for value in range(1, 21)]
+        training = [str(value) for value in range(1, 21)]
+        report = evaluate_classifier(
+            self.model, self.X, self.y, sample_ids=evaluation, train_sample_ids=training,
+            groups=evaluation, train_groups=training)
+        self.assertEqual(report["status"], "valid")
+        self.assertEqual(report["predictions"]["sample_ids"], evaluation)
+        self.assertEqual(report["evaluation_groups"], evaluation)
+        self.assertTrue(report["support_diagnostics"]["sample_overlap_checked"])
+        self.assertTrue(report["support_diagnostics"]["group_overlap_checked"])
+
+    def test_sample_and_group_identifier_namespaces_are_independent(self):
+        strings = [f"subject-{value}" for value in range(20)]
+        training_strings = [f"training-{value}" for value in range(20)]
+        numbers = np.arange(20)
+        for sample_strings in (False, True):
+            sample_ids = strings if sample_strings else numbers
+            train_sample_ids = training_strings if sample_strings else numbers + 100
+            groups = numbers if sample_strings else strings
+            train_groups = numbers + 100 if sample_strings else training_strings
+            # Type consistency applies to corresponding train/evaluation
+            # arrays, not jointly to the sample and subject namespaces.
+            with self.subTest(sample_strings=sample_strings):
+                report = evaluate_classifier(
+                    self.model, self.X, self.y, sample_ids=sample_ids,
+                    train_sample_ids=train_sample_ids, groups=groups, train_groups=train_groups)
+                self.assertEqual(report["status"], "valid")
+                self.assertTrue(report["support_diagnostics"]["sample_overlap_checked"])
+                self.assertTrue(report["support_diagnostics"]["group_overlap_checked"])
+
+    def test_optional_metadata_does_not_require_cross_split_identifier_types(self):
+        for metadata in ({}, {"train_y": self.train_y},
+                         {"sample_ids": [f"image-{value}" for value in range(20)],
+                          "groups": np.arange(20)}):
+            with self.subTest(metadata=list(metadata)):
+                report = evaluate_classifier(self.model, self.X, self.y, **metadata)
+                self.assertEqual(report["status"], "valid")
+                self.assertFalse(report["support_diagnostics"]["sample_overlap_checked"])
+                self.assertFalse(report["support_diagnostics"]["group_overlap_checked"])
+
     def test_valid_metadata_preserves_predictions_and_probabilities(self):
         direct = evaluate_classifier(self.model, self.X, self.y)
         enriched = evaluate_classifier(self.model, self.X, self.y, sample_ids=np.arange(20),

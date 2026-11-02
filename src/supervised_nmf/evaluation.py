@@ -184,6 +184,7 @@ def _diagnostics(estimator, projection=None):
                       "training_projection_converged_", "training_projection_convergence_warnings_", "training_projection_performed_",
                       "classifier_n_iter_", "classifier_converged_", "classifier_convergence_warnings_",
                       "knn_normalization_", "training_coordinates_mode_",
+                      "decision_threshold_", "positive_label_", "positive_class_index_", "mu_projection_",
                       "fit_times_", "n_features_in_"):
         if attribute.startswith("last_transform_") and call_local:
             continue
@@ -307,11 +308,16 @@ def refinement_diagnostics(candidates, selected_params):
     """Flag range boundaries and interior intervals; this is not completed tuning."""
     if selected_params is None:
         return {"status": "pending_valid_candidate", "parameters": {}}
+    numeric_types = (int, float, np.number)
+    boolean_types = (bool, np.bool_)
     output = {}
     for parameter, selected in selected_params.items():
         values = [c[parameter] for c in candidates if parameter in c]
-        if isinstance(selected, (int, float, np.number)) and not isinstance(selected, bool):
-            values = sorted(set(float(v) for v in values if isinstance(v, (int, float, np.number))))
+        if isinstance(selected, numeric_types) and not isinstance(selected, boolean_types):
+            includes_none = any(value is None for value in values)
+            values = sorted(set(float(v) for v in values
+                                if isinstance(v, numeric_types)
+                                and not isinstance(v, boolean_types)))
             if len(values) < 2:
                 output[parameter] = {"status": "single_value_requires_exploration", "selected": selected}
             else:
@@ -320,6 +326,8 @@ def refinement_diagnostics(candidates, selected_params):
                           else "upper_boundary_requires_expansion_or_constraint" if location == len(values) - 1
                           else "interior_interval_requires_refinement")
                 output[parameter] = {"status": status, "selected": selected, "values": values}
+            if includes_none:
+                output[parameter]["includes_none"] = True
         else:
             output[parameter] = {"status": "categorical", "selected": selected}
     return {"status": "pending_refinement_and_replication", "parameters": output}
@@ -335,6 +343,12 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
                        threads=1, checkpoint_path=None, refit=True,
                        groups=None, folds=None, data_ids=None):
     """Calibrate on training data with complete, resumable per-fold records.
+
+    Defaults are five folds, seed zero and one native numerical thread.
+    Candidate/fold loops are serial: ``threads`` limits supported native pools,
+    not CV workers. Separate SPA projection controls can override that limit
+    or launch processes, so it is not a global concurrency ceiling. ``seed``
+    controls generated folds; fix estimator random states separately.
 
     Both fit and held-out-fold prediction warnings are retained. Convergence
     warnings invalidate that candidate. If a numerically valid CV winner fails
@@ -516,11 +530,16 @@ def _evaluation_metadata(y, classes, *, sample_ids, groups, train_sample_ids,
     if train_sample_ids is not None:
         if sample_ids is None:
             raise ValueError("sample_ids are required when train_sample_ids are supplied.")
+        # Each validated array has one ID family. Compare without coercing IDs.
+        if isinstance(train_sample_ids[0], str) != isinstance(sample_ids[0], str):
+            raise ValueError("Training and evaluation sample IDs must use the same identifier type (numeric or string).")
         if set(train_sample_ids.tolist()) & set(sample_ids.tolist()):
             raise ValueError("Training and evaluation sample IDs must not overlap.")
     if train_groups is not None:
         if groups is None:
             raise ValueError("groups are required when train_groups are supplied.")
+        if isinstance(train_groups[0], str) != isinstance(groups[0], str):
+            raise ValueError("Training and evaluation groups must use the same identifier type (numeric or string).")
         if set(train_groups.tolist()) & set(groups.tolist()):
             raise ValueError("Training and evaluation groups must not overlap.")
     counts = [int(np.sum(y == label)) for label in classes]
@@ -562,8 +581,10 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
     Optional ``train_y`` defines a training-only majority reference. Subject IDs
     in ``groups`` provide subject counts; with ``train_groups`` they also enforce
     disjoint training/evaluation subjects. Likewise, ``train_sample_ids`` require
-    explicit evaluation ``sample_ids`` and reject shared rows. Metadata is
-    checked before prediction. Support thresholds add descriptive flags only;
+    explicit evaluation ``sample_ids`` and reject shared rows. Each paired
+    training/evaluation ID array must use the same numeric or string identifier
+    type; integer and floating-point IDs are compatible. Metadata is checked
+    before prediction. Support thresholds add descriptive flags only;
     they do not alter predictions, scores, numerical status or model selection.
     Ranking metrics use probabilities when available, otherwise genuine binary
     decision margins oriented toward ``classes_[1]``. Margins are recorded

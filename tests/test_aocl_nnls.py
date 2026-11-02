@@ -115,14 +115,14 @@ def test_padding_changes_true_outer_dimensions_and_zero_fills():
     with patch.object(_aocl.np, "matmul", side_effect=observed):
         result = _aocl.padded_matmul(left, right)
 
-    assert len(calls) == 1
-    padded_left, padded_right = calls[0]
-    assert padded_left.shape == (24, 13)
-    assert padded_right.shape == (13, 16)
-    np.testing.assert_array_equal(padded_left[:19], left)
-    np.testing.assert_array_equal(padded_right[:, :11], right)
-    assert np.count_nonzero(padded_left[19:]) == 0
-    assert np.count_nonzero(padded_right[:, 11:]) == 0
+    assert len(calls) == 2
+    assert [(a.shape,b.shape) for a,b in calls] == [((24,13),(13,8)),((24,13),(13,8))]
+    np.testing.assert_array_equal(calls[0][0], calls[1][0])
+    np.testing.assert_array_equal(calls[0][0][:19], left)
+    np.testing.assert_array_equal(calls[0][1], right[:, :8])
+    np.testing.assert_array_equal(calls[1][1][:, :3], right[:, 8:])
+    assert np.count_nonzero(calls[0][0][19:]) == 0
+    assert np.count_nonzero(calls[1][1][:, 3:]) == 0
     np.testing.assert_array_equal(result, np.einsum("ik,kj->ij", left, right))
 
 

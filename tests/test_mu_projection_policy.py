@@ -16,6 +16,7 @@ from supervised_nmf import NMFClassifier
 from supervised_nmf.classifier import _capture_projection
 from supervised_nmf._mu import transform_mu
 from supervised_nmf._mu_rowwise import transform_mu_rowwise
+from supervised_nmf.evaluation import _diagnostics, evaluate_classifier
 from supervised_nmf.screening import BinaryScreening
 
 
@@ -120,10 +121,18 @@ def test_policy_clone_pickle_and_set_params_take_effect_on_refit(data, policy):
     model.set_params(mu_projection=opposite)
     assert model.mu_projection == opposite and model.mu_projection_ == policy
     np.testing.assert_array_equal(model.transform(q), expected)
+    report = evaluate_classifier(model, x, y)
+    assert report["status"] == "valid"
+    assert report["diagnostics"]["mu_projection"] == policy
+    assert report["diagnostics"]["decision_threshold"] is None
     restored = pickle.loads(pickle.dumps(model))
     assert restored.mu_projection_ == policy
     assert restored.mu_projection == opposite
     np.testing.assert_array_equal(restored.transform(q), expected)
+    restored_report = evaluate_classifier(restored, x, y)
+    assert restored_report["diagnostics"]["mu_projection"] == policy
+    assert restored_report["predictions"] == report["predictions"]
+    assert restored_report["metrics"] == report["metrics"]
     fresh = clone(restored)
     assert fresh.mu_projection == opposite
     assert not hasattr(fresh, "mu_projection_")
@@ -144,11 +153,15 @@ def test_legacy_fitted_state_retains_batch_policy(data, keep_constructor):
         model.mu_projection = "rowwise"
     else:
         del model.mu_projection
+    assert "mu_projection" not in _diagnostics(model)
     restored = pickle.loads(pickle.dumps(model))
     assert restored.mu_projection_ == "batch"
     assert restored.mu_projection == ("rowwise" if keep_constructor else "batch")
     np.testing.assert_array_equal(restored.transform(q), expected)
     assert clone(restored).get_params() == restored.get_params()
+    report = evaluate_classifier(restored, x, y)
+    assert report["status"] == "valid"
+    assert report["diagnostics"]["mu_projection"] == "batch"
 
 
 def test_failed_refit_clears_fitted_policy(data):
@@ -159,6 +172,9 @@ def test_failed_refit_clears_fitted_policy(data):
         model.fit(x, y)
     assert not hasattr(model, "mu_projection_")
     assert not hasattr(model, "classifier_")
+    diagnostic = _diagnostics(model)
+    assert all(name not in diagnostic for name in (
+        "decision_threshold", "positive_label", "positive_class_index", "mu_projection"))
     with pytest.raises(NotFittedError):
         model.transform(q)
 

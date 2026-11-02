@@ -71,6 +71,16 @@ class BinaryScreening(TransformerMixin, BaseEstimator):
     ``percentile`` controls percentile mode and ``score_threshold`` controls
     absolute mode. Changing either parameter does not switch the mode.
 
+    Choose percentile mode for a relative feature-budget policy, subject to
+    the documented rounding and eligibility rules. Choose absolute mode for
+    an explicit pooled-t cutoff; its default ``score_threshold`` is 2.0 and
+    the number retained depends on the data. More retained features increase
+    downstream work; stricter selection can remove useful features or leave
+    too few for the requested rank. This standalone screen accepts only these
+    two modes; omit the step to perform no screening. Changing constructor
+    settings, including through ``set_params``, affects the next fit.
+    Transform keeps using the stored mask until refitting.
+
     ``percentile`` follows sklearn SelectPercentile rounding and deterministic
     index-order tie handling for finite nonconstant scores. Its denominator is
     the original feature count. Globally constant features are always excluded.

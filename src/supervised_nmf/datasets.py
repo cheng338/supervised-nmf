@@ -243,6 +243,8 @@ def _attribute_labels(path, attribute):
         index = header.index(attribute)
         labels = {}
         for row_number, row in enumerate(rows, start=1):
+            if not row:
+                continue
             if len(row) != len(header):
                 raise ValueError(f"Malformed attribute row {row_number} in {path}")
             identifier = _image_id(row[0], path)
@@ -291,6 +293,10 @@ def load_celeba(
 
     Attributes may be official count/header/whitespace text or a CSV whose
     first column is image_id/filename. Labels -1 and 0 map to 0; 1 maps to 1.
+    Empty CSV data records (zero fields) after the header are ignored.
+    Whitespace-only records and explicitly empty fields retain normal validation;
+    quoted multiline fields are preserved. Official text also ignores
+    whitespace-only data lines. A header without any labels remains invalid.
     partitions_path must contain official ``filename partition`` rows, where
     0=train, 1=validation, 2=test. Partition metadata are required.
 

@@ -8,8 +8,9 @@ must wait for a separate explicitly frozen configuration and completed tuning.
 Example (replace local paths):
   python examples/celeba_classification.py --dir PATH/img_align_celeba \
       --attributes PATH/list_attr_celeba.txt --partitions PATH/list_eval_partition.txt --quick
-Add --classifier logistic to compare NMF, PCA and feature baselines with logistic
-regression. The default final classifier remains KNN.
+Add --classifier logistic or --classifier linear_svm to select an alternative
+head for NMF, PCA and feature baselines. Linear SVM uses unscaled coordinates
+and decision margins, not probabilities. The default final classifier remains KNN.
 """
 
 from __future__ import annotations
@@ -38,16 +39,26 @@ def main():
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--max-iter", type=int, default=20000)
     parser.add_argument("--tol", type=float, default=1e-4)
-    parser.add_argument("--classifier", choices=("knn", "logistic"), default="knn")
+    parser.add_argument("--classifier", choices=("knn", "logistic", "linear_svm"), default="knn")
     parser.add_argument("--logistic-max-iter", type=int, default=1000)
     parser.add_argument("--logistic-tol", type=float, default=1e-4)
     parser.add_argument("--logistic-class-weight", choices=("none", "balanced"), default="none")
+    parser.add_argument("--svm-max-iter", type=int, default=20000,
+                        help="Linear-SVM iteration cap; independent of the NMF cap (default: 20000).")
+    parser.add_argument("--svm-tol", type=float, default=1e-5,
+                        help="Linear-SVM stopping tolerance (default: 1e-5).")
+    parser.add_argument("--svm-class-weight", choices=("none", "balanced"), default="none",
+                        help="Linear-SVM class weighting (default: none). SVM options apply only to linear_svm.")
     parser.add_argument("--quick", action="store_true", help="Single-candidate correctness smoke; not completed tuning.")
     parser.add_argument("--grid-json", type=Path, help="JSON mapping model names to sklearn parameter grids.")
     parser.add_argument("--output", type=Path, default=Path("runs"))
     parser.add_argument("--resume", type=Path)
     args = parser.parse_args()
     logistic_class_weight = None if args.logistic_class_weight == "none" else "balanced"
+    svm_options = {}
+    if args.classifier == "linear_svm":
+        svm_options = {"svm_max_iter": args.svm_max_iter, "svm_tol": args.svm_tol,
+                       "svm_class_weight": None if args.svm_class_weight == "none" else "balanced"}
     configuration = {"data_dir": str(args.dir.resolve()), "attributes": str(args.attributes.resolve()),
                      "partitions": str(args.partitions.resolve()), "attribute": args.attribute,
                      "max_train": args.max_train, "max_validation": args.max_validation,
@@ -56,6 +67,7 @@ def main():
                      "classifier": args.classifier, "logistic_max_iter": args.logistic_max_iter,
                      "logistic_tol": args.logistic_tol, "logistic_class_weight": logistic_class_weight,
                      "grid_override": json.loads(args.grid_json.read_text(encoding="utf-8")) if args.grid_json else {}}
+    configuration.update(svm_options)
     if args.resume:
         run_dir = args.resume
         if json.loads((run_dir / "configuration.json").read_text(encoding="utf-8")) != configuration:
@@ -79,7 +91,7 @@ def main():
     models = comparison_models(random_state=args.seed, quick=args.quick,
                                max_iter=args.max_iter, tol=args.tol, classifier=args.classifier,
                                logistic_max_iter=args.logistic_max_iter, logistic_tol=args.logistic_tol,
-                               logistic_class_weight=logistic_class_weight)
+                               logistic_class_weight=logistic_class_weight, **svm_options)
     unknown = set(configuration["grid_override"]) - set(models)
     if unknown:
         raise ValueError(f"Unknown grid model names: {sorted(unknown)}")

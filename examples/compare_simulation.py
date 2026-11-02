@@ -6,8 +6,9 @@ tuning or determines package defaults. Use --grid-json to supply expanded grids,
 --seeds for replications, and --scenario/--correlation/--signal-strength for harder
 designs. --resume RUN_DIRECTORY preserves compatible completed model results.
 All metrics here use a held-out development subset; there is no final-test claim.
-Use --classifier logistic to compare the same representations with logistic
-regression; the default final classifier remains KNN.
+Use --classifier logistic or --classifier linear_svm for alternative heads.
+Linear SVM uses unscaled coordinates and decision margins, not probabilities.
+The default final classifier remains KNN.
 """
 
 from __future__ import annotations
@@ -46,10 +47,16 @@ def parse_args():
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--max-iter", type=int, default=20000)
     parser.add_argument("--tol", type=float, default=1e-4)
-    parser.add_argument("--classifier", choices=("knn", "logistic"), default="knn")
+    parser.add_argument("--classifier", choices=("knn", "logistic", "linear_svm"), default="knn")
     parser.add_argument("--logistic-max-iter", type=int, default=1000)
     parser.add_argument("--logistic-tol", type=float, default=1e-4)
     parser.add_argument("--logistic-class-weight", choices=("none", "balanced"), default="none")
+    parser.add_argument("--svm-max-iter", type=int, default=20000,
+                        help="Linear-SVM iteration cap; independent of the NMF cap (default: 20000).")
+    parser.add_argument("--svm-tol", type=float, default=1e-5,
+                        help="Linear-SVM stopping tolerance (default: 1e-5).")
+    parser.add_argument("--svm-class-weight", choices=("none", "balanced"), default="none",
+                        help="Linear-SVM class weighting (default: none). SVM options apply only to linear_svm.")
     return parser.parse_args()
 
 
@@ -58,6 +65,10 @@ def main():
     if len(set(args.seeds)) != len(args.seeds):
         raise ValueError("Replication seeds must be distinct.")
     logistic_class_weight = None if args.logistic_class_weight == "none" else "balanced"
+    svm_options = {}
+    if args.classifier == "linear_svm":
+        svm_options = {"svm_max_iter": args.svm_max_iter, "svm_tol": args.svm_tol,
+                       "svm_class_weight": None if args.svm_class_weight == "none" else "balanced"}
     config = {"quick": args.quick, "seeds": args.seeds,
               "n_samples": args.n_samples if args.n_samples is not None else (120 if args.quick else 400),
               "n_features": args.n_features if args.n_features is not None else (40 if args.quick else 120),
@@ -70,6 +81,7 @@ def main():
               "logistic_tol": args.logistic_tol, "logistic_class_weight": logistic_class_weight,
               "cv": 5, "development_validation_fraction": 0.25,
               "grid_override": json.loads(args.grid_json.read_text(encoding="utf-8")) if args.grid_json else {}}
+    config.update(svm_options)
     if args.resume:
         run_dir = args.resume
         previous = json.loads((run_dir / "configuration.json").read_text(encoding="utf-8"))
@@ -95,7 +107,8 @@ def main():
                                             "role": "development_only_not_final_test"})
         models = comparison_models(random_state=seed, quick=args.quick, max_iter=args.max_iter, tol=args.tol,
                                    classifier=args.classifier, logistic_max_iter=args.logistic_max_iter,
-                                   logistic_tol=args.logistic_tol, logistic_class_weight=logistic_class_weight)
+                                   logistic_tol=args.logistic_tol, logistic_class_weight=logistic_class_weight,
+                                   **svm_options)
         unknown = set(config["grid_override"]) - set(models)
         if unknown:
             raise ValueError(f"Unknown grid model names: {sorted(unknown)}")

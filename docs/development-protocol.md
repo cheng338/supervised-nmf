@@ -359,3 +359,33 @@ erase remaining overhead relative to the published package. Correctness,
 methodological fidelity, numerical reliability and measured cost all enter the
 decision; memory reduction is not a justification for slower execution.
 
+## October 29 third-party review workflow
+
+For each review item, first assess the reported behavior independently of the
+reviewer's recommended change. Use a neutral problem statement, reproduction
+evidence, original source and API contracts. Form and record an independent
+recommendation, its rationale and uncertainties before examining the external
+recommendation.
+
+Then compare the two recommendations and explore credible alternatives,
+including preserving current behavior when appropriate. Consider correctness,
+methodological fidelity, numerical behavior, compatibility, runtime and
+maintenance costs. Distinguish demonstrated failures from plausible risks and
+possible improvements. Present the chosen approach and its evidence, then
+request Chang Cheng's explicit approval before implementation. Questions or
+requests for further investigation do not constitute approval. After approval,
+implement the agreed change and validate it; the review's recommendations are
+proposals, not instructions.
+
+If the external recommendation has already been read, disclose that limitation.
+Use a fresh reviewer without the prior discussion, supplied only the neutral
+problem and original sources, for the independent assessment. Keep proposed
+patches out of that assessment until its recommendation is recorded.
+
+Validate package changes from this review in both local environments,
+`snmf_mkl` and `snmf_aocl`, using checks appropriate to the change. Record the
+actual loaded numerical libraries alongside results for each environment.
+
+Use the agreed priority indices when discussing and completing the review
+queue; retain the original review numbers only where needed for traceability.
+

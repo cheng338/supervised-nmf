@@ -105,7 +105,7 @@ def _passive_solve(gram, cross, passive, factors):
 
 
 def _batched_block(design, targets, gram, maxiter, *, matmul=np.matmul):
-    """Return a candidate and per-RHS convergence flags, never certify it here."""
+    """Return candidate, per-RHS convergence flags and the unchanged cross."""
     cross = matmul(design.T, targets)
     if not np.isfinite(cross).all():
         raise FloatingPointError("NNLS products overflowed.")
@@ -142,24 +142,29 @@ def _batched_block(design, targets, gram, maxiter, *, matmul=np.matmul):
         solved = _passive_solve(gram, cross[:, pending], passive[:, pending], factors)
         coefficients[:, pending] = solved
         gradient[:, pending] = matmul(gram, solved) - cross[:, pending]
-    return coefficients, counts == 0
+    return coefficients, counts == 0, cross
 
 
-def _qualified_rows(design, targets, coefficients, *, matmul=np.matmul):
+def _qualified_rows(design, targets, coefficients, *, matmul=np.matmul, cross_scale=None):
     """Check finite feasible solutions and KKT against ORIGINAL design/targets.
 
     A residual workspace is limited to one block, never all input rows. The
     tolerance is coordinatewise and bounds matrix-product roundoff separately
     from the 1e-12 stopping tolerance. Negative coefficients are not silently
     clipped: a row with even a small negative value uses the reference solver.
+    A supplied cross_scale belongs to this exact admitted nonnegative BPP
+    design/target block. Other callers retain original-design recomputation.
     """
     feasible = np.isfinite(coefficients).all(axis=0) & (coefficients >= 0).all(axis=0)
     with np.errstate(over="ignore", invalid="ignore", under="ignore"):
         fitted = matmul(design, coefficients)
         residual = fitted - targets
         gradient = matmul(design.T, residual)
-        cross_scale = matmul(design.T, np.abs(targets))
-        roundoff_scale = matmul(design.T, np.abs(fitted) + np.abs(targets))
+        if cross_scale is None:
+            cross_scale = matmul(design.T, np.abs(targets))
+        roundoff_input = np.abs(fitted)
+        roundoff_input += np.abs(targets)
+        roundoff_scale = matmul(design.T, roundoff_input)
         tolerance = (1e-12 * cross_scale
                      + 64 * np.finfo(float).eps * max(design.shape) * roundoff_scale)
         projected = np.where((coefficients > 0) | (gradient < 0), gradient, 0.0)
@@ -324,9 +329,12 @@ def _project_unscaled(design, rows, solver, maxiter, batch_size, *, matmul=np.ma
             answer[start:start + len(block)] = _scipy_rows(design, block, maxiter)
             continue
         try:
+            targets = block.T
             with np.errstate(over="raise", invalid="raise", divide="raise"):
-                candidate, converged = _batched_block(design, block.T, gram, cap, matmul=matmul)
-            qualified = converged & _qualified_rows(design, block.T, candidate, matmul=matmul)
+                candidate, converged, cross = _batched_block(
+                    design, targets, gram, cap, matmul=matmul)
+            qualified = converged & _qualified_rows(
+                design, targets, candidate, matmul=matmul, cross_scale=cross)
         except (np.linalg.LinAlgError, FloatingPointError):
             answer[start:start + len(block)] = _scipy_rows(design, block, maxiter)
             continue

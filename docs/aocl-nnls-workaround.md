@@ -18,7 +18,14 @@ process startup; discovery is cached per process by the existing controller.
 For an M-by-K times K-by-N product, both outer dimensions are rounded up to
 multiples of eight. New operand entries are zero and K is unchanged. The
 returned M-by-N crop is an owned C-contiguous array. Already aligned products
-use direct multiplication. Padding changes the executed matrix dimensions,
+use direct multiplication. In a partially padded product, an operand is reused
+only when its own outer dimension already fits and it is a plain ndarray with
+native float64 dtype, dtype-aligned storage and canonical C-contiguous strides.
+Other operands retain the existing allocation, float64 conversion and zero-fill
+path. Borrowed inputs are never modified or cached; read-only inputs and
+nonowning C-contiguous views can qualify. The result remains an owned C-order
+copy. This optimization does not change backend selection or padding widths.
+Padding changes the executed matrix dimensions,
 rather than allocating spare bytes around an invalid output access. In exact
 arithmetic the original product and NNLS objective are unchanged. Floating
 point rounding can differ, so original-design KKT checks and public SciPy

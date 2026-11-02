@@ -27,18 +27,28 @@ def _use_blocks(X, coordinates, components):
     if not (8192 <= n <= 32768 and 1024 <= p <= 4096 and 1 <= rank <= 32
             and coordinates.shape[0] == n and components.shape == (rank, p)):
         return False
-    # Preserve the qualified MKL path. The additional AOCL case is limited to
-    # the measured Windows build, one BLAS library and C-contiguous inputs.
+    # Preserve the qualified pure-backend paths. Mixed admission below is
+    # limited to the measured MKL/AOCL inventory and aligned C-order operands.
     pools = [pool for pool in _native_controller().info() if pool.get("user_api") == "blas"]
     if not pools or any(pool.get("num_threads") != 1 for pool in pools):
         return False
     if all(pool.get("internal_api") == "mkl" for pool in pools):
         return True
-    return (sys.platform == "win32" and len(pools) == 1
-            and pools[0].get("internal_api") == "blis"
-            and pools[0].get("prefix") == "aocl-libblis"
-            and pools[0].get("version") == "AOCL-BLAS 5.3.0 Build 20260511"
-            and all(array.flags.c_contiguous for array in (X, coordinates, components)))
+    if sys.platform != "win32" or not all(
+            array.flags.c_contiguous for array in (X, coordinates, components)):
+        return False
+    aocl = [pool for pool in pools
+            if pool.get("internal_api") == "blis"
+            and pool.get("prefix") == "aocl-libblis"
+            and pool.get("version") == "AOCL-BLAS 5.3.0 Build 20260511"]
+    if len(pools) == 1:
+        return len(aocl) == 1
+    # Every 128-row block, including its tail, then has aligned outer
+    # dimensions. No copying or padding is introduced to gain eligibility.
+    return (len(pools) == 2 and len(aocl) == 1
+            and sum(pool.get("internal_api") == "mkl" for pool in pools) == 1
+            and aocl[0].get("architecture") == "zen3"
+            and n % 8 == 0 and p % 8 == 0)
 
 
 def _blocked_error(X, coordinates, components):

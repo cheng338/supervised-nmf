@@ -387,6 +387,12 @@ def calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=1
                          checkpoint_dir, groups=None, folds=None, data_ids=None):
     """Evaluate an explicit grid, sharing fold-local screening and representations.
 
+    Defaults are five folds, seed zero and one native numerical thread.
+    Fold/group loops are serial: ``threads`` limits supported native pools,
+    not CV workers. Separate SPA projection controls can override that limit
+    or launch processes, so it is not a global concurrency ceiling. ``seed``
+    controls generated folds; fix representation random states separately.
+
     The return value is a JSON-compatible report containing ordinary complete
     candidate/fold records, provisional CV ranking and refinement diagnostics.
     Classifier settings other than n_neighbors must be fixed on the estimator;

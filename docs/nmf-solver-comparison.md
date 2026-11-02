@@ -65,6 +65,93 @@ those assumptions. The reference-basis argument additionally needs alignment,
 conditioning and controlled projection error. The independent-sample KNN
 corollary is not automatically established by any of the four implementations.
 
+## Experimental ANLS stopping and repeated iterates
+
+The experimental `ANLSBPP` in `scripts/experimental_nmf.py` retains its outer
+criterion: projected-gradient norm no greater than `tol` times its initial
+norm. A nearly stationary rank-one initialization can make that denominator
+extremely small, so accurate factors can still fail the relative test. The
+repeat policy does not change that criterion or declare such fits converged.
+
+For rank one with positive `tol`, a detected exact repeat of an earlier accepted
+factor pair ends further sweeps. Original inner-solve failure,
+objective/nonfinite checks and ordinary convergence take priority. Initialization
+is not indexed as an accepted sweep. `tol=0` and higher ranks bypass repeat
+detection and retain their original stopping behavior.
+
+A repeat leaves `converged_=False`, sets
+`convergence_reason_="repeated_iterate"`, and emits `ConvergenceWarning`.
+`n_iter_`, objective/gradient histories and `relative_projected_gradient_`
+describe the actual completed prefix; the terminal ratio can differ by cycle
+phase. `cycle_event_` is `None` without a detected repeat, otherwise a dictionary
+of scalar metadata: `method`, `detector`, `detected_iteration`,
+`matched_iteration` and `period`. The period is the distance between the
+matched states, not a proof of a minimal mathematical cycle. No retained factor
+arrays are exposed through this diagnostic.
+
+Full-history fingerprints index contiguous factors; a match must also pass
+complete bit equality for both W and H, including signed zero. Hash collisions,
+near-equal factors, equivalent products or factor rescaling alone cannot stop a
+fit. Other layouts use a continuously advanced Brent checkpoint. The fit-local
+history retains immutable accepted factors until exit. For rank one, its factor
+payload grows as `O(max_iter * (n_samples + n_features))`, in addition to hash
+and Python-object overhead; hashing scans both contiguous factors each accepted sweep.
+It is an effort limit based on represented states: it does not prove optimality
+or universal recurrence of hidden native-library state.
+
+The supporting isolated study used the existing Windows AOCL and MKL environments
+with one native thread. Cycling anchors showed about 96–99% lower measured
+`fit_transform + transform + external diagnostics` time than fresh unchanged
+current-source runs. Measured noncycling controls also showed real costs of
+roughly 1–3%; no universal speedup or nonregression claim follows. On large-factor
+controls, 128 retained states represented about 67 MB of logical factor payload.
+Matching stop/observe runs on both real datasets and both backends continued
+observation to 1,000 sweeps without later ordinary convergence or material
+factor/query changes, using the original `rtol=1e-9`, `atol=1e-10` comparisons.
+These are finite checks, not guarantees for every input, backend or thread count.
+
+The local investigation record is
+`tmp/rank1-stopping-exploration/SUMMARY.txt`, with source snapshots, plans and
+checked output archives under the same study directory; those raw records are
+not included in the distribution. This evidence concerns isolated prototypes
+and does not replace validation of the exact integrated source. It does not
+revise the frozen October comparison or historical release measurements below,
+and adds no public solver option.
+
+## Experimental diagnostic cost — November 2, 2026
+
+The descriptive `projected_gradient_kkt` diagnostic now avoids redundant finite
+scans and combines the protected reconstruction crop with subtraction into one
+owned C-order residual. Private diagnostic helpers preserve the original solver
+helper, ANLS iterations, stopping rules and fitted factors. Native selection,
+protected product dimensions, full reduction dimension and float64 arithmetic
+remain unchanged. When sklearn bypasses input validation with `assume_finite`,
+the original X/H norm finite checks remain enabled; nonfinite gradients retain
+the original checked norm path and operation order.
+
+Fixed measurements in the existing local environments used eight independent
+processes per environment and one native thread. The selected prototype reduced
+the diagnostic call time relative to the then-current source by:
+
+| Environment | CelebA | Fashion-MNIST |
+| --- | ---: | ---: |
+| AOCL | 6.59% | 6.41% |
+| MKL | 4.02% | 5.72% |
+
+These are diagnostic-call measurements, not whole-fit speedups or a new comparison
+with release 0.4.1. The concrete patch matches the prototype's qualified AST and
+passed 429 full diagnostic cases, 28 direct helper comparisons and 91 focused
+tests in each environment. On four saved live workflow states, its diagnostic
+matched the current implementation and selected prototype exactly within each
+replay process. The concrete source was not separately retimed. Coverage remains
+limited to the recorded existing environments and thread setting; historical
+study results and the original failed live-checker attempt remain preserved.
+
+Retained development evidence is under `tmp/diagnostic-cost-investigation/`,
+including `COMPLETION.json`, `PROPOSAL.json`, `CONFIRMATION-ANALYSIS.json` and
+`REPLAY-PROPOSAL-{aocl,mkl}.json`. These local records and their source, runtime,
+archive and result hashes are not included in package distributions.
+
 ## Development results
 
 The comparison completed on October 5, 2026, with 89 qualified selected models

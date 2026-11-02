@@ -41,6 +41,29 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
     of incoming observations. With normalize=False the unnormalized SPA model
     needs the usual bound on the sums of mixing coefficients.
 
+    ``n_components=2`` selects the number of anchors. Larger ranks can retain
+    more structure but require more anchor-selection and NNLS work; the data
+    must supply enough independent anchors. Choose ``normalize=False`` when
+    selection by original feature magnitudes is intended: large-scale columns
+    can then dominate. Neither setting rescales returned anchor coordinates
+    or incoming observations. The unnormalized recovery assumptions still apply.
+
+    ``condition_limit=1e12`` rejects poorly conditioned selected anchors
+    (both selection-scale and original-scale) and the fitted basis. A smaller
+    finite limit greater than one imposes a stricter admission policy; raising
+    it admits more ill-conditioned models without improving their accuracy.
+    This is separate from the stricter batched and QR acceleration guards.
+
+    ``nnls_max_iter=None`` uses the reference solver's default, currently three
+    times the rank. A positive integer sets the cap for basis fitting and
+    projection. Increase it when a solve exhausts its iteration allowance;
+    larger caps allow more work, not a different objective or an accuracy target.
+    A bounded batched attempt may precede SciPy fallback with the original cap,
+    so this is not a shared total-work budget. Changing ``nnls_max_iter`` or
+    projection execution controls affects subsequent transforms without refit.
+    Changes to rank, normalization or condition admission require a new fit;
+    they do not modify or requalify the existing basis.
+
     The selected original-scale columns form training coordinates W. We solve
     NNLS for every column to learn H such that X approximately equals W H.
     ``transform`` solves NNLS against this fixed H, without selecting anchors

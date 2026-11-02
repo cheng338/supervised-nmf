@@ -234,7 +234,8 @@ with tarfile.open(root / "dist" / f"supervised_nmf-{version}.tar.gz") as archive
     assert not any(n.endswith(withdrawn_workflow) for n in members)
     for relative in ("src/supervised_nmf/_aocl.py", "tests/test_aocl_nnls.py",
                      "docs/aocl-nnls-workaround.md", "docs/current-package-evidence-20261029.md",
-                     "docs/release-0.4.1.md"):
+                     "docs/release-0.4.1.md", "CHANGELOG.md",
+                     f"docs/release-{version}.md"):
         with archive.extractfile(f"supervised_nmf-{version}/{relative}") as stream:
             assert stream.read() == (root / relative).read_bytes(), relative
     for suffix in ("provenance/original/sim.py", "provenance/original/snmf_am.py",

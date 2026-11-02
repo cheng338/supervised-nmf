@@ -19,7 +19,7 @@ classifier = NMFClassifier(
     percentile=10.0,             # used only by percentile screening
     classifier="knn",            # also "logistic" or "linear_svm"
     n_neighbors=5,
-    weights="uniform",           # sklearn KNN weighting choice
+    weights="uniform",           # equal votes; "distance" or a callable also supported
     knn_normalization="none",    # optional "sd", fitted on training coordinates
     logistic_C=1.0,              # inverse L2 regularization strength
     logistic_max_iter=1000,
@@ -60,6 +60,19 @@ CD/MU and is not used by SPA's NNLS routine. CD and MU have different stopping
 criteria; equal tolerance values do not establish equal numerical accuracy.
 Explicit overrides are preserved; `None` is invalid for `solver` or `screening`.
 
+Use `screening="percentile"` when a relative feature budget is appropriate,
+or `"absolute"` when selection should follow a pooled-t cutoff. The latter's
+retained count varies with the training data; neither policy guarantees enough
+features survive for the requested rank. Choose `screening="none"` for an
+unscreened NMF comparison or when all supplied features should reach the
+factorization. It retains every column, including constants, and ignores the
+screening cutoffs. More columns can increase fitting and projection work and
+retain irrelevant features. It still requires dense finite nonnegative data,
+binary labels with at least two training observations per class, and valid
+factorization inputs. Tune rank and classifier settings for the unscreened
+representation independently; a screened model's selected settings need not
+transfer. See [screening details](#screening-and-anchor-details).
+
 Choose multiplicative updates with `NMFClassifier(solver="mu", random_state=42)`.
 Both MU and CD use scikit-learn NMF with NNDSVDa initialization, unregularized
 Frobenius loss, and the existing `max_iter`, `tol`, and `random_state` parameters.
@@ -76,6 +89,20 @@ metric, not the factorization, `transform` output or `training_coordinates_`.
 Constant and nearconstant coordinates use scikit-learn's scale fallback;
 there is no row normalization or added variance floor. The option is validated
 but unused by logistic regression and linear SVM.
+
+For KNN, `weights="uniform"` gives the selected neighbors equal votes.
+Choose `weights="distance"` to give closer neighbors more influence through
+inverse-distance weights. Among the selected neighbors, zero-distance matches
+vote equally and other neighbors receive zero weight whenever such matches
+exist. Distance weighting changes class probabilities and can change labels,
+including decisions under a saved threshold. It can make very close or noisy
+observations more influential; compare it with uniform voting on training-only
+CV together with the coordinate metric and neighbor count. It is not a
+guaranteed accuracy or speed improvement. `weights=None` also means uniform
+voting. A callable may implement a custom distance-to-weight rule: it receives
+the distance array and must return weights of the same shape. Custom weighting
+can forgo shared-neighbor acceleration; saving the model also requires a
+serializable callable. These choices affect KNN only and take effect on refit.
 
 `classifier="logistic"` uses a pipeline containing `StandardScaler` and
 L2-regularized scikit-learn `LogisticRegression` with the `lbfgs` solver.
@@ -146,6 +173,41 @@ the original feature mask. `classifier_` is a bare KNN for unscaled KNN, a
 pipeline named `scale`/`knn` for SD KNN, a pipeline named `scale`/`logistic` for
 logistic regression, or a bare `LinearSVC` for SVM. `knn_normalization_` records
 the fitted KNN metric and is `None` for other heads.
+
+### Changing settings on a fitted model
+
+`set_params` changes constructor settings; it does not refit learned objects.
+For `NMFClassifier`, changing the solver, screen, rank, classifier head, KNN
+weights/normalization, class weights, thresholds, training-coordinate policy
+or MU projection policy takes effect on the next fit. This also applies to
+`max_iter`, `tol`, `random_state` and the head's numerical settings: prediction
+uses the settings already copied into the fitted decomposition and classifier.
+Changing an inactive head- or solver-specific parameter does not activate it.
+
+The exceptions are the four SPA execution controls: `projection_solver`,
+`projection_workers`, `projection_batch_size` and `projection_native_threads`.
+They affect the next SPA projection without refitting; valid settings remain
+unused by CD/MU. Changing a projection solver can change numerical coordinates
+and predictions, so record execution settings when reproducing results.
+
+| Public estimator | Changes requiring a new fit | Changes used by the next transform |
+| --- | --- | --- |
+| `NMFClassifier` | All constructor parameters except the four SPA execution controls | Those four controls, for a fitted SPA model |
+| `BinaryScreening` | Screening mode and its selection parameters | None; transformation uses the fitted feature mask |
+| `FeatureSPA` | Rank, `normalize`, `condition_limit` | `nnls_max_iter` and the four projection controls |
+
+In particular, changing standalone `FeatureSPA.nnls_max_iter` can change the
+next projection's iteration allowance. Changing `NMFClassifier.max_iter`
+requires refitting, even for SPA. Neither operation requalifies or modifies
+an existing fitted basis by itself.
+
+For resolved decisions, inspect `training_coordinates_mode_`, `mu_projection_`,
+`knn_normalization_`, `decision_threshold_` and `positive_label_`, together with
+the fitted decomposition, feature mask and `classifier_`. `get_params()` may
+describe settings queued for a future fit. Saving/loading preserves both those
+constructor settings and the fitted objects; it does not apply a pending refit.
+Direct edits to fitted internals or a stateful custom callable are outside this
+parameter-change contract. Do not change settings during an active prediction.
 
 ### Prediction dtype
 
@@ -421,6 +483,38 @@ SPA coordinate convention below still applies.
 
 ## Screening and SPA separately
 
+### Standalone SPA options
+
+```python
+from supervised_nmf import FeatureSPA
+
+spa = FeatureSPA(
+    n_components=2,
+    normalize=True,
+    condition_limit=1e12,
+    nnls_max_iter=None,
+    projection_solver="auto",
+    projection_workers=1,
+    projection_batch_size=256,
+    projection_native_threads=1,
+)
+```
+
+| Setting and default | When to change it and tradeoff |
+| --- | --- |
+| `n_components=2` | Choose rank using training data. Higher ranks add anchor-selection and NNLS work and require enough independent anchors. |
+| `normalize=True` | L1-normalizes columns only for anchor selection. Choose `False` when original feature magnitudes should influence selection; large-scale columns can dominate, and the unnormalized SPA recovery assumptions apply. Returned anchor coordinates remain on their original scale either way. |
+| `condition_limit=1e12` | Limits the condition numbers of the selection-scale anchors, original-scale anchors and fitted basis. A smaller finite value greater than one rejects more ill-conditioned fits. Raising it relaxes rejection without improving numerical accuracy. It does not change the separate batched/QR acceleration guards. |
+| `nnls_max_iter=None` | Uses SciPy's default, currently three times the rank. Set a positive integer for a different basis/projection iteration allowance, for example after iteration exhaustion. A larger cap permits more work; it is not an accuracy tolerance. A bounded batched attempt may precede fallback with the original cap, so this is not a shared total-work budget. |
+
+The four [projection controls](#spa-projection-execution) have the defaults
+shown above. They and `nnls_max_iter` affect subsequent standalone transforms
+without refitting. Rank, normalization and condition admission affect the next
+fit; changing them does not alter or requalify the existing basis.
+`nnls_max_iter` also applies to basis fitting on the next fit. The standalone
+[training-coordinate convention](#standalone-spa-coordinates) differs from
+the default SPA classifier's convention.
+
 ### SPA basis fitting
 
 Version 0.3.3 fits the basis by guarded batched NNLS against the selected
@@ -579,6 +673,16 @@ The two estimators retain their existing screening defaults:
 | `NMFClassifier()` | `"absolute"` | `score_threshold=2.0`, an inclusive cutoff on the absolute pooled-t score |
 | `BinaryScreening()` | `"percentile"` | `percentile=10.0`, using the percentile and tie rules below |
 
+Use percentile screening for a relative feature budget and absolute screening
+for a pooled-t cutoff whose retained count varies with the training data.
+Retaining more features increases downstream work; tighter selection can
+discard useful features or leave too few for the requested rank. Standalone
+`BinaryScreening` accepts only `"percentile"` and `"absolute"`; omit that step
+to skip screening. `NMFClassifier` separately offers `screening="none"` to
+retain every input feature. A fitted standalone mask survives parameter
+changes and serialization: `set_params` affects the next fit, while `transform`
+uses the saved mask.
+
 Set the mode explicitly when composing a standalone screen:
 
 ```python
@@ -691,6 +795,20 @@ screening or SPA coordinates on the full dataset before splitting into folds.
 
 ## Calibration and reporting
 
+`calibration_search`, `calibration_knn_grid` and `calibration_rank_search`
+default to `cv=5`, `seed=0` and `threads=1`. The examples below explicitly
+override the seed. Use supplied `groups` for subject-disjoint folds or `folds`
+for an exact declared split; the seed governs generated folds, not every
+estimator's random state. Fix the estimator's `random_state` separately when
+reproducible initialization is needed.
+
+`threads` limits supported native numerical thread pools; it does not launch
+parallel CV candidates or folds. Those loops execute serially in these helpers.
+SPA's projection workers and per-worker native-thread limits are separate and
+can override the surrounding limit, so `threads` is not a global concurrency
+ceiling. Budget both levels explicitly; see
+[SPA projection execution](#spa-projection-execution).
+
 For a staged training-only workflow, start with the
 [quickstart tuning guide](../README.md#training-only-tuning) and pass
 `refit=False` to `calibration_search`. That mode returns `estimator=None` plus
@@ -765,8 +883,17 @@ validation = evaluate_classifier(
 print(format_evaluation_summary(validation))
 ```
 
-Training/evaluation IDs and subjects must not overlap. Training labels determine
-the majority-class reference; evaluation labels never choose that class.
+Training/evaluation IDs and subjects must not overlap. Each corresponding pair
+(`sample_ids`/`train_sample_ids` and `groups`/`train_groups`) must use the same
+identifier type: both numeric or both string. Integers and finite floating-point
+IDs remain supported and can be mixed. A string/numeric mismatch
+raises an error before prediction; identifiers are not automatically converted.
+Sample IDs and subject IDs may use different types from each other. Prepare
+each pair with a consistent encoding before evaluation.
+These checks compare the supplied identifiers; they cannot verify real-world
+identity or reconcile different spellings within the same identifier type.
+Training labels determine the majority-class reference; evaluation labels
+never choose that class.
 `min_class_support=10` and `min_groups=5` flag small evaluation samples without
 altering predictions or excluding rows. The summary includes accuracy and balanced
 accuracy, per-class precision and recall, evaluation and supplied training class
@@ -782,6 +909,25 @@ Numerical-phase diagnostics on `NMFClassifier` now include
 `factorization_converged_` and `training_projection_converged_`, with their
 corresponding `*_convergence_warnings_` attributes.
 
+For a direct `NMFClassifier`, the report's `diagnostics` also records
+`decision_threshold`, `positive_label`, `positive_class_index`, and
+`mu_projection` from the corresponding fitted attributes. These describe the
+saved fit even if `set_params` has changed constructor settings for a future
+refit. The threshold label and class index identify the probability column used
+by an explicit threshold; they are inactive when `decision_threshold` is `None`,
+which selects the fitted head's ordinary decision rule. Evaluation metrics and
+ranking scores continue to use `classes_[1]` regardless of these settings.
+
+An explicit `mu_projection=None` means that the MU policy is inapplicable.
+`"batch"` and `"rowwise"` describe the fitted MU projection policy, not the
+particular numerical kernel or recovery path executed by a prediction.
+Missing fitted attributes, including unavailable legacy fields, are omitted
+rather than inferred from constructor settings; explicit `None` is retained
+as JSON `null`. Existing model-loading migrations still apply. These fields
+are available in diagnostic dictionaries, including failed evaluation and
+calibration records; the text summary does not display them. Policy extraction
+from arbitrary outer pipelines is outside this direct-estimator reporting scope.
+
 For SVM, `evaluate_classifier` uses real decision margins for AUROC and average
 precision. The report sets `ranking_score_type="decision_margin"`, stores the
 scores in `predictions["positive_class_decision_margin"]` and leaves
@@ -796,6 +942,7 @@ The commands below exercise a paired development comparison:
 ```powershell
 python examples/compare_simulation.py --quick --output runs
 python examples/compare_simulation.py --scenario xor --seeds 1 2 3 --output runs
+python examples/compare_simulation.py --quick --classifier linear_svm --output runs
 ```
 
 `--quick` is a correctness smoke test. The ordinary grids are starting points
@@ -803,6 +950,16 @@ for tuning. Use `--grid-json` for expanded sklearn-style parameter grids keyed
 by model name, and record the reason for each expansion.
 Refinement diagnostics flag boundaries and interior intervals; they do not
 automatically certify that tuning is complete. Neither command freezes defaults.
+
+For numeric selections, Python and NumPy booleans are excluded from the
+reported numeric range. If the declared candidates for that parameter
+include an explicit `None`, its numeric diagnostic entry also records
+`includes_none: true`, including when there is only one numeric value.
+This optional field records a declared alternative, even if it failed
+qualification; it does not mean that `None` qualified or won. The field is
+omitted otherwise. A selected `None`, boolean or string retains its
+categorical diagnostic. Full candidate records remain the source for
+qualification and selection evidence.
 
 Set rank, the applicable screening parameter, and classifier parameter in each method's
 explicit grid. Tune unscreened NMF independently, and use the same saved folds
@@ -825,6 +982,23 @@ Names use `_linear_svm`, including `raw_linear_svm`. The grid keys are
 The ordinary and quick C grids match those listed above; `svm_max_iter`,
 `svm_tol` and `svm_class_weight` configure the SVM numerical/risk policy.
 `comparison_models()` retains the original KNN choices.
+
+The simulation and CelebA comparison CLIs expose this head through
+`--classifier linear_svm`. Both accept `--svm-max-iter` (default `20000`),
+`--svm-tol` (default `1e-5`), and `--svm-class-weight` (`none` or `balanced`,
+default `none`, converted to Python `None`). These options apply only when
+`linear_svm` is selected and supply constructor defaults; a per-model
+`--grid-json` override retains precedence for each candidate. There is no
+separate CLI C flag: use the head-specific grid keys above. No scaler or
+probability conversion is added.
+
+SVM selections save these three settings alongside the full grid overrides in
+`configuration.json`; changing them rejects an incompatible resume. KNN and
+logistic selections retain their historical configuration fields, including
+when inactive SVM options are supplied. Existing estimator, candidate, data,
+source and runtime fingerprint checks also remain in force. A changed grid
+does not silently reuse previously completed results.
+
 Set `max_iter` and `tol` to numerically qualify
 the intended method; do not select them to exploit unconverged fits.
 
@@ -906,10 +1080,20 @@ and all three arrays must satisfy one of these configurations:
 - On Windows, exactly one BLAS pool is detected as AOCL/BLIS with version
   `AOCL-BLAS 5.3.0 Build 20260511`, using one thread, and all arrays are
   C-contiguous.
+- On Windows, exactly two BLAS pools are detected: one MKL and one AOCL/BLIS
+  with prefix `aocl-libblis`, version `AOCL-BLAS 5.3.0 Build 20260511`, and
+  architecture `zen3`. Both use one thread, all arrays are C-contiguous, and
+  both the observation count and feature count are divisible by eight.
 
-Other configurations, including unrecognized AOCL builds, mixed BLAS backends,
+Other configurations, including unrecognized AOCL builds, other mixed BLAS backends,
 multithreaded settings and unsupported shapes or layouts, retain the
 full-product expression. No array is copied merely to enter the blocked path.
+The mixed-library case follows the configured environment's NumPy AOCL policy;
+the global library inventory alone does not identify which library owns NumPy.
+It uses the ambient thread counts when reporting, after projection thread
+controls have ended. Screened arrays can be F-contiguous and remain ineligible
+for this mixed case. The alignment restriction limits newly admitted products
+and their final blocks; it is not a universal native-library safety guarantee.
 Block norms are combined to report the Frobenius norm; matrix-product rounding
 can differ from the full expression.
 This affects reconstruction diagnostics only. It does not change optimizers,
@@ -956,7 +1140,16 @@ python examples/celeba_classification.py --dir PATH/img_align_celeba `
 ```
 
 Replace these example paths with the supplied data location. Attributes may also
-be a CSV with an image ID column. The loader checks IDs, labels, required images,
+be a CSV with an image ID column. Empty CSV data records (zero fields) after a
+valid header are ignored. Whitespace-only CSV records, quoted empty/whitespace
+fields and delimiter-only empty fields retain their existing validation; they
+are not treated as empty records. Quoted multiline fields are parsed intact.
+Official whitespace text also ignores whitespace-only data lines. A valid
+header with no labels still fails, and leading empty records do not replace
+the required first header. CSV malformed-row numbers count logical data records
+after the header, including ignored empty records, rather than physical lines.
+
+The loader checks IDs, labels, required images,
 and official partition codes. Sampling is uniform within a partition; it does
 not artificially balance classes. This development example loads training and
 validation partitions only. Official test evaluation and identity-overlap audit

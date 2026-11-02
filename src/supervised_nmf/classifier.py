@@ -108,6 +108,13 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
     another method.
     Rank, screening level and final classifier parameters still require
     data-specific tuning.
+    Percentile screening expresses a relative feature budget; absolute
+    screening uses a pooled-t cutoff with a data-dependent retained count.
+    Use ``screening='none'`` for an unscreened comparison or to retain every
+    supplied feature, including constants. Screening cutoffs are then unused;
+    data, binary-label and factorization validation still apply. More features
+    can increase downstream work and retain irrelevant information. Tune the
+    unscreened representation independently using training data.
     Coordinate descent uses sklearn NMF with NNDSVDa initialization and Frobenius
     loss, matching the original scripts. Multiplicative updates use the same
     initialization and loss with sklearn's MU solver. Raw nonnegative feature
@@ -132,6 +139,17 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
     it does not change ``transform`` or ``training_coordinates_``. The fitted
     scaler and KNN are stored in a ``classifier_`` pipeline with steps ``'scale'``
     and ``'knn'``. This option is validated but unused by the other heads.
+
+    KNN ``weights='uniform'`` gives selected neighbors equal votes; optional
+    ``'distance'`` uses inverse distances when nearer observations should have
+    more influence. If selected neighbors include zero-distance matches, those
+    matches vote equally and other selected neighbors have zero weight.
+    This can change probabilities and labels and emphasize very close noisy
+    points; compare weighting and coordinate metrics on training-only CV.
+    ``None`` also means uniform weighting. A callable receives distances and
+    returns same-shaped weights; it can forgo shared-neighbor acceleration
+    and must be serializable when saving the model. These choices affect KNN
+    only and take effect on refit.
 
     The optional
     ``classifier='logistic'`` extension standardizes the NMF coordinates using
@@ -177,6 +195,15 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
     limits, iteration-cap semantics and process-pool behavior. These controls are
     validated but unused by CD and MU. Unlike the fitted decision policy,
     projection execution settings may be changed without refitting.
+
+    All other constructor parameter changes take effect on the next fit,
+    including ``max_iter``, ``tol``, head settings and KNN normalization.
+    Prediction uses the saved feature mask, decomposition and classifier;
+    ``get_params()`` can describe settings queued for a future fit. Saving and
+    loading preserves both the constructor settings and fitted objects and
+    does not perform a pending refit. This excludes direct mutation of fitted
+    internals or stateful custom callables. Standalone ``FeatureSPA`` differs:
+    its ``nnls_max_iter`` also affects subsequent transforms without refitting.
 
     ``mu_projection='batch'`` retains MU's shared query-batch stopping rule.
     Optional ``'rowwise'`` gives each observation its own initialization and

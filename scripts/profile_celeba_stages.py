@@ -161,7 +161,8 @@ def _expected_stages(estimator):
         expected.update(("decomposition_fit_seconds", "decomposition_projection_seconds"))
         if estimator.screening != "none":
             expected.add("screening_fit_seconds")
-        if estimator.training_coordinates == "transform":
+        if (estimator.training_coordinates == "transform"
+                or (estimator.training_coordinates == "auto" and estimator.solver == "spa")):
             expected.add("training_projection_seconds")
     elif isinstance(estimator, Pipeline):
         expected.update(("screening_fit_seconds", "screening_prediction_seconds"))

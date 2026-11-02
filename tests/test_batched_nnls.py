@@ -154,6 +154,7 @@ class BatchedNNLSTests(unittest.TestCase):
 
     def test_forged_success_requires_finite_nonnegative_original_design_kkt(self):
         reference = self.reference()
+        cross = _nnls.nnls_matmul()(self.design.T, self.rows.T)
         defects = [lambda x: x.__setitem__((0, 0), -1e-20),
                    lambda x: x.__setitem__((0, 0), np.nan),
                    lambda x: x.__setitem__((0, 0), np.inf),
@@ -163,7 +164,7 @@ class BatchedNNLSTests(unittest.TestCase):
             coefficients = reference.T.copy()
             defect(coefficients)
             with self.subTest(defect=defect), patch.object(
-                    _nnls, "_batched_block", return_value=(coefficients, np.ones(83, bool))), \
+                    _nnls, "_batched_block", return_value=(coefficients, np.ones(83, bool), cross)), \
                     patch.object(_nnls, "nnls", wraps=nnls) as fallback:
                 actual = _nnls.project_nnls(self.design, self.rows, solver="batched")
                 self.assertEqual(fallback.call_count, 1)
@@ -171,9 +172,10 @@ class BatchedNNLSTests(unittest.TestCase):
 
     def test_nonconverged_rows_fallback_even_when_candidate_passes_kkt(self):
         expected = self.reference()
+        cross = _nnls.nnls_matmul()(self.design.T, self.rows.T)
         converged = np.ones(83, bool)
         converged[[0, 7]] = False
-        with patch.object(_nnls, "_batched_block", return_value=(expected.T, converged)), \
+        with patch.object(_nnls, "_batched_block", return_value=(expected.T, converged, cross)), \
                 patch.object(_nnls, "nnls", wraps=nnls) as fallback:
             actual = _nnls.project_nnls(self.design, self.rows, solver="batched", maxiter=100)
         self.assertEqual(fallback.call_count, 2)

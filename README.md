@@ -46,6 +46,13 @@ workflow. MKL retains direct multiplication. See the
 [0.4.1 release notes](docs/release-0.4.1.md) and
 [workaround retirement policy](docs/aocl-nnls-workaround.md#retirement-policy).
 
+Version **0.4.2** fixes evaluation and reporting edge cases, reduces repeated
+numerical work, and adds exact-repeat stopping to experimental ANLS-BPP.
+Public solver defaults are unchanged. See the [0.4.2 release notes](docs/release-0.4.2.md)
+for changes, compatibility details and validation limits.
+
+See the [changelog](CHANGELOG.md) for the complete release history.
+
 **Copyright (c) 2026 Chang Cheng. All Rights Reserved.** A distribution license
 has not yet been selected. Public availability of this repository does not
 grant an open-source license. See [LICENSE](LICENSE) and the separately
@@ -53,20 +60,20 @@ applicable [third-party notices](THIRD_PARTY_NOTICES).
 
 # Installation
 
-Python 3.11 or later is required for version 0.4.1. Python 3.10 support
+Python 3.11 or later is required for version 0.4.2. Python 3.10 support
 ended on October 20, 2026. Dependencies are NumPy, SciPy, scikit-learn
 1.6 or later (below 2.0), threadpoolctl, and joblib 1.3 or later.
 Download the wheel from the [GitHub releases](https://github.com/cheng338/supervised-nmf/releases)
 and install it:
 
 ```shell
-python -m pip install --upgrade supervised_nmf-0.4.1-py3-none-any.whl
+python -m pip install --upgrade supervised_nmf-0.4.2-py3-none-any.whl
 ```
 
 To install the release from source:
 
 ```shell
-git clone --branch v0.4.1 https://github.com/cheng338/supervised-nmf.git
+git clone --branch v0.4.2 https://github.com/cheng338/supervised-nmf.git
 cd supervised-nmf
 python -m pip install .
 ```
@@ -299,12 +306,12 @@ earlier [BLAS checks](docs/blas-optimization.md).
 | --- | --- | --- |
 | `n_components` | `2` | Number of NMF components. |
 | `solver` | `"spa"` | Factorization method. |
-| `screening` | `"absolute"` | Also accepts `"percentile"` or `"none"`. |
+| `screening` | `"absolute"` | `"percentile"` selects by relative rank; `"none"` retains all input columns and ignores screening cutoffs. |
 | `score_threshold` | `2.0` | Inclusive cutoff on the absolute pooled-t score. |
 | `percentile` | `10.0` | Retained percentage when percentile screening is selected. |
 | `classifier` | `"knn"` | Final classifier; also accepts `"logistic"` and `"linear_svm"`. |
 | `n_neighbors` | `5` | Number of neighbors; used only by KNN. |
-| `weights` | `"uniform"` | KNN-only weighting; `"distance"` is also available. |
+| `weights` | `"uniform"` | Equal KNN votes; `"distance"` uses inverse distances. A callable can supply a custom rule; `None` also means uniform. |
 | `knn_normalization` | `"none"` | `"sd"` uses training-fitted SD without centering. |
 | `logistic_C` | `1.0` | Inverse L2 regularization strength for logistic regression. |
 | `logistic_max_iter` | `1000` | Logistic-regression iteration limit, independent of the NMF cap. |
@@ -325,6 +332,13 @@ earlier [BLAS checks](docs/blas-optimization.md).
 | `projection_native_threads` | `1` | Numerical threads per projection process. |
 | `decision_threshold` | `None` | Optional frozen probability cutoff for KNN/logistic; SVM requires `None`. |
 | `positive_label` | `None` | Class for probability thresholding; defaults to `classes_[1]`. Does not reverse SVM margins. |
+
+For when to choose these options, their costs and restrictions, see the
+[API reference](docs/api.md#classifier). The
+[parameter-change guide](docs/api.md#changing-settings-on-a-fitted-model)
+distinguishes settings requiring refit from execution controls that affect the
+next prediction. Standalone SPA has additional
+[normalization, conditioning and iteration controls](docs/api.md#standalone-spa-options).
 
 These are `NMFClassifier` defaults. The standalone `BinaryScreening()` retains
 its percentile default (`screening="percentile", percentile=10.0`). Set
@@ -458,6 +472,7 @@ Run the example scripts from the source checkout or source archive:
 ```shell
 python examples/quickstart.py
 python examples/compare_simulation.py --quick --output runs
+python examples/compare_simulation.py --quick --classifier linear_svm --output runs
 python examples/compare_classifiers.py --quick --output runs
 python examples/celeba_classification.py --help
 python examples/celeba_parameter_study.py --help
@@ -468,6 +483,17 @@ screened PCA and screening-only KNN. CelebA requires local images, attributes
 and official partition files. Images use the original 64 by 64 grayscale
 preprocessing; the examples use the training and validation partitions.
 Datasets are not included in the package.
+
+Both `compare_simulation.py` and `celeba_classification.py` accept
+`--classifier linear_svm`, alongside `knn` (the default) and `logistic`.
+The SVM options are `--svm-max-iter` (20000), `--svm-tol` (1e-5), and
+`--svm-class-weight` (`none` or `balanced`, default `none`). They set the SVM
+constructor defaults; `--grid-json` can override them per candidate. SVM model
+names end in `_linear_svm`; use `svm_C` for NMF grids and `linear_svm__C` for
+baseline pipeline grids. SVM scores are decision margins, not probabilities.
+Selected SVM settings and grid overrides are saved for strict resume checks;
+KNN/logistic configuration formats are unchanged. A quick run remains a
+correctness check, not completed tuning or evidence for new package defaults.
 
 `compare_classifiers.py` compares KNN and logistic regression across matched
 NMF, PCA, screening-only and raw-feature paths. The completed
@@ -575,7 +601,7 @@ python scripts/build_release.py
 python -I scripts/check_wheel.py
 ```
 
-The build produces `dist/supervised_nmf-0.4.1-py3-none-any.whl` and a source
+The build produces `dist/supervised_nmf-0.4.2-py3-none-any.whl` and a source
 archive. The wheel check verifies
 imports, authorship metadata, SPA/MU/CD fitting and prediction, and archive
 contents. It does not publish a release.

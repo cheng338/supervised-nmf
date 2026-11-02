@@ -5,7 +5,6 @@ unprotected native products. Ordinary native cases use only the helper's usual
 protected dimensions. No guard pages or native-fault reproductions are used.
 """
 
-import hashlib
 from pathlib import Path
 import sys
 
@@ -20,19 +19,12 @@ from supervised_nmf import _aocl
 
 assert Path(_aocl.__file__).resolve() == ROOT / "src" / "supervised_nmf" / "_aocl.py"
 
-# Execute these contract tests only against the exact reviewed R3-on-combined
-# helper, rather than accepting any helper that differs from the baseline.
-EXPECTED_R3_HELPER_SHA256 = "30d19c29696bba6594f707c30952ba03a6b61d1f59ba7ced208c4578ab1cfcb1"
-
-
-@pytest.fixture(scope="module", autouse=True)
-def item8_candidate_guard():
-    digest = hashlib.sha256(Path(_aocl.__file__).read_bytes()).hexdigest()
-    assert digest == EXPECTED_R3_HELPER_SHA256, "Item-8 reuse tests require the exact reviewed D20-CN helper"
+# Archived release and qualification records retain exact historical source
+# identities. These maintained tests check the current helper's behavior.
 
 
 @pytest.fixture(autouse=True)
-def one_native_thread(item8_candidate_guard):
+def one_native_thread():
     with threadpool_limits(limits=1):
         yield
 

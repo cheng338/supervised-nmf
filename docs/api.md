@@ -885,13 +885,56 @@ print(format_evaluation_summary(validation))
 
 Training/evaluation IDs and subjects must not overlap. Each corresponding pair
 (`sample_ids`/`train_sample_ids` and `groups`/`train_groups`) must use the same
-identifier type: both numeric or both string. Integers and finite floating-point
-IDs remain supported and can be mixed. A string/numeric mismatch
-raises an error before prediction; identifiers are not automatically converted.
+identifier type: both numeric or both string. Python/NumPy integers and finite
+floating-point IDs can be mixed; nonblank strings retain their exact values.
+Boolean values (including NumPy booleans and Boolean arrays), complex values
+(including zero imaginary parts), temporal values, and other objects such as
+`Decimal` or `Fraction` are rejected with `ValueError`. The same policy applies
+to calibration `data_ids`/`groups` and cross-validation subject IDs. Validation
+does not convert numeric IDs to float: large integers stay distinct, while
+`1` and `1.0` remain the same identifier for duplicate/overlap checks.
+Numeric identity uses exact represented values, including mixed NumPy
+scalars and Python integers. Internal comparison keys prevent NumPy hashing
+or mixed-type rounding from missing an overlap or merging distinct groups;
+the original identifiers remain unchanged in returned metadata and reports.
+This policy also governs automatically generated group-disjoint folds.
+A string/numeric mismatch raises an error before prediction. A mask already
+converted to an integer array by the caller has lost its Boolean origin and
+is treated as the supplied integer IDs.
+
 Sample IDs and subject IDs may use different types from each other. Prepare
 each pair with a consistent encoding before evaluation.
 These checks compare the supplied identifiers; they cannot verify real-world
 identity or reconcile different spellings within the same identifier type.
+
+Extended-precision `np.longdouble` IDs retain their precision in validation,
+evaluation reports and calibration checkpoints. Reports encode these scalars as
+tagged JSON objects rather than converting them to Python floats. For example,
+`np.longdouble("-1.5")` becomes:
+
+```json
+{"__supervised_nmf_scalar__": "longdouble-v1", "significand": "-3", "exponent": -1}
+```
+
+The exact value is `int(significand) * 2**exponent`, interpreted with exact
+arithmetic. Nonzero significands are odd decimal strings; signed zeros use
+`"0"` or `"-0"` with exponent zero. This representation distinguishes adjacent
+values without depending on storage padding or narrowing to float64. Actual
+`np.longdouble` precision remains platform-dependent. Ordinary integer, string,
+and float16/32/64 JSON representations are unchanged.
+
+The `__supervised_nmf_scalar__` key is reserved for scalar output tags. These
+objects are report/checkpoint representations, not accepted input identifiers;
+pass original numeric IDs to evaluation and calibration APIs. Reusing the same
+IDs produces the same checkpoint identity, and changing an adjacent value is
+detected. Existing source/runtime compatibility checks still apply; this change
+does not migrate checkpoints created with different package source.
+
+For general report values, extended complex scalars use `clongdouble-v1` with
+`real` and `imag` fields encoded as above. Nonfinite real values/components
+become JSON `null`, matching the ordinary nonfinite-float policy. Complex and
+nonfinite identifiers remain invalid.
+
 Training labels determine the majority-class reference; evaluation labels
 never choose that class.
 `min_class_support=10` and `min_groups=5` flag small evaluation samples without

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from numbers import Integral, Number
+from fractions import Fraction
+from numbers import Integral
 
 import numpy as np
 from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
@@ -11,12 +12,19 @@ from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 def validate_metadata(values, n_samples, *, name, unique=False):
     """Return one scalar ID per row, rejecting missing or ambiguous metadata.
 
-    IDs may be finite numbers or nonempty strings. Numeric and string IDs may
-    not be mixed in one array. This avoids silently coercing distinct IDs into
-    the same value before checking overlap or constructing subject folds.
+    IDs may be Python/NumPy integers, finite floating-point scalars, or
+    nonblank strings. Boolean, complex, temporal, and other objects are
+    rejected. Numeric and string IDs may not be mixed in one array. Values
+    retain their precision; overlap/group checks use exact numerical identity.
+    This validates supplied values, not their origin before caller coercion.
     """
     if values is None:
         return None
+    invalid_type = (f"{name} must contain integer, finite floating-point, or nonempty string IDs; "
+                    "Boolean, complex, and temporal IDs are not supported.")
+    # Object conversion can turn nanosecond temporal arrays into integers.
+    if isinstance(values, np.ndarray) and values.dtype.kind in "mM":
+        raise ValueError(invalid_type)
     array = np.asarray(values, dtype=object)
     if array.ndim != 1 or len(array) != n_samples:
         raise ValueError(f"{name} must match rows as a one-dimensional array.")
@@ -26,17 +34,47 @@ def validate_metadata(values, n_samples, *, name, unique=False):
             if not value.strip():
                 raise ValueError(f"{name} must not contain missing IDs.")
             string_ids.append(True)
-        elif isinstance(value, Number) and not isinstance(value, complex):
+        elif isinstance(value, (bool, np.bool_, np.timedelta64)):
+            # bool and timedelta64 inherit integer behavior but are not IDs.
+            raise ValueError(invalid_type)
+        elif isinstance(value, (int, np.integer)):
+            # Integers are finite; a float conversion could lose identity.
+            string_ids.append(False)
+        elif isinstance(value, (float, np.floating)):
             if not np.isfinite(value):
                 raise ValueError(f"{name} must not contain missing or nonfinite IDs.")
             string_ids.append(False)
         else:
-            raise ValueError(f"{name} must contain finite numeric or nonempty string IDs.")
+            raise ValueError(invalid_type)
     if string_ids and any(string_ids) and not all(string_ids):
         raise ValueError(f"{name} must not mix numeric and string IDs.")
-    if unique and len(set(array.tolist())) != len(array):
+    if unique and len(set(_metadata_keys(array).tolist())) != len(array):
         raise ValueError(f"{name} must contain unique IDs.")
     return array
+
+
+def _metadata_keys(values):
+    """Return exact comparison keys for a validated object array of IDs.
+
+    NumPy can narrow mixed numeric comparisons and long-double hashes. Use
+    Python numeric keys internally; keep original scalars for reports/callers.
+    Builtin-only arrays need no copy, and integral extended values need no
+    Fraction. Construct keys once when reusing them across classes or folds.
+    """
+    if not len(values) or isinstance(values[0], str):
+        # Validated string families never contain numeric scalars.
+        return values
+    keys = values
+    for index, value in enumerate(values):
+        if isinstance(value, np.number):
+            item = value.item()
+            if isinstance(item, np.generic):
+                numerator, denominator = value.as_integer_ratio()
+                item = numerator if denominator == 1 else Fraction(numerator, denominator)
+            if keys is values:
+                keys = values.copy()
+            keys[index] = item
+    return keys
 
 
 def _indices(values, n_samples, role):
@@ -74,13 +112,14 @@ def build_cv_folds(X, y, *, cv=5, seed=0, groups=None, folds=None):
         raise ValueError("Every class must have at least cv samples; cv must be >= 2.")
     cv = int(cv)
     groups = validate_metadata(groups, len(y), name="groups")
-    if groups is not None and len(set(groups.tolist())) < cv:
+    group_keys = None if groups is None else _metadata_keys(groups)
+    if group_keys is not None and len(set(group_keys.tolist())) < cv:
         raise ValueError("At least cv distinct groups are required.")
     if folds is None:
         splitter = (StratifiedKFold(n_splits=cv, shuffle=True, random_state=seed)
                     if groups is None else
                     StratifiedGroupKFold(n_splits=cv, shuffle=True, random_state=seed))
-        folds = splitter.split(X, y) if groups is None else splitter.split(X, y, groups)
+        folds = splitter.split(X, y) if groups is None else splitter.split(X, y, group_keys)
     folds = list(folds)
     if len(folds) != cv:
         raise ValueError("Explicit folds must contain exactly cv splits.")
@@ -102,7 +141,7 @@ def build_cv_folds(X, y, *, cv=5, seed=0, groups=None, folds=None):
             raise ValueError("Training and validation indices must not overlap.")
         if not np.array_equal(np.sort(np.concatenate([train, valid])), all_indices):
             raise ValueError("Every training fold must be the complement of its validation fold.")
-        if groups is not None and set(groups[train].tolist()) & set(groups[valid].tolist()):
+        if group_keys is not None and set(group_keys[train].tolist()) & set(group_keys[valid].tolist()):
             raise ValueError("Training and validation groups must not overlap.")
         if any(np.sum(y[valid] == label) == 0 for label in classes):
             raise ValueError("Every validation fold must contain both classes.")

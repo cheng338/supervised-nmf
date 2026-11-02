@@ -7,6 +7,40 @@ records retain their original scope.
 
 Release dates are GitHub publication dates in America/Indianapolis time.
 
+## Unreleased
+
+## 0.4.3 — 2026-11-02
+
+See the [release notes](docs/release-0.4.3.md) for compatibility and validation details.
+
+- Consistently reject Boolean, complex and temporal sample/group identifiers
+  across scalar and array representations before fitting or prediction.
+  Unsupported identifier objects raise `ValueError`. Python/NumPy integer,
+  finite floating-point and nonblank string identities are preserved; large
+  Python integers no longer fail a NumPy finiteness check. Document the
+  identifier policy.
+- Use exact internal numeric keys for identifier uniqueness, overlap checks,
+  subject counts and grouped CV. Mixed NumPy scalars and Python integers
+  no longer miss equal IDs through inconsistent hashes or merge distinct
+  groups through rounded comparisons. Original IDs and report encodings
+  remain unchanged.
+- Fix recursive serialization of NumPy extended-precision scalars during report
+  construction and checkpoint writing. Tagged JSON preserves finite long-double
+  values exactly, including adjacent values, extreme magnitudes and signed zero;
+  extended complex report values also serialize without recursion. Ordinary
+  scalar encodings and identifier validation rules are unchanged.
+- Initialize the numerical-library inventory before freezing general
+  calibration checkpoint identities, matching shared-grid calibration.
+  Lazy BLAS/OpenMP initialization no longer makes an otherwise identical
+  resume incompatible; actual source/runtime changes still reject
+  reuse. This also applies to comparison identities; initialization occurs
+  before their calibration fit/tuning timers.
+
+- Expand padding-workspace ownership, reuse and failure-recovery tests.
+  Keep maintained AOCL operand tests focused on behavior without pinning
+  one historical implementation hash. Clarify the historical benchmark
+  wrappers' environment restrictions and the scope of portable runners.
+
 ## 0.4.2 — 2026-11-02
 
 See the [release notes](docs/release-0.4.2.md) for compatibility and validation details.

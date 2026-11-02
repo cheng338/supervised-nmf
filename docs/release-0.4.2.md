@@ -1,7 +1,5 @@
 # supervised-nmf 0.4.2
 
-November 2, 2026 (America/Indianapolis). Author: Chang Cheng.
-
 Version 0.4.2 corrects evaluation and reporting edge cases, reduces repeated
 numerical work, and adds exact-repeat stopping to the experimental ANLS-BPP
 solver. SPA, absolute screening and unscaled KNN remain the public defaults.

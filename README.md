@@ -51,6 +51,12 @@ numerical work, and adds exact-repeat stopping to experimental ANLS-BPP.
 Public solver defaults are unchanged. See the [0.4.2 release notes](docs/release-0.4.2.md)
 for changes, compatibility details and validation limits.
 
+Version **0.4.3** corrects sample/group identifier handling, preserves NumPy
+extended-precision scalars in reports and checkpoints, and stabilizes
+calibration checkpoint identities when native libraries load lazily. See
+the [0.4.3 release notes](docs/release-0.4.3.md) for compatibility and
+validation scope.
+
 See the [changelog](CHANGELOG.md) for the complete release history.
 
 **Copyright (c) 2026 Chang Cheng. All Rights Reserved.** A distribution license
@@ -60,20 +66,20 @@ applicable [third-party notices](THIRD_PARTY_NOTICES).
 
 # Installation
 
-Python 3.11 or later is required for version 0.4.2. Python 3.10 support
+Python 3.11 or later is required for version 0.4.3. Python 3.10 support
 ended on October 20, 2026. Dependencies are NumPy, SciPy, scikit-learn
 1.6 or later (below 2.0), threadpoolctl, and joblib 1.3 or later.
 Download the wheel from the [GitHub releases](https://github.com/cheng338/supervised-nmf/releases)
 and install it:
 
 ```shell
-python -m pip install --upgrade supervised_nmf-0.4.2-py3-none-any.whl
+python -m pip install --upgrade supervised_nmf-0.4.3-py3-none-any.whl
 ```
 
 To install the release from source:
 
 ```shell
-git clone --branch v0.4.2 https://github.com/cheng338/supervised-nmf.git
+git clone --branch v0.4.3 https://github.com/cheng338/supervised-nmf.git
 cd supervised-nmf
 python -m pip install .
 ```
@@ -601,7 +607,7 @@ python scripts/build_release.py
 python -I scripts/check_wheel.py
 ```
 
-The build produces `dist/supervised_nmf-0.4.2-py3-none-any.whl` and a source
+The build produces `dist/supervised_nmf-0.4.3-py3-none-any.whl` and a source
 archive. The wheel check verifies
 imports, authorship metadata, SPA/MU/CD fitting and prediction, and archive
 contents. It does not publish a release.

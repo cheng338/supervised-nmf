@@ -39,7 +39,7 @@ from threadpoolctl import threadpool_info, threadpool_limits
 
 from .classifier import _capture_projection, _record_warnings, _uses_projection_diagnostics
 from .screening import _clear_fitted_attributes
-from .validation import build_cv_folds, validate_metadata
+from .validation import _metadata_keys, build_cv_folds, validate_metadata
 
 
 class _TrackedLogisticRegression(LogisticRegression):
@@ -76,11 +76,41 @@ class _TrackedLinearSVC(LinearSVC):
         return result
 
 
+def _extended_float_json(value):
+    """Encode an unboxable NumPy float exactly, without narrowing its range."""
+    if not np.isfinite(value):
+        return None
+    numerator, denominator = value.as_integer_ratio()
+    if numerator == 0:
+        significand = "-0" if np.signbit(value) else "0"
+        exponent = 0
+    else:
+        # A binary float has a power-of-two denominator. Remove powers of two
+        # from the numerator too, keeping even extreme values compact.
+        magnitude = abs(numerator)
+        shift = (magnitude & -magnitude).bit_length() - 1
+        significand = str(numerator >> shift)
+        exponent = shift - (denominator.bit_length() - 1)
+    return {"__supervised_nmf_scalar__": "longdouble-v1",
+            "significand": significand, "exponent": exponent}
+
+
 def _jsonable(value):
     if isinstance(value, np.ndarray):
         return _jsonable(value.tolist())
     if isinstance(value, np.generic):
-        return _jsonable(value.item())
+        item = value.item()
+        if not isinstance(item, np.generic):
+            return _jsonable(item)
+        # longdouble/clongdouble cannot always unbox to a Python scalar.
+        # Recursing through .item() again would never terminate.
+        if isinstance(item, np.floating):
+            return _extended_float_json(item)
+        if isinstance(item, np.complexfloating):
+            return {"__supervised_nmf_scalar__": "clongdouble-v1",
+                    "real": _extended_float_json(item.real),
+                    "imag": _extended_float_json(item.imag)}
+        return repr(item)
     if isinstance(value, float) and not math.isfinite(value):
         return None
     if isinstance(value, dict):
@@ -160,6 +190,15 @@ def provenance(threads=1):
             "conda_environment": os.environ.get("CONDA_DEFAULT_ENV"),
             "versions": versions, "source_sha256": source_hashes,
             "native_threads_requested": threads, "threadpools": threadpool_info()}
+
+
+def _initialized_provenance(threads):
+    # A first BLAS operation can load a previously unseen OpenMP library.
+    # Stabilize that inventory before freezing it, without using study data.
+    with threadpool_limits(limits=threads):
+        probe = np.eye(4)
+        probe @ probe
+        return provenance(threads)
 
 
 def new_run_directory(root, prefix="development"):
@@ -288,7 +327,7 @@ def support_recovery(estimator, signal_support):
 
 def _search_identity(estimator, candidates, X, y, cv, seed, threads, refit=True,
                      *, groups=None, folds=None, data_ids=None):
-    environment = provenance(threads)
+    environment = _initialized_provenance(threads)
     runtime_keys = ("user_api", "internal_api", "prefix", "filepath", "version", "threading_layer", "architecture")
     numerical_runtime = sorted([{key: library.get(key) for key in runtime_keys}
                                 for library in environment["threadpools"]],
@@ -533,17 +572,20 @@ def _evaluation_metadata(y, classes, *, sample_ids, groups, train_sample_ids,
         # Each validated array has one ID family. Compare without coercing IDs.
         if isinstance(train_sample_ids[0], str) != isinstance(sample_ids[0], str):
             raise ValueError("Training and evaluation sample IDs must use the same identifier type (numeric or string).")
-        if set(train_sample_ids.tolist()) & set(sample_ids.tolist()):
+        if set(_metadata_keys(train_sample_ids).tolist()) & set(_metadata_keys(sample_ids).tolist()):
             raise ValueError("Training and evaluation sample IDs must not overlap.")
+    group_keys = None if groups is None else _metadata_keys(groups)
+    group_set = None if group_keys is None else set(group_keys.tolist())
+    train_group_set = None if train_groups is None else set(_metadata_keys(train_groups).tolist())
     if train_groups is not None:
         if groups is None:
             raise ValueError("groups are required when train_groups are supplied.")
         if isinstance(train_groups[0], str) != isinstance(groups[0], str):
             raise ValueError("Training and evaluation groups must use the same identifier type (numeric or string).")
-        if set(train_groups.tolist()) & set(groups.tolist()):
+        if train_group_set & group_set:
             raise ValueError("Training and evaluation groups must not overlap.")
     counts = [int(np.sum(y == label)) for label in classes]
-    group_count = None if groups is None else len(set(groups.tolist()))
+    group_count = None if group_set is None else len(group_set)
     low_class_support = min(counts) < min_class_support
     low_group_support = group_count is not None and group_count < min_groups
     metadata = {
@@ -556,10 +598,10 @@ def _evaluation_metadata(y, classes, *, sample_ids, groups, train_sample_ids,
         "sample_overlap_checked": train_sample_ids is not None,
         "group_overlap_checked": train_groups is not None,
         "training_sample_count": train_count,
-        "training_group_count": None if train_groups is None else len(set(train_groups.tolist())),
+        "training_group_count": None if train_group_set is None else len(train_group_set),
     }
     if groups is not None:
-        metadata["per_class_group_count"] = [len(set(groups[y == label].tolist())) for label in classes]
+        metadata["per_class_group_count"] = [len(set(group_keys[y == label].tolist())) for label in classes]
     if train_y is None:
         baseline = {"available": False, "reason": "Training labels were not supplied; majority class was not inferred from evaluation labels."}
     else:

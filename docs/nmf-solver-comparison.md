@@ -196,6 +196,21 @@ The full local record is
 results and checksummed experiment records under the same run directory. Raw
 run records and datasets are not included in the package distribution.
 
+The combined [four-solver orchestration](../scripts/run_four_solver_benchmarks.py)
+and [numerical-repair recovery](../scripts/prepare_four_solver_recovery.py)
+scripts preserve the recorded historical workflow and require an environment
+whose basename is `py12_df_aocl`. This name check is an administrative
+restriction, not verification of the AOCL binaries.
+
+For fresh studies in other environments, the
+[Fashion-MNIST](../scripts/fashion_mnist_study.py) and
+[CelebA](../scripts/celeba_four_solver_study.py) study runners accept explicit
+protocols and output directories without that restriction. To preserve this
+comparison's protocol, complete both datasets' CV before either evaluation.
+These runners do not replace historical checkpoint migration. Existing combined
+runs remain tied to their recorded sources, executable and numerical runtime,
+and a different environment requires a new run or a separately qualified migration.
+
 The benchmark scripts do not change public defaults. Interpret the result with
 accuracy, fit/prediction workload, numerical reliability, two-dataset scope and
 the implementation/theory qualifications together. Neither the comparison nor

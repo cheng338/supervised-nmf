@@ -35,7 +35,7 @@ from ._neighbors import _KNNQueryReuse
 from .screening import BinaryScreening
 from .validation import build_cv_folds, validate_metadata
 from .evaluation import (
-    _diagnostics, _digest, _jsonable, _nonconverged, _search_identity,
+    _diagnostics, _digest, _initialized_provenance, _jsonable, _nonconverged, _search_identity,
     _warning_records, provenance, refinement_diagnostics, write_json,
 )
 
@@ -98,15 +98,6 @@ def _layout(estimator):
         forbidden = {name, "steps"} | {f"{name}__{key}" for key in classifier.get_params() if key != "n_neighbors"}
         return "pipeline", f"{name}__n_neighbors", forbidden
     raise TypeError("Use NMFClassifier with classifier='knn', a standard Pipeline ending in KNeighborsClassifier, or raw KNeighborsClassifier.")
-
-
-def _initialized_provenance(threads):
-    # A first BLAS operation can load a previously unseen OpenMP library.
-    # Stabilize that inventory before freezing it, without using study data.
-    with threadpool_limits(limits=threads):
-        probe = np.eye(4)
-        probe @ probe
-        return provenance(threads)
 
 
 def _runtime_identity(estimator, threads):

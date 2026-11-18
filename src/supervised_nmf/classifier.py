@@ -20,7 +20,7 @@ from sklearn.utils.metaestimators import available_if
 from sklearn.utils.validation import check_consistent_length, check_is_fitted
 
 from .decomposition import FeatureSPA
-from ._labels import _validate_class_label, _validate_class_labels
+from ._labels import _sklearn_labels, _validate_class_label, _validate_class_labels
 from ._mu import transform_mu
 from ._mu_rowwise import transform_mu_rowwise
 from ._projection import validate_projection_parameters
@@ -518,6 +518,7 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
             W, projection_warnings = _record_warnings(lambda: projection_transform(decomposition, X_selected))
         training_projection_seconds = time.perf_counter() - stage
         stage = time.perf_counter()
+        y = _sklearn_labels(y)
         if self.classifier == "knn":
             classifier = KNeighborsClassifier(n_neighbors=self.n_neighbors, weights=self.weights)
             if self.knn_normalization == "sd":
@@ -670,7 +671,7 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
         predicted = self.predict(X)
         check_consistent_length(y, predicted, sample_weight)
         y = _validate_class_labels(y)
-        return accuracy_score(y, predicted, sample_weight=sample_weight)
+        return accuracy_score(_sklearn_labels(y), _sklearn_labels(predicted), sample_weight=sample_weight)
 
     def _prediction_coordinates(self, X):
         coordinates = self.transform(X)

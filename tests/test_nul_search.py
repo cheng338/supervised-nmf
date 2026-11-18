@@ -13,7 +13,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 
-from supervised_nmf.evaluation import provenance
+from supervised_nmf.evaluation import data_fingerprint, provenance
 from supervised_nmf.screening import BinaryScreening
 from supervised_nmf.search import calibration_rank_search
 from supervised_nmf.study import calibration_knn_grid
@@ -177,6 +177,28 @@ class TerminalNULSearchTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 result = self.call(kind, labels, self.directory / f"embedded-{kind}")
                 self.assertTrue(all(row["valid"] for row in result["candidates"]))
+
+    @unittest.skipUnless(hasattr(np.dtypes, "StringDType"), "requires NumPy StringDType")
+    def test_variable_width_grouped_search_preserves_checkpoint_dtype_at_every_stage(self):
+        labels = np.array(["\0absent", "pré\0sent"] * 12, dtype=object)
+        strings = labels.astype(np.dtypes.StringDType())
+        digest = data_fingerprint(self.X, strings)
+        self.assertNotEqual(digest, data_fingerprint(self.X, labels))
+        for kind in ("representation", "rank"):
+            with self.subTest(kind=kind):
+                directory = self.directory / kind
+                reference = self.call(kind, labels, self.directory / f"{kind}-object", folds=None)
+                actual = self.call(kind, strings, directory, folds=None)
+                self.assertTrue(all(row["valid"] for row in actual["candidates"]))
+                self.assertEqual([row["mean_score"] for row in actual["candidates"]],
+                                 [row["mean_score"] for row in reference["candidates"]])
+                self.assertEqual(actual["selected_parameters"], reference["selected_parameters"])
+                for report in [actual, *actual.get("stages", [])]:
+                    self.assertEqual(report["identity"]["calibration"]["data_sha256"], digest)
+                resumed = self.call(kind, strings.copy(), directory, folds=None)
+                self.assertEqual(resumed["fingerprint"], actual["fingerprint"])
+                with self.assertRaisesRegex(ValueError, "incompatible"):
+                    self.call(kind, labels, directory, folds=None)
 
     def test_package_identity_includes_new_label_validator(self):
         import supervised_nmf._labels as labels

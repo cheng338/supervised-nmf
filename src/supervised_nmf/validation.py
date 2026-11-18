@@ -10,7 +10,7 @@ from numbers import Integral
 import numpy as np
 from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 
-from ._labels import _validate_class_labels
+from ._labels import _sklearn_labels, _validate_class_labels
 
 
 # Capture the stock scalar class independently of the mutable public alias.
@@ -445,7 +445,8 @@ def build_cv_folds(X, y, *, cv=5, seed=0, groups=None, folds=None):
         splitter = (StratifiedKFold(n_splits=cv, shuffle=True, random_state=seed)
                     if groups is None else
                     StratifiedGroupKFold(n_splits=cv, shuffle=True, random_state=seed))
-        folds = splitter.split(X, y) if groups is None else splitter.split(X, y, group_keys)
+        split_y = _sklearn_labels(y)
+        folds = splitter.split(X, split_y) if groups is None else splitter.split(X, split_y, group_keys)
     folds = list(folds)
     if len(folds) != cv:
         raise ValueError("Explicit folds must contain exactly cv splits.")

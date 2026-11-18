@@ -121,7 +121,7 @@ def freeze_run(output, fashion_protocol=DEFAULT_FASHION_PROTOCOL, celeba_protoco
     protocol_paths = {"fashion": fashion_protocol.relative_to(ROOT).as_posix(),
                       "celeba": celeba_protocol.relative_to(ROOT).as_posix()}
     files = list((ROOT / "src").rglob("*.py")) + [
-        Path(__file__), ROOT / "scripts" / "fashion_mnist_study.py",
+        Path(__file__).resolve(), ROOT / "scripts" / "fashion_mnist_study.py",
         ROOT / "scripts" / "celeba_four_solver_study.py",
         ROOT / "scripts" / "experimental_nmf.py",
         ROOT / "scripts" / "report_four_solver_benchmarks.py",

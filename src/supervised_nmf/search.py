@@ -14,7 +14,6 @@ from sklearn.base import clone
 from sklearn.decomposition import NMF, PCA
 from sklearn.model_selection import ParameterGrid
 from sklearn.pipeline import Pipeline
-from sklearn.utils.validation import check_X_y
 
 from .classifier import NMFClassifier
 from ._calibration import _validate_scoring
@@ -22,7 +21,7 @@ from ._search_diagnostics import mark_inactive_refinement
 from .decomposition import FeatureSPA
 from .evaluation import _digest, _jsonable, _search_identity, refinement_diagnostics
 from ._identity import implementation_sources
-from ._labels import _validate_class_labels
+from ._labels import _check_labeled_data, _validate_class_labels
 from .screening import BinaryScreening
 from .study import (
     _checkpoint_lock, _read_receipt, _runtime_identity, _write_receipt,
@@ -140,7 +139,7 @@ def calibration_rank_search(estimator, param_grid, X, y, *, rank_parameter=None,
         max_rank = _positive_integer(max_rank, "max_rank")
     candidates = list(ParameterGrid(param_grid))
     raw_y = y
-    X, y = check_X_y(X, y)
+    X, y = _check_labeled_data(X, y)
     _validate_class_labels(raw_y, y)
     # Validate before a custom clone can hide the original implementation.
     implementation_sources(estimator, candidates)

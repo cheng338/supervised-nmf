@@ -23,7 +23,6 @@ from sklearn.model_selection import ParameterGrid
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.utils.validation import check_X_y
 from threadpoolctl import threadpool_info, threadpool_limits
 
 from ._completed_reuse import _ReuseUnavailable, _quiet_record
@@ -32,7 +31,7 @@ from .classifier import NMFClassifier, _capture_projection
 _STUDY_LABEL_CONVERSION = NMFClassifier._labels_from_probabilities
 from ._calibration import _validate_scoring, _score_predictions, _score_fields
 from ._identity import configuration_identity, implementation_sources
-from ._labels import _validate_class_labels
+from ._labels import _check_labeled_data, _sklearn_labels, _validate_class_labels
 from ._neighbors import _KNNQueryReuse
 from ._search_diagnostics import screening_grid_diagnostics, mark_inactive_refinement
 from .screening import BinaryScreening
@@ -682,7 +681,7 @@ def _calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=
         raise ValueError("cv must be an integer >= 2.")
     cv = int(cv)
     raw_y = y
-    X, y = check_X_y(X, y)
+    X, y = _check_labeled_data(X, y)
     classes, counts = np.unique(y, return_counts=True)
     _validate_class_labels(raw_y, y, classes=classes)
     if len(classes) != 2 or counts.min() < cv:
@@ -745,6 +744,7 @@ def _calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=
     if _screening_statistics_recovery == "early":
         identity["screening_statistics_recovery"] = {"requested": "early", "schema": 1}
     fingerprint = _digest(identity)
+    y = _sklearn_labels(y)
     directory = Path(checkpoint_dir)
     directory.mkdir(parents=True, exist_ok=True)
     receipts = []

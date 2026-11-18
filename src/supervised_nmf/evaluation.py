@@ -38,14 +38,14 @@ from sklearn.model_selection import ParameterGrid
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.svm import LinearSVC
-from sklearn.utils.validation import check_X_y, check_is_fitted, check_random_state
+from sklearn.utils.validation import check_is_fitted, check_random_state
 from threadpoolctl import threadpool_info, threadpool_limits
 
-from .classifier import (_capture_projection, _record_warnings, _uses_projection_diagnostics,
+from .classifier import (NMFClassifier, _capture_projection, _record_warnings, _uses_projection_diagnostics,
                          _knn_probabilities_preserve_labels)
 from ._calibration import _score_fields, _score_predictions, _validate_scoring
 from ._identity import configuration_identity, implementation_sources
-from ._labels import _validate_class_label, _validate_class_labels
+from ._labels import _check_labeled_data, _sklearn_labels, _validate_class_label, _validate_class_labels
 from ._search_diagnostics import mark_inactive_refinement, screening_grid_diagnostics
 from .screening import _clear_fitted_attributes
 from .validation import (
@@ -259,7 +259,7 @@ def data_fingerprint(X, y):
     for array in arrays:
         digest.update(str(array.shape).encode())
         digest.update(array.dtype.str.encode())
-        if array.dtype.hasobject:
+        if array.dtype.hasobject or array.dtype.kind == "T":
             digest.update(json.dumps(_jsonable(array), sort_keys=True).encode())
         else:
             contiguous = np.ascontiguousarray(array)
@@ -524,7 +524,7 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
     refit = _validate_refit(refit)
     scoring = _validate_scoring(scoring)
     raw_y = y
-    X, y = check_X_y(X, y)
+    X, y = _check_labeled_data(X, y)
     classes, counts = np.unique(y, return_counts=True)
     _validate_class_labels(raw_y, y, classes=classes)
     groups = validate_metadata(groups, len(y), name="groups")
@@ -536,6 +536,8 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
         raise ValueError("At least one parameter candidate is required.")
     identity = _search_identity(estimator, candidates, X, y, cv, seed, threads, refit=refit,
                                 groups=groups, folds=folds, data_ids=data_ids, scoring=scoring)
+    if type(estimator) is not NMFClassifier:
+        y = _sklearn_labels(y)
     # Identity must validate custom cloning before diagnostics clone anything.
     screening_diagnostics = screening_grid_diagnostics(estimator, candidates)
     fingerprint = _digest(identity)
@@ -666,7 +668,7 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
                     break
             if fitted is None:
                 fallback_start = time.perf_counter()
-                fitted = DummyClassifier(strategy="most_frequent").fit(X, y)
+                fitted = DummyClassifier(strategy="most_frequent").fit(X, _sklearn_labels(y))
                 seconds = time.perf_counter() - fallback_start
                 report["final_fit_seconds"] += seconds
                 report["final_fit_attempts"].append({"status": "fallback", "seconds": seconds,
@@ -967,7 +969,7 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
     """
     threads = _validate_threads(threads)
     raw_y = y
-    X, y = check_X_y(X, y)
+    X, y = _check_labeled_data(X, y)
     _validate_class_labels(raw_y, y)
     raw_classes = estimator.classes_
     classes = np.asarray(raw_classes)
@@ -1052,8 +1054,11 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
                     "support_diagnostics": support_diagnostics, "training_majority_reference": majority_reference,
                     "data_sha256": data_fingerprint(X, y)}
     elapsed = time.perf_counter() - start
-    precision, recall, f1, support = precision_recall_fscore_support(y, predicted, labels=classes,
-                                                                 zero_division=0)
+    metric_y = _sklearn_labels(y)
+    predicted = _sklearn_labels(predicted)
+    classes = _sklearn_labels(classes)
+    precision, recall, f1, support = precision_recall_fscore_support(metric_y, predicted, labels=classes,
+                                                                     zero_division=0)
     both_classes = len(np.unique(y)) == 2
     auc = ap = None
     ranking_score = probability if probability is not None else margin
@@ -1062,12 +1067,12 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
         if both_classes:
             auc = float(roc_auc_score(y == positive, ranking_score))
             ap = float(average_precision_score(y == positive, ranking_score))
-    metrics = {"accuracy": float(accuracy_score(y, predicted)),
-               "balanced_accuracy": float(balanced_accuracy_score(y, predicted)) if both_classes else None,
+    metrics = {"accuracy": float(accuracy_score(metric_y, predicted)),
+               "balanced_accuracy": float(balanced_accuracy_score(metric_y, predicted)) if both_classes else None,
                "roc_auc": auc, "average_precision": ap,
                "precision": float(precision[1]), "recall": float(recall[1]), "f1": float(f1[1]),
                "positive_class": _jsonable(positive),
-               "confusion_matrix": confusion_matrix(y, predicted, labels=classes).tolist(),
+               "confusion_matrix": confusion_matrix(metric_y, predicted, labels=classes).tolist(),
                "confusion_matrix_labels": _jsonable(classes),
                "per_class": [{"label": _jsonable(label), "precision": float(precision[i]),
                               "recall": float(recall[i]), "f1": float(f1[i]), "support": int(support[i])}

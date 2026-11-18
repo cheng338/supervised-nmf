@@ -219,7 +219,10 @@ integer codes before converting them to fixed-width NumPy strings. Converting
 an already truncated array to `object` cannot recover the original values:
 fixed-width `U2` storage cannot distinguish `"a"` plus padding from `"a\x00"`.
 Raw lists/tuples and object/StringDType arrays retaining the original strings
-are checked without silently trimming or merging labels.
+are checked without silently trimming or merging labels. On NumPy versions
+where scikit-learn cannot validate variable-width string arrays, the package
+passes the same strings in an object array to the affected routines. Calibration
+checkpoints still distinguish variable-width string inputs from object inputs.
 
 Older fitted screens/classifiers still containing terminal-NUL class values
 are rejected when used for transformation, prediction or support queries.

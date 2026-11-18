@@ -21,7 +21,7 @@ class CheckpointOwnershipTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.path = self.root / "nested" / "checkpoint.json"
         self.X = np.random.default_rng(713).uniform(.2, 2., size=(24, 4))
         self.y = np.tile([0, 1], 12)

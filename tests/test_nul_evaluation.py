@@ -20,6 +20,8 @@ class LabelProbeClassifier(ClassifierMixin, BaseEstimator):
     def fit(self, X, y):
         FIT_CALLS.append(len(y))
         self.classes_ = np.unique(y)
+        if self.output == "variable_strings":
+            self.classes_ = self.classes_.astype(np.dtypes.StringDType())
         self.n_features_in_ = X.shape[1]
         return self
 
@@ -31,6 +33,8 @@ class LabelProbeClassifier(ClassifierMixin, BaseEstimator):
         if self.output == "terminal_numpy_scalar":
             return np.array([np.str_("a\0") if i % 2 == 0 else "b"
                              for i in range(len(X))], dtype=object)
+        if self.output == "terminal_string_dtype":
+            return terminal_labels("string_dtype", len(X))
         return labels
 
     def predict_proba(self, X):
@@ -44,6 +48,34 @@ def data():
     PREDICT_CALLS.clear()
     X = np.column_stack([np.arange(20), np.ones(20)])
     return X, np.array(["a", "b"] * 10, dtype=object)
+
+
+@pytest.mark.skipif(not hasattr(np.dtypes, "StringDType"), reason="requires NumPy StringDType")
+@pytest.mark.parametrize("scoring", ["accuracy", "balanced_accuracy"])
+def test_variable_width_predictions_and_classes_reach_native_metrics(data, tmp_path, scoring):
+    X, y = data
+    strings = y.astype(np.dtypes.StringDType())
+    probe = LabelProbeClassifier(output="variable_strings")
+    checkpoint = tmp_path / "cv.json"
+
+    def calibrate(target):
+        return evaluation.calibration_search(probe, {}, X, target, cv=2, scoring=scoring,
+                                             checkpoint_path=checkpoint)
+
+    fitted = calibrate(strings)
+    assert fitted.report["selected_mean_score"] == 1.0
+    assert fitted.report["identity"]["data_sha256"] == evaluation.data_fingerprint(X, strings)
+    for target in (strings, y):
+        report = evaluation.evaluate_classifier(fitted.estimator, X, target)
+        assert report["status"] == "valid"
+        assert report["data_sha256"] == evaluation.data_fingerprint(X, target)
+        assert report["metrics"]["confusion_matrix"] == [[10, 0], [0, 10]]
+        assert report["metrics"]["roc_auc"] == 1.0
+        assert report["predictions"]["predicted_labels"] == y.tolist()
+
+    assert calibrate(strings.copy()).report["fingerprint"] == fitted.report["fingerprint"]
+    with pytest.raises(ValueError, match="incompatible"):
+        calibrate(y)
 
 
 def terminal_labels(kind, length):
@@ -108,7 +140,7 @@ def test_evaluation_rejects_all_label_inputs_before_prediction(data, role, kind)
     assert pickle.dumps(model) == preserved
 
 
-@pytest.mark.parametrize("output", ["terminal_list", "terminal_numpy_scalar"])
+@pytest.mark.parametrize("output", ["terminal_list", "terminal_numpy_scalar", "terminal_string_dtype"])
 def test_external_prediction_labels_fail_before_metrics(data, output, monkeypatch):
     X, y = data
     model = LabelProbeClassifier(output=output).fit(X, y)

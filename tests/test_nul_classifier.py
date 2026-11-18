@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from sklearn.base import ClassifierMixin
 from sklearn.decomposition import NMF
-from sklearn.exceptions import NotFittedError
+from sklearn.exceptions import DataConversionWarning, NotFittedError
 from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
@@ -62,6 +62,24 @@ def target(codes, representation):
 def head(model):
     value = model.classifier_
     return value.steps[-1][1] if isinstance(value, Pipeline) else value
+
+
+@pytest.mark.skipif(not hasattr(np.dtypes, "StringDType"), reason="requires NumPy StringDType")
+def test_variable_width_column_labels_keep_class_dtype_and_score_on_refit(data):
+    X, codes = data
+    labels = np.array(["", "prés\0ent"], dtype=object)[codes]
+    strings = labels.astype(np.dtypes.StringDType())
+    model = classifier(screening="percentile").fit(X, labels)
+    expected_predictions = model.predict(X)
+    weights = np.linspace(.2, 2, len(codes))
+    expected_score = model.score(X, labels, sample_weight=weights)
+
+    with pytest.warns(DataConversionWarning):
+        model.fit(X, strings.reshape(-1, 1))
+    assert model.classes_.dtype == strings.dtype
+    assert model.classes_.tolist() == ["", "prés\0ent"]
+    assert model.predict(X).tolist() == expected_predictions.tolist()
+    assert model.score(X, strings, sample_weight=weights) == expected_score
 
 
 @pytest.mark.parametrize("solver", SOLVERS)

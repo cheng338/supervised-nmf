@@ -100,7 +100,7 @@ class RecoveryProvenanceTests(unittest.TestCase):
 
     def test_source_freeze_does_not_require_retired_writer(self):
         with tempfile.TemporaryDirectory(prefix="freeze-") as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             files = ["src/supervised_nmf/__init__.py", "scripts/run_four_solver_benchmarks.py",
                      "scripts/fashion_mnist_study.py", "scripts/celeba_four_solver_study.py",
                      "scripts/experimental_nmf.py", "scripts/report_four_solver_benchmarks.py",
@@ -117,9 +117,10 @@ class RecoveryProvenanceTests(unittest.TestCase):
             celeba.write_text('{"fixture": "celeba"}', encoding="utf-8")
             output = root / "run"
             with patch.object(orchestration, "ROOT", root), patch.object(
-                    orchestration, "__file__", str(root / "scripts/run_four_solver_benchmarks.py")):
+                    orchestration, "__file__", str(root / "scripts/../scripts/run_four_solver_benchmarks.py")):
                 freeze = orchestration.freeze_run(output, fashion, celeba)
                 self.assertEqual(orchestration.freeze_run(output, fashion, celeba), freeze)
+            self.assertIn("scripts/run_four_solver_benchmarks.py", freeze["files"])
             self.assertNotIn("scripts/prepare_four_solver_recovery.py", freeze["files"])
             self.assertFalse((root / "scripts/prepare_four_solver_recovery.py").exists())
             for relative, expected in freeze["files"].items():

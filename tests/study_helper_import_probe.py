@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import chdir
 import hashlib
 import importlib
 import importlib.util
@@ -357,7 +358,10 @@ def origin_aliases(source, work, route):
         operation = owner._experimental_module
     assert name not in sys.modules
     helper = importlib.import_module(name)
-    aliases = [str(path), os.path.relpath(path), str(path.parent) + os.sep + "." + os.sep + path.name,
+    with chdir(work):
+        helper.__file__ = os.path.relpath(path)
+        assert operation() is helper
+    aliases = [str(path), str(path.parent) + os.sep + "." + os.sep + path.name,
                path, OriginString(str(path))]
     if os.name == "nt":
         aliases.append(str(path).swapcase())

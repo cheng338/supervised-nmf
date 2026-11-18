@@ -26,6 +26,8 @@ import uuid
 import warnings
 
 ROOT = Path(__file__).resolve().parents[1]
+_EXPERIMENTAL_SOURCE = ROOT / "scripts" / "experimental_nmf.py"
+_EXPERIMENTAL_ORIGIN = str(_EXPERIMENTAL_SOURCE)
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
@@ -37,6 +39,7 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from threadpoolctl import threadpool_limits
 
+from supervised_nmf._identity import configuration_identity, implementation_sources
 from supervised_nmf.evaluation import (
     _diagnostics, _digest, _jsonable, _nonconverged, _warning_records,
     comparison_models, data_fingerprint, evaluate_classifier, provenance,
@@ -47,7 +50,16 @@ from supervised_nmf.study import (
     _checkpoint_lock, _initialized_provenance, _read_receipt, _runtime_identity as _calibration_runtime,
     _write_receipt, calibration_knn_grid,
 )
-from profile_celeba_stages import _compare_predictions, _runtime_identity, _StageProfiler, profile_selected_estimator
+import profile_celeba_stages as _profile_helper
+if (getattr(_profile_helper, "__file__", None) is None
+        or Path(_profile_helper.__file__).resolve()
+        != (ROOT / "scripts" / "profile_celeba_stages.py").resolve()):
+    raise ImportError("The study requires its sibling profile_celeba_stages.py; "
+                      "restart with the intended checkout on the import path.")
+_compare_predictions = _profile_helper._compare_predictions
+_runtime_identity = _profile_helper._runtime_identity
+_StageProfiler = _profile_helper._StageProfiler
+profile_selected_estimator = _profile_helper.profile_selected_estimator
 
 EXPECTED_SHAPE = (60000, 784)
 NMF_METHODS = ("screened_cd_absolute", "screened_spa_absolute")
@@ -73,11 +85,24 @@ def _integer(value, label, minimum=1, maximum=None):
 def _sources(extra_paths=()):
     environment = _initialized_provenance(1)
     paths = [Path(__file__), ROOT / "scripts" / "profile_celeba_stages.py"]
-    experimental = ROOT / "scripts" / "experimental_nmf.py"
+    experimental = _EXPERIMENTAL_SOURCE
     if experimental.exists():
         paths.append(experimental)
+    sources = {p.name: _file_hash(p) for p in paths}
+    if getattr(_profile_helper, "_SOURCE_SHA256_AT_IMPORT", None) != sources["profile_celeba_stages.py"]:
+        raise ValueError("profile_celeba_stages.py changed after import or lacks an import source pin; "
+                         "restart the interpreter before continuing this study.")
+    loaded_experimental = sys.modules.get("experimental_nmf")
+    if loaded_experimental is not None:
+        origin = getattr(loaded_experimental, "__file__", None)
+        if (origin is None or (not (type(origin) is str and origin == _EXPERIMENTAL_ORIGIN)
+                and Path(origin).resolve() != experimental.resolve())
+                or getattr(loaded_experimental, "_SOURCE_SHA256_AT_IMPORT", None)
+                != sources.get("experimental_nmf.py")):
+            raise ValueError("Loaded experimental_nmf.py differs from this study source; "
+                             "restart the interpreter before continuing this study.")
     return {"package_source_sha256": environment["source_sha256"],
-            "runner_source_sha256": {p.name: _file_hash(p) for p in paths},
+            "runner_source_sha256": sources,
             "extra_sources_sha256": {str(Path(p).resolve()): _file_hash(p) for p in extra_paths},
             "runtime": _runtime_identity(environment)}
 
@@ -348,13 +373,33 @@ def initialize(protocol_path, output):
     return configuration
 
 
+def _experimental_module(*, verify_source=True):
+    """Load the optional comparator from the same study checkout.
+
+    Read-only diagnostics rely on their study's existing source checks before
+    result publication; estimator construction and workflow entry check here.
+    """
+    import experimental_nmf
+    expected = _EXPERIMENTAL_SOURCE
+    origin = getattr(experimental_nmf, "__file__", None)
+    if (origin is None or (not (type(origin) is str and origin == _EXPERIMENTAL_ORIGIN)
+            and Path(origin).resolve() != expected.resolve())):
+        raise ImportError("The study requires its sibling experimental_nmf.py; "
+                          "restart with the intended checkout on the import path.")
+    if (verify_source and getattr(experimental_nmf, "_SOURCE_SHA256_AT_IMPORT", None)
+            != hashlib.sha256(expected.read_bytes()).hexdigest()):
+        raise ImportError("experimental_nmf.py changed after import or lacks an import source pin; "
+                          "restart the interpreter before continuing this study.")
+    return experimental_nmf
+
+
 def _estimator(job):
     if job["method"] in EXPERIMENTAL_METHODS:
         if job["method"] == "screened_mu_absolute":
             decomposition = NMF(solver="mu", init="nndsvda", random_state=job["seed"],
                                 max_iter=job["max_iter"], tol=job["tol"])
         else:
-            from experimental_nmf import ANLSBPP
+            ANLSBPP = _experimental_module().ANLSBPP
             decomposition = ANLSBPP(random_state=job["seed"], max_iter=job.get("anls_max_iter", 1000), tol=job["tol"],
                                     nnls_max_iter=job.get("anls_nnls_max_iter"), nnls_tol=job.get("anls_nnls_tol", 1e-10))
         return Pipeline([("screen", BinaryScreening(screening="absolute")), ("nmf", decomposition),
@@ -369,7 +414,9 @@ def _worker(work):
     X, y = _load_arrays(job.get("training_array_record", {"path": job["cache"]}))
     if data_fingerprint(X, y) != job["training_data_sha256"]:
         raise ValueError("Worker training data differ from the frozen configuration.")
+    # Preserve this protocol's declared balanced-accuracy selection objective.
     report = calibration_knn_grid(_estimator(job), chunk["grid"], X, y, cv=5, seed=job["seed"], threads=1,
+                                  scoring="balanced_accuracy",
                                   checkpoint_dir=Path(output) / job["id"] / chunk["id"])
     _check_source(sources)
     return {"job": job["id"], "chunk": chunk["id"], "valid_candidates": sum(row["valid"] for row in report["candidates"]),
@@ -390,17 +437,24 @@ def aggregate_cv(output, configuration, *, require_complete=False):
             continue
         canonical = {_digest(row["parameters"]): row["index"] for row in plan["candidates"]}
         candidates, costs, receipts = [], {}, {}
-        expected_runtime = _calibration_runtime(_estimator(job), 1)
         for chunk, path in zip(plan["chunks"], paths):
             report = _read_receipt(path)
             identity = report["identity"]
             calibration = identity["calibration"]
             expected = list(ParameterGrid(chunk["grid"]))
+            estimator = _estimator(job)
+            expected_runtime = _calibration_runtime(estimator, 1, expected)
+            expected_configuration = configuration_identity({"estimator": estimator,
+                                                             "candidates": expected})
             if (_read_receipt(path.parent / "identity.json") != identity or report["state"] != "cv_completed"
+                    or report.get("schema_version") != 4 or identity.get("schema_version") != 4
+                    or calibration.get("identity_schema") != 2
+                    or any(record.get("scoring") != "balanced_accuracy"
+                           for record in (report, identity, calibration))
                     or report["fingerprint"] != _digest(identity) or calibration["data_sha256"] != job["training_data_sha256"]
-                    or calibration["candidates"] != expected or calibration["cv"] != 5 or calibration["seed"] != job["seed"]
+                    or calibration.get("structural_configuration") != expected_configuration or calibration["cv"] != 5 or calibration["seed"] != job["seed"]
                     or calibration["threads"] != 1 or calibration["refit"] is not False
-                    or calibration["parameters"] != _jsonable(_estimator(job).get_params(deep=True))
+                    or calibration.get("implementation_source") != implementation_sources(estimator, expected)
                     or calibration["source_sha256"] != configuration["sources"]["package_source_sha256"]
                     or identity["runtime"] != expected_runtime
                     or _digest(identity["folds"]) != plan["fold_indices_sha256"]
@@ -476,15 +530,16 @@ def _profile(estimator, X, y, Xv, yv, *, reference, sample_ids):
     """Extend unchanged stage instrumentation to the two experimental pipelines."""
     if not (isinstance(estimator, Pipeline) and "nmf" in estimator.named_steps):
         return profile_selected_estimator(estimator, X, y, Xv, yv, reference=reference, sample_ids=sample_ids)
-    model, caught = clone(estimator), []
+    capture_transform_diagnostics = _experimental_module().capture_transform_diagnostics
+    model, caught, projection = clone(estimator), [], None
     record = {"status": "failed", "exact_prediction_match": False,
               "timing": {"total_fit_seconds": None, "prediction_seconds": None}, "evaluation": None}
     with threadpool_limits(limits=1), _StageProfiler() as meter:
         decomposition_type = type(estimator.named_steps["nmf"])
         if decomposition_type is not NMF:
             meter._wrap(decomposition_type, "fit_transform", {"fit": "decomposition_fit_seconds"})
-            meter._wrap(decomposition_type, "transform", {"fit": "training_projection_seconds",
-                                                         "prediction": "decomposition_projection_seconds"})
+        meter._wrap(decomposition_type, "transform", {"fit": "training_projection_seconds",
+                                                     "prediction": "decomposition_projection_seconds"})
         start = time.perf_counter()
         try:
             with warnings.catch_warnings(record=True) as caught:
@@ -496,18 +551,22 @@ def _profile(estimator, X, y, Xv, yv, *, reference, sample_ids):
                 record["status"] = "nonconverged"
             else:
                 meter.phase = "prediction"
-                reproduced = evaluate_classifier(model, Xv, yv, threads=1, sample_ids=sample_ids)
+                with capture_transform_diagnostics(model.named_steps["nmf"]) as projection:
+                    reproduced = evaluate_classifier(model, Xv, yv, threads=1, sample_ids=sample_ids)
                 record["evaluation"] = reproduced
-                record["diagnostics"] = _model_diagnostics(model)
+                if projection is None:
+                    record["diagnostics"] = _model_diagnostics(model)
                 record["timing"]["prediction_seconds"] = reproduced["prediction_seconds"]
                 comparison = _compare_predictions(reference["predictions"], reproduced.get("predictions", {}))
                 record["prediction_comparison"] = comparison
                 record["exact_prediction_match"] = comparison["exact_match"]
                 record["status"] = ("valid" if reproduced["status"] == "valid" and comparison["exact_match"]
-                                    and not _model_nonconverged(model, []) else "invalid_reproduction")
+                                    and not _model_nonconverged(model, [], projection, query=True) else "invalid_reproduction")
         except Exception as error:
             record.update(status="failed", error_type=type(error).__name__, error=str(error))
         finally:
+            if projection is not None:
+                record["diagnostics"] = _model_diagnostics(model, projection)
             if record["timing"]["total_fit_seconds"] is None:
                 record["timing"]["total_fit_seconds"] = time.perf_counter() - start
             record["fit_warnings"] = _warning_records(caught)
@@ -520,15 +579,23 @@ def _profile(estimator, X, y, Xv, yv, *, reference, sample_ids):
     return record
 
 
-def _model_diagnostics(model):
+def _model_diagnostics(model, projection=None):
     output = _diagnostics(model)
     decomposition = model.named_steps.get("nmf") if isinstance(model, Pipeline) else getattr(model, "decomposition_", None)
     if decomposition is not None:
+        ANLSBPP = _experimental_module(verify_source=False).ANLSBPP
+        experimental = isinstance(decomposition, ANLSBPP)
         output["decomposition"] = {key: _jsonable(getattr(decomposition, key)) for key in (
             "n_iter_", "converged_", "last_transform_converged_", "reconstruction_err_", "solver", "tol", "max_iter",
             "nnls_tol", "nnls_max_iter", "convergence_reason_", "relative_projected_gradient_",
             "initial_projected_gradient_", "nnls_diagnostics_", "last_transform_diagnostics_", "computation_dtype_")
-            if hasattr(decomposition, key)}
+            if hasattr(decomposition, key) and not (experimental and key.startswith("last_transform_"))}
+        if experimental and projection is not None:
+            output["decomposition"].update(
+                last_transform_performed_=bool(projection["performed"]),
+                last_transform_converged_=projection["converged"],
+                last_transform_diagnostics_=_jsonable(projection["diagnostics"]),
+                last_transform_error_=projection["error"])
         if hasattr(decomposition, "components_"):
             output["basis_dtype"] = str(decomposition.components_.dtype)
         solver = getattr(model, "solver", getattr(decomposition, "solver", "anls_bpp"))
@@ -544,10 +611,24 @@ def _model_diagnostics(model):
     return output
 
 
-def _model_nonconverged(model, caught):
-    """Inspect fitted pipeline steps as well as their required warning contract."""
-    return _nonconverged(model, caught) or (isinstance(model, Pipeline) and any(
-        _nonconverged(step, []) for _, step in model.steps))
+def _model_nonconverged(model, caught, projection=None, *, query=False):
+    """Qualify fitting separately from an explicitly captured ANLS query."""
+    ANLSBPP = _experimental_module(verify_source=False).ANLSBPP
+    if _nonconverged(model, caught):
+        return True
+    if isinstance(model, Pipeline):
+        for _, step in model.steps:
+            if isinstance(step, ANLSBPP):
+                # Old serialized query attributes are historical evidence only.
+                if not bool(getattr(step, "converged_", True)):
+                    return True
+                if query or projection is not None:
+                    if (projection is None or not projection["performed"]
+                            or projection["converged"] is not True or projection["error"] is not None):
+                        return True
+            elif _nonconverged(step, []):
+                return True
+    return False
 
 
 def _warning_free_profile(profile):
@@ -566,7 +647,7 @@ def _training_stationarity(model, X):
             return {"status": "not_applicable"}
         W, H, selector = model.training_coordinates_, model.selected_components_, model.selector_
     started = time.perf_counter()
-    from experimental_nmf import projected_gradient_kkt
+    projected_gradient_kkt = _experimental_module(verify_source=False).projected_gradient_kkt
     try:
         result = projected_gradient_kkt(selector.transform(X), W, H)
         return {"status": "valid", "diagnostics": result,
@@ -578,6 +659,7 @@ def _training_stationarity(model, X):
 
 
 def evaluate(output, configuration):
+    capture_transform_diagnostics = _experimental_module().capture_transform_diagnostics
     output = Path(output)
     cv = aggregate_cv(output, configuration, require_complete=True)
     # Freeze exact CV evidence before any validation scoring, including resume.
@@ -628,7 +710,7 @@ def evaluate(output, configuration):
                     if result["identity"] != identity:
                         raise ValueError("Saved original selected fit identity differs.")
                 else:
-                    model, caught = clone(template), []
+                    model, caught, projection = clone(template), [], None
                     start = time.perf_counter()
                     try:
                         with warnings.catch_warnings(record=True) as caught:
@@ -637,15 +719,21 @@ def evaluate(output, configuration):
                         result["final_fit_seconds"] = time.perf_counter() - start
                         result["diagnostics"] = _model_diagnostics(model)
                         result["training_stationarity"] = _training_stationarity(model, X)
-                        result["evaluation"] = ({"status": "held", "reason": "Selected final fit did not converge."}
-                                                if _model_nonconverged(model, caught)
-                                                else evaluate_classifier(model, Xv, yv, threads=1, sample_ids=ids))
-                        result["diagnostics"] = _model_diagnostics(model)
-                        if result["evaluation"]["status"] == "valid" and _model_nonconverged(model, []):
+                        if _model_nonconverged(model, caught):
+                            result["evaluation"] = {"status": "held", "reason": "Selected final fit did not converge."}
+                        else:
+                            decomposition = model.named_steps.get("nmf") if isinstance(model, Pipeline) else None
+                            with capture_transform_diagnostics(decomposition) as projection:
+                                result["evaluation"] = evaluate_classifier(model, Xv, yv, threads=1, sample_ids=ids)
+                        if projection is None:
+                            result["diagnostics"] = _model_diagnostics(model)
+                        if result["evaluation"]["status"] == "valid" and _model_nonconverged(model, [], projection, query=True):
                             result["evaluation"]["status"] = "provisional_nonconvergence"
                     except Exception as error:
                         result["evaluation"] = {"status": "failed", "error_type": type(error).__name__, "error": str(error)}
                     finally:
+                        if projection is not None:
+                            result["diagnostics"] = _model_diagnostics(model, projection)
                         if result["final_fit_seconds"] is None:
                             result["final_fit_seconds"] = time.perf_counter() - start
                         result["final_fit_warnings"] = _warning_records(caught)

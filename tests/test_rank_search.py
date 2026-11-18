@@ -35,24 +35,77 @@ class RankSearchTests(unittest.TestCase):
             self.calls.append((list(ParameterGrid(param_grid)), options))
             rows = []
             parameter = "n_components" if type(estimator) is NMFClassifier else "pca__n_components"
+            scoring = options["scoring"]
+            stage_scores = scores[scoring] if scoring in scores else scores
             for index, params in enumerate(ParameterGrid(param_grid)):
-                score = scores.get(params[parameter])
+                score = stage_scores.get(params[parameter])
                 rows.append({"index": index, "parameters": params, "valid": score is not None,
-                             "mean_balanced_accuracy": score,
+                             "mean_score": score, f"mean_{scoring}": score,
                              "folds": [{"status": "valid" if score is not None else "failed",
                                         "diagnostics": {"n_selected_features": selected_features}}
                                        for _ in options["folds"]]})
             return {"candidates": rows, "tuning_seconds": 1.0,
+                    "screening_diagnostics": {"candidates": [
+                        {"index": row["index"], "screens": [
+                            {"mode": "none", "inactive_grid_parameters": ["score_threshold"]}
+                        ] if "score_threshold" in row["parameters"] else []}
+                        for row in rows]},
                     "new_representation_fits": len(rows) * options["cv"],
                     "reused_representation_folds": 0}
 
         estimator = kwargs.pop("estimator", self.estimator)
+        directory = Path(self.directory.name) / kwargs.pop("subdir", "default")
         with patch("supervised_nmf.search.calibration_knn_grid", side_effect=shared):
             return calibration_rank_search(estimator, grid, self.X, self.y,
-                                           cv=3, checkpoint_dir=self.directory.name, **kwargs)
+                                           cv=3, checkpoint_dir=directory, **kwargs)
+
+    def test_requested_metric_controls_initial_winner_and_rank_expansion(self):
+        scores = {"accuracy": {1: .9, 2: .8, 4: .7},
+                  "balanced_accuracy": {1: .5, 2: .7, 4: .8, 8: .6}}
+        accuracy = self.run_stub(scores, scoring="accuracy", subdir="accuracy")
+        self.assertEqual(accuracy["selected_parameters"]["n_components"], 1)
+        self.assertEqual(accuracy["expansions_performed"], 0)
+        self.assertEqual(accuracy["selected_mean_score"], .9)
+        self.assertEqual(accuracy["selected_mean_accuracy"], .9)
+        self.assertNotIn("selected_mean_balanced_accuracy", accuracy)
+        self.assertTrue(all(options["scoring"] == "accuracy" for _, options in self.calls))
+        self.calls.clear()
+        balanced = self.run_stub(scores, scoring="balanced_accuracy", subdir="balanced")
+        self.assertEqual(balanced["selected_parameters"]["n_components"], 4)
+        self.assertEqual(balanced["expansions_performed"], 2)
+        self.assertEqual(balanced["selected_mean_score"], .8)
+        self.assertEqual(balanced["selected_mean_balanced_accuracy"], .8)
+        self.assertNotIn("selected_mean_accuracy", balanced)
+        self.assertTrue(all(options["scoring"] == "balanced_accuracy" for _, options in self.calls))
+
+    def test_metric_change_rejects_rank_checkpoint_before_stage_runs(self):
+        self.run_stub({1: .6, 2: .7}, scoring="accuracy", max_expansions=0)
+        self.calls.clear()
+        with self.assertRaisesRegex(ValueError, "incompatible"):
+            self.run_stub({1: .6, 2: .7}, scoring="balanced_accuracy", max_expansions=0)
+        self.assertEqual(self.calls, [])
+
+    def test_invalid_metric_rejected_before_stage_runs(self):
+        for scoring in ("roc_auc", "Accuracy", None, 1):
+            with self.subTest(scoring=scoring), self.assertRaises(ValueError):
+                self.run_stub({1: .6, 2: .7}, scoring=scoring)
+        self.assertEqual(self.calls, [])
+
+    def test_expanded_winner_refinement_uses_its_stage_local_diagnostics(self):
+        report = self.run_stub({1: .6, 2: .7, 4: .8, 8: .65},
+                               grid={"n_components": [1, 2], "score_threshold": [1, 2]})
+        selected = report["candidates"][report["selected_candidate_index"]]
+        self.assertEqual(selected["stage"], 1)
+        self.assertEqual(selected["stage_candidate_index"], 0)
+        self.assertNotEqual(selected["index"], selected["stage_candidate_index"])
+        self.assertEqual(report["refinement"]["parameters"]["score_threshold"]["status"],
+                         "inactive_for_selected_screening_mode")
 
     def test_interior_winner_does_not_expand(self):
         result = self.run_stub({1: .6, 2: .8, 4: .7}, grid={"n_components": [1, 2, 4]})
+        self.assertEqual(result["scoring"], "accuracy")
+        self.assertEqual(result["selected_mean_accuracy"], .8)
+        self.assertNotIn("selected_mean_balanced_accuracy", result)
         self.assertEqual(result["selected_parameters"], {"n_components": 2})
         self.assertEqual(result["stop_reason"], "winner_below_upper_rank_boundary")
         self.assertTrue(result["search_complete"])
@@ -175,7 +228,8 @@ class RankSearchTests(unittest.TestCase):
                                         checkpoint_dir=Path(self.directory.name) / "explicit")
         self.assertEqual(result["selected_parameters"], expected["selected_parameters"])
         for actual, reference in zip(result["candidates"], expected["candidates"]):
-            self.assertEqual(actual["mean_balanced_accuracy"], reference["mean_balanced_accuracy"])
+            self.assertEqual(actual["mean_score"], reference["mean_score"])
+            self.assertEqual(actual["mean_accuracy"], reference["mean_accuracy"])
         resumed = calibration_rank_search(estimator, grid, self.X, self.y, cv=3, seed=4,
                                           checkpoint_dir=target, max_expansions=1)
         self.assertEqual(resumed["selected_parameters"], result["selected_parameters"])

@@ -150,7 +150,9 @@ def test_auto_and_qr_route_every_explicit_product_through_selected_callable(
     def recorded(left, right):
         frame = inspect.currentframe().f_back
         try:
-            sites.add((frame.f_code.co_name, frame.f_lineno))
+            # Runtime offsets distinguish calls even when they share a line;
+            # no particular instruction offset is required by this test.
+            sites.add((frame.f_code, frame.f_lasti))
         finally:
             del frame
         return original_product(left, right)
@@ -165,7 +167,7 @@ def test_auto_and_qr_route_every_explicit_product_through_selected_callable(
     assert native_pools.info.call_count == 2
     # Seven BPP/qualification sites plus QR reduction must all use the chosen
     # product; exercising just the original failing cross product is not enough.
-    assert {name: sum(site[0] == name for site in sites) for name, _ in sites} == {
+    assert {code.co_name: sum(site[0] is code for site in sites) for code, _ in sites} == {
         "_project_unscaled": 1, "_batched_block": 2,
         "_qualified_rows": 4, "_project_qr": 1,
     }

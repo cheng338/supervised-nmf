@@ -17,6 +17,7 @@ from sklearn.model_selection import train_test_split
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from supervised_nmf.datasets import make_original_simulation
+from supervised_nmf.validation import _validate_threads
 from supervised_nmf.evaluation import (
     comparison_models, new_run_directory, provenance, run_comparison,
     save_data_manifest, write_json,
@@ -27,7 +28,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--quick", action="store_true", help="One candidate per method; correctness check only.")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--threads", type=int, choices=range(1, 9), default=1)
+    parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--output", type=Path, default=Path("runs"))
     parser.add_argument("--max-iter", type=int, default=20000, help="NMF/NNLS iteration limit.")
     parser.add_argument("--tol", type=float, default=1e-4, help="CD/MU stopping tolerance.")
@@ -35,6 +36,10 @@ def main():
     parser.add_argument("--logistic-tol", type=float, default=1e-4)
     parser.add_argument("--logistic-class-weight", choices=("none", "balanced"), default="none")
     args = parser.parse_args()
+    try:
+        args.threads = _validate_threads(args.threads)
+    except ValueError as error:
+        parser.error(str(error))
 
     class_weight = None if args.logistic_class_weight == "none" else "balanced"
     data = make_original_simulation(n_samples=160 if args.quick else 400,

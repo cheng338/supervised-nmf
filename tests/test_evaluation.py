@@ -72,13 +72,13 @@ class EvaluationTests(unittest.TestCase):
             self.assertEqual(observed, split["training_indices"])
             self.assertFalse(set(observed) & set(split["validation_indices"]))
         self.assertEqual(FIT_HISTORY[-1], list(range(60)))
-        self.assertEqual(result.report["candidates"][0]["mean_balanced_accuracy"], 1.0)
+        self.assertEqual(result.report["candidates"][0]["mean_score"], 1.0)
 
     def test_single_failed_fold_disqualifies_candidate(self):
         result = calibration_search(AuditedClassifier(), {"reject_missing_zero": [True, False]}, self.X, self.y)
         failed, valid = result.report["candidates"]
         self.assertEqual(failed["invalid_fold_count"], 1)
-        self.assertIsNone(failed["mean_balanced_accuracy"])
+        self.assertIsNone(failed["mean_score"])
         self.assertFalse(failed["valid"])
         self.assertTrue(valid["valid"])
         self.assertEqual(result.report["selected_candidate_index"], 1)
@@ -100,7 +100,7 @@ class EvaluationTests(unittest.TestCase):
                 failed, valid = result.report["candidates"]
                 self.assertFalse(failed["valid"])
                 self.assertEqual(failed["invalid_fold_count"], 3)
-                self.assertIsNone(failed["mean_balanced_accuracy"])
+                self.assertIsNone(failed["mean_score"])
                 self.assertTrue(valid["valid"], valid)
                 self.assertFalse(result.report["is_fallback"])
                 self.assertEqual(result.estimator.solver, "mu")
@@ -256,7 +256,7 @@ class EvaluationTests(unittest.TestCase):
             calibration_search(AuditedClassifier(), {}, self.X, self.y,
                                checkpoint_path=path, refit=False)
             saved = json.loads(path.read_text())
-            saved["candidates"][0]["folds"][0]["balanced_accuracy"] = 0.125
+            saved["candidates"][0]["folds"][0]["score"] = 0.125
             path.write_text(json.dumps(saved))
             with self.assertRaisesRegex(ValueError, "integrity"):
                 calibration_search(AuditedClassifier(), {}, self.X, self.y,

@@ -165,11 +165,12 @@ class ANLSBPPTests(unittest.TestCase):
         np.testing.assert_array_equal(W, model.training_coordinates_)
         H_before = model.components_.copy()
         probe = self.X[::4] * 1.1
-        actual = model.transform(probe)
+        with experimental_nmf.capture_transform_diagnostics(model) as diagnostic:
+            actual = model.transform(probe)
         expected = np.vstack([nnls(H_before.T, row)[0] for row in probe])
         np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-8)
         np.testing.assert_array_equal(model.components_, H_before)
-        self.assertTrue(model.last_transform_converged_)
+        self.assertTrue(diagnostic["converged"])
 
     def test_pipeline_clone_and_global_random_state_unchanged(self):
         np.random.seed(491)
@@ -209,10 +210,10 @@ class ANLSBPPTests(unittest.TestCase):
         model = ANLSBPP(4, max_iter=1000).fit(random.uniform(size=(35, 11)))
         model.set_params(nnls_max_iter=1)
         basis = model.components_.copy()
-        with warnings.catch_warnings(record=True) as caught:
+        with warnings.catch_warnings(record=True) as caught, experimental_nmf.capture_transform_diagnostics(model) as diagnostic:
             warnings.simplefilter("always")
             model.transform(random.uniform(size=(40, 11)))
-        self.assertFalse(model.last_transform_converged_)
+        self.assertFalse(diagnostic["converged"])
         self.assertTrue(any(issubclass(item.category, ConvergenceWarning) for item in caught))
         np.testing.assert_array_equal(model.components_, basis)
 

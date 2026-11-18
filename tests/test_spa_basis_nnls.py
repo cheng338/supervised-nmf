@@ -64,7 +64,8 @@ def test_known_basis_and_query_coordinates_preserve_inputs(rank, dtype, layout):
     assert set(model.anchor_indices_) == set(range(rank))
     expected_basis = mixing[model.anchor_indices_]
     expected_coordinates = coordinates[:, model.anchor_indices_]
-    np.testing.assert_array_equal(fitted, expected_coordinates)
+    np.testing.assert_array_equal(model.fit_coordinates_, expected_coordinates)
+    np.testing.assert_allclose(fitted, expected_coordinates, rtol=1e-10, atol=1e-12)
     np.testing.assert_allclose(model.components_, expected_basis, rtol=1e-10, atol=1e-12)
     np.testing.assert_array_equal(model.components_[:, -1], np.zeros(rank))
     np.testing.assert_allclose(fitted @ model.components_, X, rtol=1e-10, atol=1e-12)

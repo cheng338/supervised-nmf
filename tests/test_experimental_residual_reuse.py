@@ -196,6 +196,8 @@ def test_prepared_target_is_not_residual_storage(monkeypatch):
     assert all(ref() is None for ref in refs)
 
 
+# The two subtraction tests below check NumPy dependency assumptions.
+# Production residual behavior is covered by the caller tests above.
 def edge_operands():
     tiny = np.nextafter(np.float64(0), np.float64(1))
     normal = np.finfo(np.float64).tiny

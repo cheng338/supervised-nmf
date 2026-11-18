@@ -27,7 +27,7 @@ def nnls_matmul():
     return np.matmul
 
 
-def padded_matmul(left, right):
+def padded_matmul(left, right, *, _final_report_copy4=False):
     """Multiply validated float64 NNLS arrays with real outer-dimension padding.
 
     For (M,K) @ (K,N), enlarge M and N to multiples of eight, leave K unchanged,
@@ -72,10 +72,30 @@ def padded_matmul(left, right):
         result[:, :nc] = np.matmul(a, right[:, :nc])[:m]
         result[:, nc:] = np.matmul(a, b)[:m, :n - nc]
         return result
-    # Ineligible operands retain the original allocation and population order.
+    # Fixed final-report opt-in; original allocations and native site stay shared.
     a = np.zeros((mp, k), dtype=np.float64)
     b = np.zeros((k, npad), dtype=np.float64)
-    a[:m] = left
+    if (_final_report_copy4 is True and k >= 12 and m % 4096 == 0
+            and m * k >= 65536
+            and mp == m and npad != n and m > 0 and n > 0
+            and right.shape[0] == k
+            and type(left) is _ndarray and type(right) is _ndarray
+            and left.dtype == np.float64 and right.dtype == np.float64
+            and left.flags.aligned and right.flags.aligned
+            and left.flags.f_contiguous and not left.flags.c_contiguous
+            and left.strides == (8, m * 8)
+            and right.flags.c_contiguous and right.strides == (n * 8, 8)):
+        copied = True
+        try:
+            for column in range(0, k, 4):
+                a[:, column:column + 4] = left[:, column:column + 4]
+        except MemoryError:
+            copied = False
+        if not copied:
+            # Overwrite any partial optional copy outside its exception handler.
+            a[:m] = left
+    else:
+        a[:m] = left
     b[..., :n] = right
     product = np.matmul(a, b)
     return np.array(product[:m, :n], order="C", copy=True)

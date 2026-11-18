@@ -1,4 +1,4 @@
-"""Classifier defaults preserve one fitted SPA map and explicit legacy modes."""
+"""New classifier fits use one SPA map and preserve current fitted state."""
 import pickle
 import unittest
 import warnings
@@ -16,6 +16,7 @@ from sklearn.preprocessing import StandardScaler
 from threadpoolctl import threadpool_limits
 
 from supervised_nmf import FeatureSPA, NMFClassifier
+from supervised_nmf._mu_rowwise import transform_mu_rowwise
 
 
 class TrainingCoordinateDefaultTests(unittest.TestCase):
@@ -86,19 +87,46 @@ class TrainingCoordinateDefaultTests(unittest.TestCase):
         np.testing.assert_allclose(model.predict_proba(self.query), reference.predict_proba(expected_query),
                                    atol=2e-8, rtol=2e-8)
 
-    def test_explicit_legacy_spa_retains_anchor_coordinates_and_lowlevel_contract(self):
+    def test_explicit_spa_fit_transform_uses_same_fixed_basis_map(self):
         spa = FeatureSPA(3, nnls_max_iter=10000)
-        anchors = spa.fit_transform(self.X)
-        np.testing.assert_array_equal(anchors, self.X[:, spa.anchor_indices_])
-        self.assertGreater(np.linalg.norm(spa.transform(self.X) - anchors), .001)
-        legacy = self.model(training_coordinates="fit_transform").fit(self.X, self.y)
-        self.assertEqual(legacy.training_coordinates_mode_, "fit_transform")
-        self.assertFalse(legacy.training_projection_performed_)
-        self.assertIsNone(legacy.training_projection_converged_)
-        np.testing.assert_array_equal(legacy.training_coordinates_, anchors)
-        reference = KNeighborsClassifier(n_neighbors=5).fit(anchors, self.y)
-        np.testing.assert_array_equal(legacy.predict(self.query), reference.predict(spa.transform(self.query)))
-        np.testing.assert_array_equal(legacy.selected_components_, spa.components_)
+        projected = spa.fit_transform(self.X)
+        expected_train = self.projected(spa.components_, self.X)
+        np.testing.assert_array_equal(spa.fit_coordinates_, self.X[:, spa.anchor_indices_])
+        self.assertGreater(np.linalg.norm(projected - spa.fit_coordinates_), .001)
+        np.testing.assert_allclose(projected, expected_train, atol=2e-10, rtol=2e-10)
+        model = self.model(training_coordinates="fit_transform").fit(self.X, self.y)
+        self.assertEqual(model.training_coordinates, "fit_transform")
+        self.assertEqual(model.training_coordinates_mode_, "transform")
+        self.assertTrue(model.training_projection_performed_)
+        self.assertTrue(model.training_projection_converged_)
+        np.testing.assert_allclose(model.training_coordinates_, expected_train, atol=2e-10, rtol=2e-10)
+        reference = KNeighborsClassifier(n_neighbors=5).fit(expected_train, self.y)
+        expected_query = self.projected(spa.components_, self.query)
+        np.testing.assert_array_equal(model.predict(self.query), reference.predict(expected_query))
+        np.testing.assert_array_equal(model.selected_components_, spa.components_)
+
+    def test_all_spa_modes_and_classifier_heads_project_training_once(self):
+        original_transform = FeatureSPA.transform
+        for mode in ("auto", "fit_transform", "transform"):
+            for head in ("knn", "logistic", "linear_svm"):
+                with self.subTest(mode=mode, classifier=head):
+                    supplied_rows = []
+
+                    def capture_transform(spa, X):
+                        supplied_rows.append(np.asarray(X).copy())
+                        return original_transform(spa, X)
+
+                    with patch.object(FeatureSPA, "transform", capture_transform):
+                        model = self.model(training_coordinates=mode, classifier=head).fit(self.X, self.y)
+                        self.assertEqual(len(supplied_rows), 1)
+                        np.testing.assert_array_equal(supplied_rows[0], self.X)
+                        model.predict(self.query)
+                        self.assertEqual(len(supplied_rows), 2)
+                        np.testing.assert_array_equal(supplied_rows[1], self.query)
+                    self.assertEqual(model.training_coordinates_mode_, "transform")
+                    self.assertTrue(model.training_projection_performed_)
+                    expected = self.projected(model.selected_components_, self.X)
+                    np.testing.assert_allclose(model.training_coordinates_, expected, atol=2e-10, rtol=2e-10)
 
     def test_explicit_transform_matches_spa_auto(self):
         automatic = self.model().fit(self.X, self.y)
@@ -120,8 +148,13 @@ class TrainingCoordinateDefaultTests(unittest.TestCase):
                     np.testing.assert_array_equal(model.training_coordinates_, expected)
                     np.testing.assert_array_equal(model.selected_components_, reference.components_)
                     classifier = KNeighborsClassifier(n_neighbors=5).fit(expected, self.y)
+                    # Joint fitting is unchanged; query stopping follows the fitted policy.
+                    selected = self.query[:, model.selected_features_]
+                    query_coordinates = (transform_mu_rowwise(reference, selected)
+                                         if model.mu_projection_ == "rowwise"
+                                         else reference.transform(selected))
                     np.testing.assert_array_equal(model.predict_proba(self.query),
-                                                  classifier.predict_proba(reference.transform(self.query)))
+                                                  classifier.predict_proba(query_coordinates))
 
     def test_explicit_transform_remains_supported_for_cd_and_mu(self):
         for solver in ("cd", "mu"):
@@ -129,7 +162,10 @@ class TrainingCoordinateDefaultTests(unittest.TestCase):
                 model = self.model(solver=solver, training_coordinates="transform").fit(self.X, self.y)
                 self.assertEqual(model.training_coordinates_mode_, "transform")
                 self.assertTrue(model.training_projection_performed_)
-                np.testing.assert_array_equal(model.training_coordinates_, model.decomposition_.transform(self.X))
+                expected = (transform_mu_rowwise(model.decomposition_, self.X)
+                            if model.mu_projection_ == "rowwise"
+                            else model.decomposition_.transform(self.X))
+                np.testing.assert_array_equal(model.training_coordinates_, expected)
 
     def test_clone_and_solver_refit_resolve_auto_without_mutating_constructor(self):
         model = self.model().fit(self.X, self.y)
@@ -155,8 +191,11 @@ class TrainingCoordinateDefaultTests(unittest.TestCase):
         self.assertEqual(model.training_coordinates_mode_, "transform")
         self.assertEqual(model.decomposition_.projection_solver, fitted_solver)
         model.fit(self.X, self.y)
-        self.assertEqual(model.training_coordinates_mode_, "fit_transform")
-        np.testing.assert_array_equal(model.training_coordinates_, model.decomposition_.fit_coordinates_)
+        self.assertEqual(model.training_coordinates, "fit_transform")
+        self.assertEqual(model.training_coordinates_mode_, "transform")
+        self.assertEqual(model.decomposition_.projection_solver, "scipy")
+        expected = self.projected(model.selected_components_, self.X)
+        np.testing.assert_allclose(model.training_coordinates_, expected, atol=2e-10, rtol=2e-10)
 
     def test_invalid_modes_fail_cleanly_and_clear_fitted_state(self):
         model = self.model().fit(self.X, self.y)
@@ -170,7 +209,7 @@ class TrainingCoordinateDefaultTests(unittest.TestCase):
                 with self.assertRaises(NotFittedError):
                     model.predict(self.query)
 
-    def test_pickles_preserve_explicit_modes_and_restore_actual_legacy_fit_metadata(self):
+    def test_pickles_preserve_explicit_modes_and_pending_constructor_settings(self):
         for mode in ("auto", "fit_transform", "transform"):
             with self.subTest(mode=mode):
                 model = self.model(training_coordinates=mode).fit(self.X, self.y)
@@ -180,25 +219,31 @@ class TrainingCoordinateDefaultTests(unittest.TestCase):
                 self.assertEqual(restored.training_coordinates, mode)
                 self.assertEqual(restored.training_coordinates_mode_, resolved)
                 np.testing.assert_array_equal(restored.predict_proba(self.query), expected)
-                # Emulate a pre-mode serialized model after constructor-only
-                # set_params: saved fitting metadata must win over that change.
-                del model.training_coordinates_mode_
+                # Current fitted metadata must survive constructor-only changes.
                 model.set_params(training_coordinates="fit_transform" if resolved == "transform" else "transform")
                 restored = pickle.loads(pickle.dumps(model))
                 self.assertEqual(restored.training_coordinates_mode_, resolved)
                 np.testing.assert_array_equal(restored.predict_proba(self.query), expected)
 
-    def test_pickle_without_coordinate_parameter_restores_historical_policy(self):
+    def test_loading_does_not_invent_missing_coordinate_metadata(self):
         legacy = self.model(training_coordinates="fit_transform").fit(self.X, self.y)
+        # This synthetic missing-field state checks absence preservation; it is
+        # not a claim that arbitrary historical files are supported or rejected.
+        anchors = legacy.decomposition_.fit_coordinates_.copy()
+        legacy.classifier_.fit(anchors, self.y)
+        legacy.training_coordinates_ = anchors
+        legacy.reconstruction_err_ = legacy.factorization_reconstruction_err_
+        legacy.training_projection_converged_ = None
+        legacy.training_projection_convergence_warnings_ = ()
         expected = legacy.predict_proba(self.query)
         del legacy.training_coordinates
         del legacy.training_coordinates_mode_
         del legacy.training_projection_performed_
         restored = pickle.loads(pickle.dumps(legacy))
-        self.assertEqual(restored.get_params()["training_coordinates"], "fit_transform")
-        self.assertEqual(restored.training_coordinates_mode_, "fit_transform")
+        self.assertFalse(hasattr(restored, "training_coordinates"))
+        self.assertFalse(hasattr(restored, "training_coordinates_mode_"))
+        self.assertFalse(hasattr(restored, "training_projection_performed_"))
         np.testing.assert_array_equal(restored.predict_proba(self.query), expected)
-        self.assertEqual(clone(restored).training_coordinates, "fit_transform")
 
     def test_default_projection_warning_is_forwarded_and_reported(self):
         original_transform = FeatureSPA.transform

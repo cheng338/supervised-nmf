@@ -13,10 +13,10 @@ The package provides:
 - **Feature screening** (`BinaryScreening`), using an absolute pooled-t cutoff
   or a retained percentile.
 - **Feature-anchor factorization** (`FeatureSPA`), available as a separate
-  transformer. Its `fit_transform` returns anchor columns; `transform` uses
-  fixed-basis NNLS. A generic pipeline therefore uses different coordinate
-  definitions for training and prediction. For a common SPA classification map,
-  use `NMFClassifier(solver="spa")`; see [standalone SPA coordinates](docs/api.md#standalone-spa-coordinates).
+  transformer. Its `fit_transform` and `transform` use the same fixed-basis
+  NNLS map, including in generic classification pipelines. Selected anchor
+  columns remain available in `fit_coordinates_`; see
+  [standalone SPA coordinates](docs/api.md#standalone-spa-coordinates).
 - **Classification comparisons** with screened PCA, screening without
   factorization, raw features, and unscreened CD-NMF, using the selected classifier.
 
@@ -40,11 +40,6 @@ Version **0.4.0** fixes mixed-dtype prediction, improves qualified float64 MU
 recovery, adds optional rowwise MU projection, and moves prediction diagnostics
 into evaluation results. See the [0.4.0 release notes](docs/release-0.4.0.md)
 for migration details and the comparison with 0.3.3.
-Version **0.4.1** adds a temporary AOCL-specific NNLS workaround for a reproduced
-native matrix-multiplication crash and clarifies the training-only tuning
-workflow. MKL retains direct multiplication. See the
-[0.4.1 release notes](docs/release-0.4.1.md) and
-[workaround retirement policy](docs/aocl-nnls-workaround.md#retirement-policy).
 
 Version **0.4.2** fixes evaluation and reporting edge cases, reduces repeated
 numerical work, and adds exact-repeat stopping to experimental ANLS-BPP.
@@ -57,7 +52,11 @@ calibration checkpoint identities when native libraries load lazily. See
 the [0.4.3 release notes](docs/release-0.4.3.md) for compatibility and
 validation scope.
 
-See the [changelog](CHANGELOG.md) for the complete release history.
+Version **0.5.0** aligns standalone SPA training and query coordinates, ranks
+calibration candidates by ordinary accuracy by default, and uses per-observation
+projection for newly fitted MU classifiers. Standalone screening now defaults
+to the absolute pooled-t cutoff. See the [upgrade guide](docs/release-0.5.0.md)
+for explicit alternatives and the [changelog](CHANGELOG.md) for the release history.
 
 **Copyright (c) 2026 Chang Cheng. All Rights Reserved.** A distribution license
 has not yet been selected. Public availability of this repository does not
@@ -66,20 +65,20 @@ applicable [third-party notices](THIRD_PARTY_NOTICES).
 
 # Installation
 
-Python 3.11 or later is required for version 0.4.3. Python 3.10 support
+Python 3.11 or later is required for version 0.5.0. Python 3.10 support
 ended on October 20, 2026. Dependencies are NumPy, SciPy, scikit-learn
 1.6 or later (below 2.0), threadpoolctl, and joblib 1.3 or later.
 Download the wheel from the [GitHub releases](https://github.com/cheng338/supervised-nmf/releases)
 and install it:
 
 ```shell
-python -m pip install --upgrade supervised_nmf-0.4.3-py3-none-any.whl
+python -m pip install --upgrade supervised_nmf-0.5.0-py3-none-any.whl
 ```
 
 To install the release from source:
 
 ```shell
-git clone --branch v0.4.3 https://github.com/cheng338/supervised-nmf.git
+git clone --branch v0.5.0 https://github.com/cheng338/supervised-nmf.git
 cd supervised-nmf
 python -m pip install .
 ```
@@ -136,8 +135,10 @@ for solver in ("spa", "mu"):
 ```
 
 Rows are observations and columns are features. Inputs must be dense, finite
-and nonnegative. The classifier preserves the two input class labels;
-probability columns follow `model.classes_`. Screening and factorization are
+and nonnegative. The classifier preserves the two supported input class labels;
+string labels must not end in a NUL codepoint (`\x00`). See the
+[class-label domain](docs/api.md#class-label-domain) for safe encoding and input
+conversion limits. Probability columns follow `model.classes_`. Screening and factorization are
 fitted on training data. Prediction reuses the fitted feature mask and basis.
 Version 0.4.0 records prediction diagnostics in evaluation results instead of
 updating the fitted model's `last_transform_*` attributes. See
@@ -163,9 +164,14 @@ calibration helper. The synthetic rows above illustrate the independent-row case
 For an application, begin this workflow before viewing any final-cohort scores;
 the synthetic scores printed above are demonstration output.
 
-The existing helper can evaluate an explicit grid without a full-training refit
-or final-test prediction. It ranks candidates by mean balanced accuracy, and
-every required fold must qualify numerically:
+For 8-bit face images, pass floating-point pixels divided by 255; this fixed
+conversion is safe before CV. Keep learned preprocessing inside the pipeline.
+See [input preparation and CV usage conditions](docs/api.md#input-preparation-and-cv-usage-conditions)
+for subject groups, independent evaluation and custom-component requirements.
+
+The helper can evaluate an explicit grid without a full-training refit or
+final-test prediction. In 0.5.0, it ranks candidates by
+mean ordinary accuracy by default. Every required fold must qualify numerically:
 
 ```python
 from supervised_nmf.evaluation import calibration_search
@@ -174,12 +180,13 @@ calibrated = calibration_search(
     NMFClassifier(solver="spa", screening="absolute", random_state=42),
     {"n_components": [2, 4], "score_threshold": [0.0, 2.0],
      "n_neighbors": [3, 5, 9]},
-    X_train, y_train, cv=5, seed=42, threads=1, refit=False,
+    X_train, y_train, cv=5, seed=42, threads=1, refit=False, scoring="accuracy",
     checkpoint_path="runs/quickstart-cv.json",
 )
 if calibrated.report["selected_parameters"] is None:
     raise RuntimeError("No candidate qualified in every training CV fold.")
 print(calibrated.report["selected_parameters"])
+print(calibrated.report["scoring"], calibrated.report["selected_mean_score"])
 print(calibrated.report["refinement"])
 ```
 
@@ -190,6 +197,16 @@ failures, warnings and refinement diagnostics; investigate feasible boundary
 winners and nearby settings using training data. Preserve the same folds and
 use a new checkpoint path when changing the grid. Compare with screening-only,
 PCA and raw-feature baselines using the same training folds.
+
+Choose `scoring="balanced_accuracy"` explicitly when mean class recall is the
+selection objective. These are the two supported scorers; the helper does not
+switch objectives automatically when it detects imbalance. CV scores are the
+equal-weight mean of the fold scores, rather than a pooled out-of-fold score.
+The selected CV score is separate from accuracy measured on reserved data.
+
+**November 3 update:** calibration now defaults to ordinary accuracy; choose
+`scoring="balanced_accuracy"` explicitly when intended. Use a new checkpoint
+after changing the objective or source. Historical study results remain unchanged.
 
 Once that training-only review is complete, freeze the chosen configuration,
 fit it on all training data, check numerical qualification, and evaluate it on
@@ -263,28 +280,41 @@ The default is **SPA with absolute screening**. Use `solver="mu"` for
 multiplicative updates or `solver="cd"` for the dissertation's original
 coordinate-descent implementation.
 
-The package also offers `mu_projection="rowwise"` for MU predictions
-that may arrive individually or in changing batches. It assigns each observation
-its own stopping decision, with guarded float64 working arithmetic. The default
-`"batch"` retains the existing shared stopping rule and can produce different
-coordinates or labels when batch composition changes. The fitted choice is
-available as `mu_projection_` and changes only on refit. For a common training
-and query projection, also set `training_coordinates="transform"`. Rowwise
-projection can add runtime and does not guarantee bitwise invariance or better
-accuracy. This option was added in version 0.4.0; see
-[MU prediction policies](docs/api.md#prediction-batches) for selection guidance.
+The default `mu_projection="auto"` resolves to `"rowwise"`
+for MU and `None` for SPA/CD at fit time. Rowwise MU gives each observation its
+own initialization and stopping decision, supporting predictions made singly or
+in changing batches. It uses guarded float64 working arithmetic while preserving
+the projection output dtype. The fitted choice is recorded in `mu_projection_`;
+changing constructor settings or loading a current-format model does not replace
+that choice before refitting. The default factorization solver remains SPA.
 
-In version 0.3.0, the default `training_coordinates="auto"` trains the
+Select `mu_projection="batch"` explicitly when its measured throughput benefit
+is useful and request-composition sensitivity is acceptable: shared stopping
+can change coordinates or labels when unrelated query rows change. Rowwise
+projection does not guarantee bitwise invariance, convergence or better accuracy,
+and can cost more for small requests or failed recovery attempts. MU/CD still use
+joint-fit training coordinates by default; `training_coordinates="transform"`
+separately requests a common training/query projection policy. See
+[MU prediction policies and measured costs](docs/api.md#prediction-batches).
+
+Since version 0.3.0, the default `training_coordinates="auto"` trains the
 SPA classifier on fixed-basis NNLS coordinates, using the same fitted basis
-and projection map for training and prediction. This adds a training projection
-to fit time. CD and MU retain their factorization's returned training coordinates.
-Set `training_coordinates="fit_transform"` explicitly to reproduce the previous
-coordinate convention. Retraining can change predictions and accuracy; an
-accuracy improvement is not guaranteed. The standalone `FeatureSPA` transformer
-keeps its anchor-derived `fit_transform` output, including in generic pipelines;
-see [standalone SPA coordinates](docs/api.md#standalone-spa-coordinates).
-Version 0.2.0 defaulted to `training_coordinates="fit_transform"`; its archived
-artifacts and historical results retain that behavior.
+and projection map for training and prediction. Version 0.5.0 also makes standalone `FeatureSPA.fit_transform` use that map. For newly
+fitted SPA classifiers, all accepted `training_coordinates` settings resolve
+to `"transform"`, including explicit `"fit_transform"`. The classifier projects
+training observations once during `fit`, without duplicating the standalone
+transformer's projection. CD and MU retain their existing coordinate policies.
+Standard SPA `NMFClassifier.fit_transform` reuses a copy of those saved NNLS
+coordinates, avoiding another projection after `fit`. Custom transform
+implementations retain their own fit-then-transform behavior.
+See [standalone SPA coordinates](docs/api.md#standalone-spa-coordinates).
+
+The standalone correction adds training projection work and may change a
+retrained pipeline's predictions; improved accuracy is not guaranteed. The
+default SPA classifier already performed this projection. Version 0.2.0
+defaulted to anchor-derived SPA training coordinates. Archived artifacts and
+historical results retain their recorded behavior; loading an older fitted
+model does not retrain its classifier or rewrite its coordinate metadata.
 
 SPA uses direct BLAS updates and reuses the fixed NNLS matrix layout during
 projection. Version 0.3.3 also uses guarded batched NNLS to fit the basis
@@ -298,7 +328,10 @@ across a query batch while preserving the fixed-basis NNLS objective. Its speed
 depends on the workload; it can also add overhead or fall back to the current
 solver. Selecting it does not change anchor selection or SPA basis fitting.
 Optional `projection_workers=8` enables reusable process workers for large
-batches; the default is one worker. See [projection controls](docs/api.md#spa-projection-execution),
+batches; the default is one worker. Keep that default for small workloads:
+process startup and result collection can outweigh parallel execution. Compare
+complete fit/prediction workloads before increasing the worker count. See
+[projection controls](docs/api.md#spa-projection-execution),
 the [0.2.0 implementation record](docs/implementation-improvements.md), and the
 earlier [BLAS checks](docs/blas-optimization.md).
 
@@ -330,8 +363,8 @@ earlier [BLAS checks](docs/blas-optimization.md).
 | `max_iter` | `20000` | CD/MU iteration limit or the limit for each SPA NNLS solve. |
 | `tol` | `1e-4` | CD/MU stopping tolerance; SPA's NNLS routine does not use this parameter. |
 | `random_state` | `None` | Set an integer for reproducible CD/MU initialization. |
-| `training_coordinates` | `"auto"` | Uses `"transform"` for SPA and `"fit_transform"` for CD/MU; either convention can also be selected explicitly. |
-| `mu_projection` | `"batch"` | MU only: shared batch stopping or explicit `"rowwise"` stopping. Recorded at fit time. |
+| `training_coordinates` | `"auto"` | Newly fitted SPA models always resolve to `"transform"`; CD/MU default to `"fit_transform"` and allow explicit `"transform"`. |
+| `mu_projection` | `"auto"` | Resolves to `"rowwise"` for MU and `None` for SPA/CD; explicit `"batch"` retains shared stopping. Recorded at fit time. |
 | `projection_solver` | `"auto"` | SPA fixed-basis projection: guarded batching; also `"scipy"`, `"batched"` or guarded `"qr"`. |
 | `projection_workers` | `1` | Maximum SPA projection processes; independent of outer CV workers. |
 | `projection_batch_size` | `256` | Maximum query rows per NNLS block. |
@@ -346,11 +379,16 @@ distinguishes settings requiring refit from execution controls that affect the
 next prediction. Standalone SPA has additional
 [normalization, conditioning and iteration controls](docs/api.md#standalone-spa-options).
 
-These are `NMFClassifier` defaults. The standalone `BinaryScreening()` retains
-its percentile default (`screening="percentile", percentile=10.0`). Set
-`screening` explicitly in standalone compositions and mode-specific searches:
-`percentile` affects selection only in percentile mode, and `score_threshold`
-only in absolute mode. Changing either parameter does not switch the mode.
+Both `NMFClassifier()` and standalone `BinaryScreening()` default to absolute
+pooled-t screening with `score_threshold=2.0`. Choose
+`screening="percentile"` explicitly to use `percentile`; changing a selection
+parameter does not switch the mode. The November 3 update changes standalone
+`BinaryScreening` from its previous percentile default.
+Calibration reports identify the active screening mode and parameter, and warn
+once per calibration grid call when an explicitly gridded, known screening
+parameter is inactive for a candidate. Rank-search stages are separate grid
+calls. These diagnostics do not change modes, remove grid entries, or add warnings
+to ordinary estimator construction or fitting.
 See [screening details](docs/api.md#screening-and-anchor-details).
 
 Rank, screening cutoff and the selected classifier's predictive parameters
@@ -418,14 +456,19 @@ Version 0.1.0a2 added subject-aware training folds, bounded rank exploration,
 reused fold-local screening statistics, and evaluation summaries with class
 support and numerical-stage diagnostics. Solver, screening, and rank defaults
 were unchanged in that release. Version 0.2.0 additionally provided guarded
-batched projection and saved decision thresholds; existing serialized models
-retain their SciPy projection path. See the [0.2.0 release record](docs/release-0.2.0.md),
+batched projection and saved decision thresholds. In that release, older
+serialized models retained their SciPy projection path. Current loading no longer
+fills missing legacy fields; see the [model-persistence contract](docs/api.md#model-persistence).
+See the [0.2.0 release record](docs/release-0.2.0.md),
 [tuning improvements](docs/tuning-improvements.md), and the [API guide](docs/api.md).
 
 Run `python examples/grouped_tuning.py --output runs/grouped-example` for a
 small subject-separated example. Search budgets and failed upper-rank
 candidates remain explicit; a completed grid does not establish a global
 optimum or complete statistical validation.
+Calibration, final fitting and evaluation each use one native numerical thread.
+The final-fit context restores the caller's previous thread limits on return or
+error.
 
 # Parameter tuning
 
@@ -440,7 +483,7 @@ search = calibration_search(
     NMFClassifier(solver="mu", screening="absolute", random_state=42),
     {"score_threshold": [1.0, 2.0, 3.0],
      "n_components": [2, 4], "n_neighbors": [3, 5, 9]},
-    X_train, y_train, cv=5, seed=42, threads=1,
+    X_train, y_train, cv=5, seed=42, threads=1, scoring="accuracy",
 )
 selected_model = search.estimator
 print(search.report["selected_parameters"])
@@ -448,14 +491,25 @@ print(search.report["is_fallback"])
 ```
 
 These are starting ranges. Check boundary winners and nearby parameter values
-using training data, then reserve independent observations for final evaluation.
+using training data, while keeping the previously reserved evaluation
+observations untouched.
 A candidate with a failed or unconverged required fold cannot win. If all
 candidates fail, the helper returns a flagged majority-class fallback; inspect
 `is_fallback` before treating the result as a fitted NMF classifier.
 
 For larger grids, `calibration_knn_grid` reuses each training-fold representation
 across neighbor counts. Both helpers support resumable records with matching
-data, settings, source and runtime identities. See the [API guide](docs/api.md).
+data, scoring objective, settings, source and runtime identities. The default
+selection objective is ordinary accuracy; use `scoring="balanced_accuracy"`
+explicitly to select by mean class recall. See the [API guide](docs/api.md).
+
+`calibration_knn_grid` keeps `execution_order="representation"` by default.
+For long, restartable grids with multiple representation settings, explicitly
+choosing `execution_order="fold"` can reduce screening repeated after partial
+resumes. It changes which candidates complete early and can be slower on short
+workflows. Reports record the requested and resolved order, including any
+eligibility fallback; changing the request requires a new checkpoint directory.
+See [execution-order options and an example](docs/api.md#execution-order-for-restartable-grids).
 
 For logistic regression, use `calibration_search` with
 `NMFClassifier(classifier="logistic", screening="absolute")` and tune `logistic_C`, for example over
@@ -484,11 +538,37 @@ python examples/celeba_classification.py --help
 python examples/celeba_parameter_study.py --help
 ```
 
+`compare_classifiers.py --threads` accepts positive integers within the native
+C-int range, including counts above eight; its default remains one. Choose a
+count within the machine's numerical-thread budget. See the
+[thread-count contract](docs/api.md#scalar-controls-for-calibration-and-evaluation).
+
+Both CelebA study CV launchers use explicit process contexts, with `spawn` for
+new output directories. The default-study CLI can automatically use an
+empty-preload `forkserver` for eligible Linux multiworker checkpoint runs. See
+the [startup policy](docs/celeba-study.md#process-startup-for-current-runs) for
+eligibility, worker budgets, measured costs and source-bound resume compatibility.
+
 The simulation and CelebA examples compare independently tuned SPA, MU, CD,
 screened PCA and screening-only KNN. CelebA requires local images, attributes
 and official partition files. Images use the original 64 by 64 grayscale
 preprocessing; the examples use the training and validation partitions.
 Datasets are not included in the package.
+
+The parameter-study example reuses compatible completed results by default.
+Use `--final-fit-recovery all` when repeating a completed final fit would be
+costly and you want to preserve it before evaluation. The default is `off`:
+checkpointing adds work even to successful ordinary runs. The recovery
+guide reports that overhead, observed prediction-time increases and uncertainty.
+This option loads joblib/pickle state only from your own trusted local study,
+and the same choice must be supplied with `--resume`. It does not continue an
+interrupted solver. See the [recovery options and restart contract](docs/celeba-parameter-study-recovery.md)
+for costs, compatibility, strict chunk checks and finalization ownership.
+Eligible raw KNN preserves its complete native state through public serialization
+buffers, without fitting again. Recovery copies the verified training matrix
+into an owned read-only snapshot inside model loading; the restored model
+does not depend on that cache afterward. Other layouts and declared models
+retain complete joblib state.
 
 Both `compare_simulation.py` and `celeba_classification.py` accept
 `--classifier linear_svm`, alongside `knn` (the default) and `logistic`.
@@ -569,6 +649,16 @@ See the [fixed protocol and sources](docs/multi-dataset-validation.md).
 After fitting, inspect `selected_features_`, `selected_components_`,
 `training_coordinates_`, `n_iter_`, `converged_`, and `convergence_warnings_`.
 `components_` maps the basis back to the original feature columns.
+
+For 8-bit images, explicitly divide pixel intensities by 255 before fitting if
+that is the chosen preprocessing; the package does not rescale pixels automatically.
+Screening retains supplied values. Saved factors can still be visualized after
+classification, and `255 * (W @ selected_components_)` reconstructs retained
+features approximately in the original intensity units when inputs used `/255`.
+Mark excluded features separately from zero-valued retained features, and do not
+interpret individual basis amplitudes as literal pixel intensities. See
+[image values and saved-model reconstruction](docs/api.md#image-values-and-saved-model-reconstruction).
+
 `classifier_n_iter_`, `classifier_converged_`, and
 `classifier_convergence_warnings_` distinguish classifier diagnostics from
 factorization diagnostics. `fit_times_` separates screening, factorization,
@@ -599,15 +689,34 @@ tracebacks and Windows error handling:
 python scripts/check.py
 ```
 
-The existing test cases and subtests run under pytest 9 or later. With build
-tools installed, build and check the distributions separately:
+The public suite requires pytest 9 or later. It covers current package behavior
+and rejection of incompatible study requests. Qualifying an original frozen
+study requires its archived sources and runtime. See
+[test scope and archived qualification](docs/validation.md#current-regressions-and-archived-qualification).
+
+To check an installed copy on synthetic data, run the following command from
+the source checkout or unpacked source archive. Choose a new output filename
+in an existing directory. The report records six fit, prediction and model
+round-trip checks, plus the installed environment's dependency status.
+
+```shell
+python -I scripts/verify_snmf_environment.py --output environment-check.json
+```
+
+Build release distributions from a fresh checkout of the intended public
+revision. The source archive includes the examples, public study tools,
+tests, protocols and small replay fixtures. Local research launchers, raw
+datasets and machine-specific run records belong outside the build checkout.
+The build includes files by directory and file type.
+
+With the build tools installed, run:
 
 ```shell
 python scripts/build_release.py
 python -I scripts/check_wheel.py
 ```
 
-The build produces `dist/supervised_nmf-0.4.3-py3-none-any.whl` and a source
+The build produces `dist/supervised_nmf-0.5.0-py3-none-any.whl` and a source
 archive. The wheel check verifies
 imports, authorship metadata, SPA/MU/CD fitting and prediction, and archive
 contents. It does not publish a release.

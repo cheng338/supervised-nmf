@@ -89,7 +89,7 @@ class StudyImprovementTests(unittest.TestCase):
                                         for row in report["candidates"][0]["folds"]))
 
     def test_impossible_pca_rank_never_factorizes(self):
-        estimator = Pipeline([("screen", BinaryScreening(percentile=100)),
+        estimator = Pipeline([("screen", BinaryScreening(screening="percentile", percentile=100)),
                               ("pca", PCA(n_components=9, svd_solver="full", random_state=3)),
                               ("knn", KNeighborsClassifier())])
         with patch.object(PCA, "fit_transform", side_effect=AssertionError("must not factorize")):
@@ -136,20 +136,20 @@ class StudyImprovementTests(unittest.TestCase):
                 return sorted((k, a.shape, a.tobytes(), b.tobytes(), p.tobytes()) for k, a, b, p in rows)
             self.assertEqual(keyed(expected), keyed(observed), name)
             self.assertTrue(all(row["valid"] for row in shared["candidates"]), name)
-            self.assertEqual([row["mean_balanced_accuracy"] for row in ordinary["candidates"]],
-                             [row["mean_balanced_accuracy"] for row in shared["candidates"]])
+            self.assertEqual([row["mean_score"] for row in ordinary["candidates"]],
+                             [row["mean_score"] for row in shared["candidates"]])
 
     def test_unknown_preprocessing_pipeline_keeps_ordinary_fit_semantics(self):
         # This scale changes screening inputs; the shortcut must not screen raw X.
         estimator = Pipeline([("scale", StandardScaler(with_mean=False)),
-                              ("screen", BinaryScreening(percentile=50)),
+                              ("screen", BinaryScreening(screening="percentile", percentile=50)),
                               ("knn", KNeighborsClassifier())])
         ordinary = calibration_search(estimator, {"knn__n_neighbors": [1, 3]}, self.X, self.y,
                                       cv=3, seed=11, refit=False).report
         shared = self.run_grid(estimator, {"knn__n_neighbors": [1, 3]})
         self.assertEqual(shared["screening_statistics_fits"], 0)
-        self.assertEqual([row["mean_balanced_accuracy"] for row in ordinary["candidates"]],
-                         [row["mean_balanced_accuracy"] for row in shared["candidates"]])
+        self.assertEqual([row["mean_score"] for row in ordinary["candidates"]],
+                         [row["mean_score"] for row in shared["candidates"]])
 
     def test_group_and_row_id_checkpoint_identity_and_complete_resume(self):
         estimator = NMFClassifier(random_state=3)

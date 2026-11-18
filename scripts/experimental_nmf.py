@@ -34,7 +34,10 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 
-import hashlib as _cycle_hashlib
+from contextlib import contextmanager
+import hashlib
+from contextvars import ContextVar
+import zlib as _cycle_zlib
 from numbers import Integral, Real
 from pathlib import Path
 import sys
@@ -57,6 +60,36 @@ if (_SOURCE_ROOT / "supervised_nmf").is_dir():
     sys.path.insert(0, str(_SOURCE_ROOT))
 from supervised_nmf._aocl import nnls_matmul, padded_matmul, _PreparedRightOperand
 from supervised_nmf._padding_roles import make_output_workspace
+
+
+_SOURCE_SHA256_AT_IMPORT = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+_transform_record = ContextVar("experimental_anls_transform_record", default=None)
+
+
+@contextmanager
+def capture_transform_diagnostics(estimator):
+    """Collect one ANLS transform's diagnostics without changing its estimator.
+
+    The yielded dictionary belongs to this caller. Use a separate scope per
+    transform, including in separate workers; nested scopes restore their outer
+    context. Non-ANLS estimators yield None for the study adapter. A scope with
+    no matching transform remains unperformed, with unknown convergence.
+
+    This isolates diagnostic records, not warning filters or native runtime
+    controls. Do not refit or change parameters during inference, or share one
+    active capture across concurrent operations.
+    """
+    if not isinstance(estimator, ANLSBPP):
+        yield None
+        return
+    record = dict(performed=False, converged=None, diagnostics=None, error=None)
+    token = _transform_record.set((estimator, record))
+    try:
+        yield record
+    finally:
+        _transform_record.reset(token)
 
 
 def _positive_integer(value, name):
@@ -271,8 +304,11 @@ class _FixedTrainingRHS:
     def __init__(self, targets):
         self._targets = targets
         self._prepared = None
+        self._handoff_enabled = False
+        self._handoff = None
 
     def solve(self, A, *, init=None, max_iter=None, tol=1e-10):
+        self._handoff = None
         return _nnls_block_pivot(A, self._targets, init=init, max_iter=max_iter,
                                  tol=tol, cross_rhs=self)
 
@@ -351,8 +387,62 @@ def _nnls_block_pivot(A, B, *, init=None, max_iter=None, tol=1e-10, cross_rhs=No
         direct_solves += direct
         gradient[:, pending] = matmul(gram, solved) - cross[:, pending]
         iterations = iteration + 1
-    # Check the feasible returned candidate against ORIGINAL A/B, not just the
-    # potentially cancellation-prone normal equations or passive-set status.
+    # The original tail is evaluated once unless an eligible quietness probe
+    # signals. Replay happens after leaving the exception handler, under the
+    # caller's policy; no discarded probe exception becomes replay context.
+    _handoff_quiet = False
+    if _handoff_producer(cross_rhs, A, B, matmul):
+        try:
+            with np.errstate(all="raise", under="ignore" if np.geterr()["under"] == "ignore" else "raise"):
+                coefficients_final, info, residual, gradient = _nnls_final_state(
+                    matmul, A, B, coefficients, pending, gradient_scale, tol,
+                    iterations, cap, solves, direct_solves, backups)
+            _handoff_quiet = True
+        except FloatingPointError:
+            pass
+    if not _handoff_quiet:
+        # Ordinary calls and caller-policy replay share the original core tail.
+        unclipped_primal = float(max(0.0, -coefficients.min()))
+        coefficients = np.maximum(coefficients, 0.0)
+        residual = matmul(A, coefficients)
+        residual -= B
+        gradient = matmul(A.T, residual)
+        projected = np.where((coefficients > 0) | (gradient < 0), gradient, 0.0)
+        relative_by_rhs = np.max(np.abs(projected), axis=0) / gradient_scale
+        relative = float(relative_by_rhs.max())
+        # A small roundoff allowance is separate from user tolerance.
+        allowance = tol + 256 * np.finfo(float).eps * max(A.shape)
+        success = bool(np.isfinite(coefficients).all() and np.isfinite(relative)
+                       and not pending.size and relative <= allowance)
+        info = {"success": success, "n_iter": iterations, "max_iter": cap,
+                "grouped_solves": solves, "direct_lstsq_groups": direct_solves,
+                "single_pivots": backups, "projected_gradient_relative": relative,
+                "kkt_tolerance": allowance, "unclipped_primal_violation": unclipped_primal,
+                "primal_violation": 0.0, "dual_violation": float(max(0.0, -gradient.min())),
+                "complementarity_max": float(np.max(np.abs(coefficients * gradient))),
+                "residual_norm": float(linalg.norm(residual))}
+    else:
+        coefficients = coefficients_final
+        success = info["success"]
+        relative = info["projected_gradient_relative"]
+    if _handoff_quiet and success:
+        try:
+            # A may be a normalized C copy. Keep it only until the consumer's
+            # full-bit basis check; earlier solve warnings can edit the view.
+            cross_rhs._handoff = (A, coefficients, residual,
+                gradient if A.shape[1] % 8 != 0 or B.shape[1] % 8 != 0 else None, np.geterr())
+        except MemoryError:
+            cross_rhs._handoff = None
+    if not success:
+        warnings.warn("ANLS-BPP inner NNLS failed its iteration/KKT qualification; "
+                      f"iterations={iterations}/{cap}, relative projected gradient={relative:.3g}.",
+                      ConvergenceWarning, stacklevel=3)
+    return coefficients, info
+
+
+def _nnls_final_state(matmul, A, B, coefficients, pending, gradient_scale, tol,
+                      iterations, cap, solves, direct_solves, backups):
+    """Original final NNLS qualification, without warning/publication policy."""
     unclipped_primal = float(max(0.0, -coefficients.min()))
     coefficients = np.maximum(coefficients, 0.0)
     residual = matmul(A, coefficients)
@@ -372,11 +462,68 @@ def _nnls_block_pivot(A, B, *, init=None, max_iter=None, tol=1e-10, cross_rhs=No
             "primal_violation": 0.0, "dual_violation": float(max(0.0, -gradient.min())),
             "complementarity_max": float(np.max(np.abs(coefficients * gradient))),
             "residual_norm": float(linalg.norm(residual))}
-    if not success:
-        warnings.warn("ANLS-BPP inner NNLS failed its iteration/KKT qualification; "
-                      f"iterations={iterations}/{cap}, relative projected gradient={relative:.3g}.",
-                      ConvergenceWarning, stacklevel=3)
-    return coefficients, info
+    return coefficients, info, residual, gradient
+
+
+def _handoff_producer(role, A, B, operation):
+    if (type(role) is not _HANDOFF_ROLE
+            or (operation is not _HANDOFF_PADDED and operation is not _HANDOFF_MATMUL)):
+        return False
+    if type(A) is not _HANDOFF_ARRAY or type(B) is not _HANDOFF_ARRAY:
+        return False
+    n, k = A.shape
+    p = B.shape[1]
+    # Exact normalized ndarray shapes need no replaceable numerical helper.
+    # Only the explicitly enabled fit-local H role may publish a handoff.
+    if not (k == 1 or (operation is _HANDOFF_PADDED and (n % 8 != 0 or p % 8 != 0))):
+        return False
+    if not vars(role).get('_handoff_enabled', False):
+        return False
+    if (B is not role._targets or A.dtype != np.float64 or B.dtype != np.float64
+            or not A.flags.c_contiguous or not B.flags.c_contiguous
+            or not A.flags.aligned or not B.flags.aligned):
+        return False
+    # A rank-one factor is both C/F contiguous: normalization does
+    # not change its native layout. The consumer verifies strides.
+    return True
+
+
+def _handoff_usable(payload, role, W, H, X, operation):
+    if (type(payload) is not tuple or len(payload) != 5
+            or type(role) is not _HANDOFF_ROLE
+            or (operation is not _HANDOFF_PADDED and operation is not _HANDOFF_MATMUL)):
+        return False
+    A, expected_H, residual, gradient, policy = payload
+    arrays = (A, W, H, X, residual) + (() if gradient is None else (gradient,))
+    if (H is not expected_H or X is not role._targets or np.geterr() != policy
+            or any(type(value) is not _HANDOFF_ARRAY for value in arrays)
+            or A.shape != W.shape or residual.shape != X.shape
+            or (gradient is not None and gradient.shape != H.shape)
+            or any(value.dtype != np.float64 for value in arrays)):
+        return False
+    if operation is _HANDOFF_MATMUL or (W.shape[0] % 8 == 0 and H.shape[1] % 8 == 0):
+        if (A.shape[1] != 1 or A.strides != W.strides
+                or not W.flags.c_contiguous or not W.flags.aligned):
+            return False
+    # Exact rank-one views of the same addressed elements need no bit scan.
+    # A shared base alone is insufficient: offsets and every stride must agree.
+    if (A.shape[1] == 1 and A.strides == W.strides
+            and A.__array_interface__["data"][0] == W.__array_interface__["data"][0]):
+        return True
+    # Equal numeric zeros are insufficient for the observed bitwise contract.
+    return bool(np.array_equal(A.view(np.uint64), W.view(np.uint64)))
+
+
+def _take_handoff(role, W, H, X, operation):
+    if type(role) is not _HANDOFF_ROLE:
+        return None
+    payload = vars(role).get('_handoff')
+    role._handoff = None
+    try:
+        return payload if _handoff_usable(payload, role, W, H, X, operation) else None
+    except MemoryError:
+        # Optional eligibility metadata must not replace mandatory arithmetic.
+        return None
 
 
 class _ExactFactorCycle:
@@ -414,10 +561,8 @@ class _ExactFactorCycle:
     def _fingerprint(w, h):
         # Deliberately patchable in tests to force collisions. No .tobytes(),
         # contiguous conversion, factor normalization or full factor copy.
-        digest = _cycle_hashlib.blake2b(digest_size=16)
-        digest.update(memoryview(w).cast("B"))
-        digest.update(memoryview(h).cast("B"))
-        return digest.digest()
+        digest = _cycle_zlib.crc32(memoryview(w).cast("B"))
+        return _cycle_zlib.crc32(memoryview(h).cast("B"), digest)
 
     def _key(self, pair):
         _, w, h = pair
@@ -461,6 +606,41 @@ class _ExactFactorCycle:
         return None
 
 
+def _return_coordinates_eligible(left):
+    if type(left) is not np.ndarray or left.ndim != 2:
+        return False
+    m, k = left.shape
+    return bool(
+        m >= 8192
+        and k >= 20
+        and m % 4096 == 0
+        and left.dtype == np.float64 and left.dtype.metadata is None and left.flags.aligned
+        and left.flags.f_contiguous and not left.flags.c_contiguous
+        and left.strides == (8, m * 8))
+
+
+def _copy_return_coordinates(left):
+    """Make the required independent C copy, with a narrow optional traversal."""
+    try:
+        eligible = _return_coordinates_eligible(left)
+    except MemoryError:
+        eligible = False
+    if not eligible:
+        return left.copy()
+    # Required storage: propagate failure; do not hide it with a second attempt.
+    scratch = np.empty(left.shape, dtype=np.float64, order="C")
+    try:
+        np.bitwise_or(left.view(np.uint64), np.uint64(0),
+                      out=scratch.view(np.uint64), order="F")
+    except MemoryError:
+        # The extra traversal is optional. Drop partial storage before fallback.
+        scratch = None
+    else:
+        return scratch
+    # Preserve the original method dispatch, outside the discarded trial handler.
+    return left.copy()
+
+
 class ANLSBPP(TransformerMixin, BaseEstimator):
     """Experimental dense, unregularized Frobenius NMF using ANLS-BPP.
 
@@ -477,9 +657,16 @@ class ANLSBPP(TransformerMixin, BaseEstimator):
     false, warns with reason ``repeated_iterate``, and records scalar details
     in ``cycle_event_``. It does not assert optimality or relax the original
     relative-gradient criterion. ``tol=0`` and higher ranks bypass detection.
-    Full-history hashing scans both factors per accepted sweep and retains
-    their arrays until fit exit, using up to O(max_iter * (n_samples +
-    n_features)) factor storage for rank one, plus indexing overhead.
+    Full-history CRC32 indexing scans both factors per accepted sweep;
+    every key hit still verifies both complete factor bit patterns.
+    Arrays remain retained until fit exit, using up to
+    O(max_iter * (n_samples + n_features)) rank-one factor storage,
+    plus indexing overhead.
+
+    Transform leaves fitted state unchanged. Use
+    ``capture_transform_diagnostics(model)`` around one query to retain its
+    qualification or exception. Older serialized ``last_transform_*`` fields
+    remain inert until refitting clears them; they are not current diagnostics.
     """
 
     def __init__(self, n_components=2, *, max_iter=1000, tol=1e-4,
@@ -529,6 +716,8 @@ class ANLSBPP(TransformerMixin, BaseEstimator):
                            if rank == 1 and tol > 0 and not converged else None)
         training_W_rhs = training_H_rhs = transpose_targets = None
         outer_reconstruction = outer_gradient_w = outer_gradient_h = None
+        _handoff = None
+        _fit_handoff_enabled = not (rank == 1 and X.size <= 16384)
         try:
             for iteration in range(cap):
                 if converged:
@@ -544,9 +733,11 @@ class ANLSBPP(TransformerMixin, BaseEstimator):
                     next_W, info_W = nnls_block_pivot(H.T, transpose_targets, init=W.T,
                                                       max_iter=self.nnls_max_iter, tol=self.nnls_tol)
                 if info_W["success"]:
-                    if matmul is padded_matmul:
+                    if matmul is padded_matmul or (_fit_handoff_enabled and rank == 1 and matmul is _HANDOFF_MATMUL):
                         if training_H_rhs is None:
                             training_H_rhs = _FixedTrainingRHS(X)
+                            if type(training_H_rhs) is _HANDOFF_ROLE:
+                                training_H_rhs._handoff_enabled = _fit_handoff_enabled
                         next_H, info_H = training_H_rhs.solve(next_W.T, init=H,
                             max_iter=self.nnls_max_iter, tol=self.nnls_tol)
                     else:
@@ -572,8 +763,13 @@ class ANLSBPP(TransformerMixin, BaseEstimator):
                     outer_reconstruction = matmul if new_W.shape[0] % 8 == 0 and new_H.shape[1] % 8 == 0 else make_output_workspace(matmul)
                     outer_gradient_w = matmul if X.shape[0] % 8 == 0 and new_H.shape[0] % 8 == 0 else make_output_workspace(matmul)
                     outer_gradient_h = matmul if new_W.shape[1] % 8 == 0 and X.shape[1] % 8 == 0 else make_output_workspace(matmul)
-                residual = outer_reconstruction(new_W, new_H)
-                residual -= X
+                _handoff = (_take_handoff(training_H_rhs, new_W, new_H, X, matmul)
+                            if _fit_handoff_enabled else None)
+                if _handoff is None:
+                    residual = outer_reconstruction(new_W, new_H)
+                    residual -= X
+                else:
+                    residual = _handoff[2]
                 objective = 0.5 * float(linalg.norm(residual)) ** 2
                 monotonic_allowance = 256 * np.finfo(float).eps * max(1.0, history[0])
                 if not np.isfinite(objective) or objective > history[-1] + monotonic_allowance:
@@ -582,7 +778,44 @@ class ANLSBPP(TransformerMixin, BaseEstimator):
                 W, H = new_W, new_H
                 iterations = iteration + 1
                 history.append(objective)
-                current_pg = _pg_values(W, H, outer_gradient_w(residual, H.T), outer_gradient_h(W.T, residual))["projected_gradient_norm"]
+                if _handoff is None or _handoff[3] is None:
+                    # A protected residual can be reused even when the H
+                    # gradient uses a different aligned native layout.
+                    _handoff = None
+                    current_pg = _pg_values(W, H, outer_gradient_w(residual, H.T), outer_gradient_h(W.T, residual))["projected_gradient_norm"]
+                else:
+                    # Match the original expression's callable/first-argument
+                    # evaluation before either gradient can invoke a callback.
+                    _pg_function, _pg_W, _pg_H = _pg_values, W, H
+                    _handoff_grad_w = _handoff_grad_h = None
+                    try:
+                        _w_quiet = False
+                        try:
+                            with np.errstate(all="raise", under="ignore" if np.geterr()["under"] == "ignore" else "raise"):
+                                _handoff_grad_w = outer_gradient_w(residual, H.T)
+                            _w_quiet = True
+                        except FloatingPointError:
+                            _handoff = None
+                        if not _w_quiet:
+                            _handoff_grad_w = outer_gradient_w(residual, H.T)
+                        if _handoff is not None:
+                            try:
+                                _still_usable = _handoff_usable(_handoff, training_H_rhs, W, H, X, matmul)
+                            except MemoryError:
+                                _still_usable = False
+                            if not _still_usable:
+                                _handoff = None
+                        if _handoff is None:
+                            _handoff_grad_h = outer_gradient_h(W.T, residual)
+                        else:
+                            _handoff_grad_h = _handoff[3]
+                        _handoff = None
+                        current_pg = _pg_function(_pg_W, _pg_H, _handoff_grad_w,
+                                                  _handoff_grad_h)["projected_gradient_norm"]
+                    finally:
+                        _handoff = None
+                        _pg_function = _pg_W = _pg_H = None
+                        _handoff_grad_w = _handoff_grad_h = None
                 pg_history.append(current_pg)
                 converged = current_pg <= tol * initial_pg
                 if converged:
@@ -605,34 +838,57 @@ class ANLSBPP(TransformerMixin, BaseEstimator):
                 _cycle_detector.checkpoint = None
             raise
         finally:
+            _handoff = None
+            if type(training_H_rhs) is _HANDOFF_ROLE:
+                training_H_rhs._handoff = None
             _cycle_detector = None
             for workspace in (outer_reconstruction, outer_gradient_w, outer_gradient_h):
                 if workspace is not None and workspace is not matmul:
                     workspace.clear()
         self.n_features_in_, self.n_components_ = X.shape[1], rank
-        self.components_, self.training_coordinates_ = H.copy(), W.copy()
+        self.components_, self.training_coordinates_ = H.copy(), _copy_return_coordinates(W)
         self.n_iter_, self.converged_ = iterations, bool(converged)
         self.convergence_reason_ = reason
         self.objective_history_, self.projected_gradient_history_ = history, pg_history
         self.initial_projected_gradient_ = initial_pg
         self.relative_projected_gradient_ = pg_history[-1] / initial_pg if initial_pg else 0.0
-        self.reconstruction_err_ = float(linalg.norm(X - matmul(W, H)))
+        if matmul is padded_matmul:
+            self.reconstruction_err_ = float(linalg.norm(
+                X - matmul(W, H, _final_report_copy4=True)))
+        else:
+            self.reconstruction_err_ = float(linalg.norm(X - matmul(W, H)))
         self.nnls_diagnostics_, self.computation_dtype_ = inner_summary, "float64"
         if not converged:
             warnings.warn(f"ANLS-BPP did not converge: {reason}; outer sweeps={iterations}/{cap}, "
                           f"relative initial projected gradient={self.relative_projected_gradient_:.3g}.",
                           ConvergenceWarning, stacklevel=2)
-        return W.copy()
+        return _copy_return_coordinates(W)
 
     def transform(self, X):
-        check_is_fitted(self, "components_")
-        self.last_transform_converged_ = False
-        X = _array(X, nonnegative=True)
-        if X.shape[1] != self.n_features_in_:
-            raise ValueError("Transform feature count does not match the fitted basis.")
-        coefficients, info = nnls_block_pivot(self.components_.T, X.T,
-                                              max_iter=self.nnls_max_iter, tol=self.nnls_tol)
-        self.last_transform_converged_ = bool(info["success"])
-        self.last_transform_diagnostics_ = info
+        active = _transform_record.get()
+        record = active[1] if active is not None and active[0] is self else None
+        if record is not None:
+            record.update(performed=True, converged=False, diagnostics=None, error=None)
+        try:
+            check_is_fitted(self, "components_")
+            X = _array(X, nonnegative=True)
+            if X.shape[1] != self.n_features_in_:
+                raise ValueError("Transform feature count does not match the fitted basis.")
+            coefficients, info = nnls_block_pivot(self.components_.T, X.T,
+                                                  max_iter=self.nnls_max_iter, tol=self.nnls_tol)
+            if record is not None:
+                record.update(converged=bool(info["success"]), diagnostics=info)
+        except BaseException as error:
+            if record is not None:
+                record.update(converged=False, diagnostics=None,
+                              error=f"{type(error).__name__}: {error}")
+            raise
         return coefficients.T
 
+
+# Canonical types and operations define the qualified handoff routes.
+# Runtime replacement of numerical/private implementations is outside this scope.
+_HANDOFF_ARRAY = np.ndarray
+_HANDOFF_ROLE = _FixedTrainingRHS
+_HANDOFF_PADDED = padded_matmul
+_HANDOFF_MATMUL = np.matmul

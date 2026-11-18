@@ -20,7 +20,9 @@ from sklearn.model_selection import ParameterGrid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "scripts"))
 from supervised_nmf.evaluation import _digest, _jsonable, comparison_models
+from supervised_nmf._identity import configuration_identity, implementation_sources
 
 ATTRIBUTES = ("Smiling", "Wearing_Necktie")
 NEAR_TIE_TOLERANCE = 1e-12
@@ -148,7 +150,29 @@ def _collect(root, configuration, models, chunks, hashes):
                 if (report["state"] != "cv_completed" or report["refit_performed"] is not False
                         or report["fingerprint"] != _digest(identity)):
                     raise ValueError(f"Incomplete, refitted, or inconsistent training-CV report: {path}")
-                if (calibration["candidates"] != expected or calibration["parameters"] != _jsonable(estimator.get_params(deep=True))
+                schema = calibration.get("identity_schema")
+                if schema is None:
+                    # Historical receipts bind display parameters and the old
+                    # estimator-source inventory. Preserve their exact checks;
+                    # never interpret a new identity as a legacy receipt.
+                    if ("structural_configuration" in calibration
+                            or identity.get("schema_version") == 4 or report.get("schema_version") == 4):
+                        raise ValueError("Structural CV identity is missing its declared schema.")
+                    declared_matches = (calibration["candidates"] == expected
+                                        and calibration["parameters"] == _jsonable(estimator.get_params(deep=True)))
+                    expected_sources = estimator_sources
+                elif type(schema) is int and schema == 2:
+                    from _audit_identity import (verify_configuration_identity, verify_implementation_sources,
+                                                 verify_shared_knn_cv_receipt)
+                    verify_shared_knn_cv_receipt(report)
+                    expected_sources = implementation_sources(estimator, expected)
+                    declared_matches = (
+                        verify_configuration_identity(calibration.get("structural_configuration"), configuration_identity(
+                            {"estimator": estimator, "candidates": expected}))
+                        and verify_implementation_sources(calibration.get("implementation_source"), expected_sources))
+                else:
+                    raise ValueError(f"Unsupported CV identity schema: {schema!r}")
+                if (not declared_matches
                         or calibration["estimator"] != f"{type(estimator).__module__}.{type(estimator).__qualname__}"
                         or calibration["seed"] != configuration["seed"] or calibration["cv"] != configuration["cv"]
                         or calibration["threads"] != configuration["threads"] or calibration["refit"] is not False
@@ -161,7 +185,9 @@ def _collect(root, configuration, models, chunks, hashes):
                 if attribute in attribute_identities and attribute_identities[attribute] != shared_identity:
                     raise ValueError(f"Methods/chunks use different training data or folds for {attribute}.")
                 attribute_identities[attribute] = shared_identity
-                if (identity["runtime"]["estimator_source"] != estimator_sources
+                runtime_sources_match = (verify_implementation_sources(identity["runtime"]["estimator_source"], expected_sources)
+                                         if schema == 2 else identity["runtime"]["estimator_source"] == expected_sources)
+                if (not runtime_sources_match
                         or identity["runtime"]["package_source"] != configuration["source_sha256"]):
                     raise ValueError("Estimator source identity differs from the frozen training implementation.")
                 common_runtime = {key: value for key, value in identity["runtime"].items() if key != "estimator_source"}

@@ -260,7 +260,7 @@ class ClassifierHeadTests(unittest.TestCase):
         with self.assertRaises(NotFittedError):
             model.predict(self.query)
 
-    def test_new_head_pickle_and_legacy_missing_parameters(self):
+    def test_current_head_pickle_and_missing_field_preservation(self):
         for settings in ({"classifier": "linear_svm"}, {"knn_normalization": "sd"},
                          {"classifier": "logistic"}, {}):
             with self.subTest(settings=settings):
@@ -269,8 +269,8 @@ class ClassifierHeadTests(unittest.TestCase):
                 restored = pickle.loads(pickle.dumps(model))
                 np.testing.assert_array_equal(restored.predict(self.query), expected)
                 self.assertEqual(restored.get_params(), model.get_params())
-        # A genuine old head had neither SD nor SVM settings. Constructor
-        # restoration must not refit its representation or change its policy.
+        # Loading must not synthesize absent constructor or fitted head metadata.
+        # The already-fitted head can still predict without those metadata fields.
         for classifier in ("knn", "logistic"):
             model = self.model(classifier=classifier).fit(self.X, self.y)
             expected = model.predict(self.query)
@@ -279,9 +279,9 @@ class ClassifierHeadTests(unittest.TestCase):
                 delattr(model, name)
             restored = pickle.loads(pickle.dumps(model))
             np.testing.assert_array_equal(restored.predict(self.query), expected)
-            self.assertEqual(restored.knn_normalization, "none")
-            self.assertEqual(restored.svm_max_iter, 20000)
-            self.assertEqual(clone(restored).get_params(), restored.get_params())
+            self.assertTrue(all(name not in vars(restored) for name in (
+                "knn_normalization", "knn_normalization_", "svm_C", "svm_tol",
+                "svm_max_iter", "svm_class_weight")))
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_FASHION_PROTOCOL = ROOT / "examples/fashion_mnist_solver_protocol_v2.json"
@@ -47,9 +48,38 @@ def sha256(path):
 
 
 def write_json(path, value):
-    temporary = Path(str(path) + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    """Stage a complete JSON file and atomically replace the target."""
+    path = Path(path)
+    payload = json.dumps(value, indent=2) + "\n"
+    temporary = None
+    try:
+        for _ in range(10):
+            candidate = path.parent / (".f" + uuid.uuid4().hex[:12])
+            try:
+                stream = candidate.open("x", encoding="utf-8")
+            except FileExistsError:
+                continue
+            temporary = candidate
+            break
+        else:
+            raise FileExistsError(f"Could not create a unique temporary file for {path}")
+        with stream:
+            stream.write(payload)
+        for attempt in range(6):
+            try:
+                temporary.replace(path)
+                temporary = None
+                return
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.05 * 2 ** attempt)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 @contextmanager
@@ -98,7 +128,6 @@ def freeze_run(output, fashion_protocol=DEFAULT_FASHION_PROTOCOL, celeba_protoco
         ROOT / "scripts" / "profile_celeba_stages.py",
         ROOT / "scripts" / "prepare_fashion_mnist.py",
         ROOT / "scripts" / "check_four_solver_training.py",
-        ROOT / "scripts" / "prepare_four_solver_recovery.py",
         fashion_protocol, celeba_protocol,
         ROOT / "docs" / "fashion-mnist-protocol.md",
         ROOT / "docs" / "nmf-solver-comparison.md",
@@ -127,8 +156,6 @@ def freeze_run(output, fashion_protocol=DEFAULT_FASHION_PROTOCOL, celeba_protoco
 
 
 def run(output, fashion_protocol=DEFAULT_FASHION_PROTOCOL, celeba_protocol=DEFAULT_CELEBA_PROTOCOL):
-    if Path(sys.prefix).name != "py12_df_aocl":
-        raise RuntimeError("This historical benchmark study requires the py12_df_aocl conda environment.")
     output = Path(output).resolve()
     freeze = freeze_run(output, fashion_protocol, celeba_protocol)
     identity = freeze["files"]

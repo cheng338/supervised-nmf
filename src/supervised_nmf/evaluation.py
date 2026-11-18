@@ -7,10 +7,13 @@ The reports deliberately leave refinement and package-default decisions open.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import errno
 import hashlib
 import importlib.metadata
+from inspect import getattr_static
 import json
 import math
 import os
@@ -18,6 +21,7 @@ from pathlib import Path
 import platform
 import re
 import time
+from types import FunctionType, MethodType
 import uuid
 import warnings
 
@@ -34,13 +38,25 @@ from sklearn.model_selection import ParameterGrid
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.svm import LinearSVC
-from sklearn.utils.validation import check_X_y
+from sklearn.utils.validation import check_X_y, check_is_fitted, check_random_state
 from threadpoolctl import threadpool_info, threadpool_limits
 
-from .classifier import _capture_projection, _record_warnings, _uses_projection_diagnostics
+from .classifier import (_capture_projection, _record_warnings, _uses_projection_diagnostics,
+                         _knn_probabilities_preserve_labels)
+from ._calibration import _score_fields, _score_predictions, _validate_scoring
+from ._identity import configuration_identity, implementation_sources
+from ._labels import _validate_class_label, _validate_class_labels
+from ._search_diagnostics import mark_inactive_refinement, screening_grid_diagnostics
 from .screening import _clear_fitted_attributes
-from .validation import _metadata_keys, build_cv_folds, validate_metadata
+from .validation import (
+    _NATIVE_ID_TYPES, _exact_metadata_promotion, _native_float_key_set, _metadata_keys, _metadata_overlap,
+    _validate_metadata_snapshot, _validated_unique_metadata,
+    _validate_refit, _validate_threads, build_cv_folds, validate_metadata,
+)
 
+
+# Capture the stock scalar class independently of the mutable public alias.
+_LONGDOUBLE_SCALAR_TYPE = np.dtype("longdouble").type
 
 class _TrackedLogisticRegression(LogisticRegression):
     """Retain fit convergence evidence for later standalone evaluation."""
@@ -96,10 +112,15 @@ def _extended_float_json(value):
 
 
 def _jsonable(value):
+    value_type = type(value)
+    if value is None or value_type is str or value_type is int or value_type is bool:
+        return value
+    if value_type is float:
+        return value if math.isfinite(value) else None
     if isinstance(value, np.ndarray):
         return _jsonable(value.tolist())
     if isinstance(value, np.generic):
-        item = value.item()
+        item = value if value_type is _LONGDOUBLE_SCALAR_TYPE else value.item()
         if not isinstance(item, np.generic):
             return _jsonable(item)
         # longdouble/clongdouble cannot always unbox to a Python scalar.
@@ -115,6 +136,8 @@ def _jsonable(value):
         return None
     if isinstance(value, dict):
         return {str(k): _jsonable(v) for k, v in value.items()}
+    if value_type is list and len(value) >= 16 and type(next(iter(value), None)) is int:
+        return [v if type(v) is int else _jsonable(v) for v in value]
     if isinstance(value, (list, tuple)):
         return [_jsonable(v) for v in value]
     if isinstance(value, Path):
@@ -126,23 +149,89 @@ def _jsonable(value):
     return repr(value)
 
 
+@contextmanager
+def _file_lock(marker_path, busy_message):
+    """Own a persistent marker through its OS lock, never through its existence."""
+    with Path(marker_path).open("a+b") as stream:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"0")
+            stream.flush()
+        stream.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                raise RuntimeError(busy_message) from error
+            raise
+        try:
+            yield
+        finally:
+            stream.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _checkpoint_file(path):
+    """Own one checkpoint destination for its complete read/modify/write cycle."""
+    if path is None:
+        yield None
+        return
+    path = Path(path)
+    # Normalize parent aliases without changing final-symlink replace semantics.
+    path = path.parent.resolve() / path.name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    marker = path.with_name(f".{path.name}.lock")
+    with _file_lock(marker, f"Another process or thread is writing this checkpoint: {path}"):
+        yield path
+
+
 def write_json(path, report):
-    """Atomically replace an explicitly supplied report, preserving valid JSON."""
+    """Atomically replace a complete report; concurrent replacements are not merged."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(_jsonable(report), indent=2, sort_keys=True,
-                                    allow_nan=False) + "\n", encoding="utf-8")
-    # Windows indexers/antivirus can briefly hold an existing checkpoint open.
-    # Keep atomic replacement; never delete the old valid checkpoint first.
-    for attempt in range(6):
-        try:
-            temporary.replace(path)
+    payload = json.dumps(_jsonable(report), indent=2, sort_keys=True,
+                         allow_nan=False) + "\n"
+    temporary = None
+    try:
+        for _ in range(10):
+            candidate = path.parent / f".snmf-{uuid.uuid4().hex}.tmp"
+            try:
+                stream = candidate.open("x", encoding="utf-8")
+            except FileExistsError:
+                continue
+            temporary = candidate
             break
-        except PermissionError:
-            if attempt == 5:
-                raise
-            time.sleep(0.05 * 2 ** attempt)
+        else:
+            raise FileExistsError(f"Could not create a unique temporary file for {path}")
+        with stream:
+            stream.write(payload)
+        # Close before replacement, retaining the existing bounded Windows retries.
+        # Never delete the old valid checkpoint first.
+        for attempt in range(6):
+            try:
+                temporary.replace(path)
+                temporary = None
+                break
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.05 * 2 ** attempt)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                # Preserve the original I/O error if cleanup is also denied.
+                pass
 
 
 def _digest(value):
@@ -151,20 +240,23 @@ def _digest(value):
 
 
 def save_data_manifest(path, manifest):
-    """Create a manifest or verify it unchanged before resuming historical work."""
+    """Create or verify a manifest while rejecting a competing writer promptly."""
     path = Path(path)
-    if path.exists():
-        saved = json.loads(path.read_text(encoding="utf-8"))
-        if saved != _jsonable(manifest):
-            raise ValueError("Existing data manifest is incompatible; create a new run directory.")
-    else:
-        write_json(path, manifest)
+    with _checkpoint_file(path) as path:
+        if path.exists():
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            if saved != _jsonable(manifest):
+                raise ValueError("Existing data manifest is incompatible; create a new run directory.")
+        else:
+            write_json(path, manifest)
 
 
 def data_fingerprint(X, y):
     """Hash data values, ordering, shape, and dtype without publishing raw data."""
+    arrays = np.asarray(X), np.asarray(y)
+    _validate_class_labels(y, arrays[1])
     digest = hashlib.sha256()
-    for array in (np.asarray(X), np.asarray(y)):
+    for array in arrays:
         digest.update(str(array.shape).encode())
         digest.update(array.dtype.str.encode())
         if array.dtype.hasobject:
@@ -326,16 +418,22 @@ def support_recovery(estimator, signal_support):
 
 
 def _search_identity(estimator, candidates, X, y, cv, seed, threads, refit=True,
-                     *, groups=None, folds=None, data_ids=None):
-    environment = _initialized_provenance(threads)
+                     *, groups=None, folds=None, data_ids=None, scoring="accuracy", _environment=None):
+    environment = _initialized_provenance(threads) if _environment is None else _environment(threads)
     runtime_keys = ("user_api", "internal_api", "prefix", "filepath", "version", "threading_layer", "architecture")
     numerical_runtime = sorted([{key: library.get(key) for key in runtime_keys}
                                 for library in environment["threadpools"]],
                                key=lambda library: library.get("filepath") or "")
-    return {"estimator": f"{type(estimator).__module__}.{type(estimator).__qualname__}",
-            "parameters": _jsonable(estimator.get_params(deep=True)),
-            "candidates": _jsonable(candidates), "data_sha256": data_fingerprint(X, y),
+    return {"identity_schema": 2,
+            "estimator": f"{type(estimator).__module__}.{type(estimator).__qualname__}",
+            # Candidate reports retain display descriptions. Keep those out of
+            # identity: repr may omit parameters or contain process addresses.
+            "data_sha256": data_fingerprint(X, y),
+            "structural_configuration": configuration_identity({"estimator": estimator,
+                                                                "candidates": candidates}),
+            "implementation_source": implementation_sources(estimator, candidates),
             "cv": cv, "seed": seed, "threads": threads, "refit": refit,
+            "scoring": _validate_scoring(scoring),
             "groups": _jsonable(groups), "folds": _jsonable(folds), "data_ids": _jsonable(data_ids),
             "python": environment["python"], "platform": environment["platform"],
             "numerical_runtime": numerical_runtime,
@@ -380,7 +478,7 @@ class CalibrationResult:
 
 def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
                        threads=1, checkpoint_path=None, refit=True,
-                       groups=None, folds=None, data_ids=None):
+                       groups=None, folds=None, data_ids=None, scoring="accuracy"):
     """Calibrate on training data with complete, resumable per-fold records.
 
     Defaults are five folds, seed zero and one native numerical thread.
@@ -388,6 +486,15 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
     not CV workers. Separate SPA projection controls can override that limit
     or launch processes, so it is not a global concurrency ceiling. ``seed``
     controls generated folds; fix estimator random states separately.
+
+    ``threads`` accepts positive Python/NumPy integer scalars representable by
+    the native C-int interface; Boolean and temporal scalars are not counts.
+    ``refit`` accepts Python/NumPy Boolean scalars, not numeric 0/1 or arrays.
+    These controls are checked before fold generation or checkpoint activity.
+    For generated folds, ``seed`` retains sklearn's random-state contract,
+    including None and RandomState. Use a fixed integer for reproducible runs.
+    With explicit folds, seed does not generate splits but remains in identity;
+    changing it can therefore prevent resume even when the folds are unchanged.
 
     Both fit and held-out-fold prediction warnings are retained. Convergence
     warnings invalidate that candidate. If a numerically valid CV winner fails
@@ -399,145 +506,196 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
     Supply one subject ID per row in ``groups`` for group-disjoint CV, or pass
     exhaustive custom ``folds`` accepted by :func:`build_cv_folds`. Optional
     unique ``data_ids``, groups and the exact folds are bound to checkpoints.
+    ``scoring`` is ``'accuracy'`` (the default) or ``'balanced_accuracy'``.
+    The latter preserves the historical selection objective. Choose the
+    objective before tuning; it never switches automatically with class
+    proportions and does not change the estimator's decision rule.
+    Explicitly gridded inactive screening parameters produce a warning and
+    report diagnostics; selection modes and candidate grids remain unchanged.
+
+    A checkpoint destination has one cooperating writer for the entire call,
+    including refit. A concurrent call using the same destination raises
+    RuntimeError; different checkpoint files remain independent. The adjacent
+    ``.<filename>.lock`` marker persists after release and must not be removed
+    or replaced. Its presence alone does not mean the checkpoint is busy.
+    With ``checkpoint_path=None``, no checkpoint files or locks are created.
     """
+    threads = _validate_threads(threads)
+    refit = _validate_refit(refit)
+    scoring = _validate_scoring(scoring)
+    raw_y = y
     X, y = check_X_y(X, y)
     classes, counts = np.unique(y, return_counts=True)
+    _validate_class_labels(raw_y, y, classes=classes)
     groups = validate_metadata(groups, len(y), name="groups")
     data_ids = validate_metadata(data_ids, len(y), name="data_ids", unique=True)
     folds = build_cv_folds(X, y, cv=cv, seed=seed, groups=groups, folds=folds)
     cv = len(folds)
-    if not isinstance(threads, int) or threads < 1:
-        raise ValueError("threads must be a positive integer.")
-    if not isinstance(refit, bool):
-        raise ValueError("refit must be boolean.")
     candidates = list(ParameterGrid(param_grid))
     if not candidates:
         raise ValueError("At least one parameter candidate is required.")
     identity = _search_identity(estimator, candidates, X, y, cv, seed, threads, refit=refit,
-                                groups=groups, folds=folds, data_ids=data_ids)
+                                groups=groups, folds=folds, data_ids=data_ids, scoring=scoring)
+    # Identity must validate custom cloning before diagnostics clone anything.
+    screening_diagnostics = screening_grid_diagnostics(estimator, candidates)
     fingerprint = _digest(identity)
-    path = Path(checkpoint_path) if checkpoint_path is not None else None
-    if path is not None and path.exists():
-        report = json.loads(path.read_text(encoding="utf-8"))
-        if report.get("fingerprint") != fingerprint:
-            raise ValueError("Checkpoint is incompatible with these data, settings, software, or source.")
-        saved_digest = report.get("checkpoint_sha256")
-        if saved_digest != _digest({k: v for k, v in report.items() if k != "checkpoint_sha256"}):
-            raise ValueError("Checkpoint content failed its integrity check.")
-    else:
-        report = {"schema_version": 1, "author": "Chang Cheng", "fingerprint": fingerprint,
-                  "identity": identity, "provenance": provenance(threads),
-                  "class_labels": _jsonable(classes), "class_counts": counts.tolist(),
-                  "folds": [{"training_indices": a.tolist(), "validation_indices": b.tolist()}
-                            for a, b in folds],
-                  "candidates": [{"index": i, "parameters": _jsonable(p), "folds": []}
-                                 for i, p in enumerate(candidates)],
-                  "tuning_seconds": 0.0, "final_fit_seconds": 0.0, "final_fit_attempts": []}
-    previous_seconds = report["tuning_seconds"]
-    start = time.perf_counter()
+    with _checkpoint_file(checkpoint_path) as path:
+        if path is not None and path.exists():
+            report = json.loads(path.read_text(encoding="utf-8"))
+            if report.get("fingerprint") != fingerprint:
+                raise ValueError("Checkpoint is incompatible with these data, settings, software, or source.")
+            saved_digest = report.get("checkpoint_sha256")
+            if saved_digest != _digest({k: v for k, v in report.items() if k != "checkpoint_sha256"}):
+                raise ValueError("Checkpoint content failed its integrity check.")
+        else:
+            report = {"schema_version": 2, "author": "Chang Cheng", "fingerprint": fingerprint,
+                      "scoring": scoring, "screening_diagnostics": screening_diagnostics,
+                      "identity": identity, "provenance": provenance(threads),
+                      "class_labels": _jsonable(classes), "class_counts": counts.tolist(),
+                      "folds": [{"training_indices": a.tolist(), "validation_indices": b.tolist()}
+                                for a, b in folds],
+                      "candidates": [{"index": i, "parameters": _jsonable(p), "folds": []}
+                                     for i, p in enumerate(candidates)],
+                      "tuning_seconds": 0.0, "final_fit_seconds": 0.0, "final_fit_attempts": []}
+        previous_seconds = report["tuning_seconds"]
+        start = time.perf_counter()
 
-    def checkpoint():
-        if path is not None:
-            report["checkpoint_sha256"] = _digest({k: v for k, v in report.items() if k != "checkpoint_sha256"})
-            write_json(path, report)
+        def checkpoint():
+            if path is not None:
+                report["checkpoint_sha256"] = _digest({k: v for k, v in report.items() if k != "checkpoint_sha256"})
+                write_json(path, report)
 
-    report["state"] = "calibrating"
-    checkpoint()
-    with threadpool_limits(limits=threads):
-        report["active_threadpools"] = threadpool_info()
-        for params, candidate in zip(candidates, report["candidates"]):
-            completed = {f["fold"] for f in candidate["folds"]}
-            for fold, (training, validation) in enumerate(folds):
-                if fold in completed:
-                    continue
-                record = {"fold": fold, "fit_seconds": 0.0, "prediction_seconds": 0.0}
-                fitted = None
-                projection = None
+        previous_files = {}
+
+        def check_implementation_source():
+            sources = implementation_sources(estimator, candidates, _previous_files=previous_files)
+            if sources != identity["implementation_source"]:
+                raise ValueError("Estimator implementation source changed during calibration.")
+
+        report["state"] = "calibrating"
+        checkpoint()
+        with threadpool_limits(limits=threads):
+            report["active_threadpools"] = threadpool_info()
+            for params, candidate in zip(candidates, report["candidates"]):
+                completed = {f["fold"] for f in candidate["folds"]}
+                for fold, (training, validation) in enumerate(folds):
+                    if fold in completed:
+                        continue
+                    check_implementation_source()
+                    record = {"fold": fold, "fit_seconds": 0.0, "prediction_seconds": 0.0}
+                    fitted = None
+                    projection = None
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter("always")
+                        try:
+                            # Grid entries may themselves be estimators. Clone them
+                            # too so replacement steps cannot retain another fold's
+                            # fitted state or mutate the caller's candidate objects.
+                            fitted = clone(estimator).set_params(**clone(params, safe=False))
+                            fit_start = time.perf_counter()
+                            try:
+                                fitted.fit(X[training], y[training])
+                            finally:
+                                record["fit_seconds"] = time.perf_counter() - fit_start
+                            inference_start = time.perf_counter()
+                            try:
+                                with _capture_projection(fitted) as projection:
+                                    predictions = fitted.predict(X[validation])
+                            finally:
+                                record["prediction_seconds"] = time.perf_counter() - inference_start
+                            score = _score_predictions(scoring, y[validation], predictions)
+                            record.update(_score_fields(scoring, score))
+                            record["status"] = "nonconverged" if _nonconverged(fitted, caught, projection) else "valid"
+                        except Exception as error:
+                            record.update(status="failed", error_type=type(error).__name__, error=str(error))
+                    record["warnings"] = _warning_records(caught)
+                    check_implementation_source()
+                    if fitted is not None:
+                        record["diagnostics"] = _diagnostics(fitted, projection)
+                    candidate["folds"].append(record)
+                    report["tuning_seconds"] = previous_seconds + time.perf_counter() - start
+                    checkpoint()
+                valid = len(candidate["folds"]) == cv and all(f["status"] == "valid" for f in candidate["folds"])
+                scores = [f["score"] for f in candidate["folds"]] if valid else []
+                candidate["valid"] = valid
+                candidate.update(_score_fields(scoring, float(np.mean(scores)) if valid else None, mean=True))
+                candidate["fold_score_std"] = float(np.std(scores, ddof=1)) if valid else None
+                candidate["invalid_fold_count"] = sum(f["status"] != "valid" for f in candidate["folds"])
+                checkpoint()
+            report["tuning_seconds"] = previous_seconds + time.perf_counter() - start
+            ranked = sorted((c for c in report["candidates"] if c["valid"]),
+                            key=lambda c: (-c["mean_score"], c["index"]))
+            if not refit:
+                selected = ranked[0] if ranked else None
+                report.update(state="cv_completed", is_fallback=False, refit_performed=False,
+                              selected_candidate_index=None if selected is None else selected["index"],
+                              selected_parameters=None if selected is None else selected["parameters"],
+                              selected_mean_score=None if selected is None else selected["mean_score"],
+                              tuning_complete=False, defaults_frozen=False,
+                              refinement=mark_inactive_refinement(
+                                  refinement_diagnostics(candidates, None if selected is None else selected["parameters"]),
+                                  screening_diagnostics, None if selected is None else selected["index"]))
+                checkpoint()
+                return CalibrationResult(None, report)
+            selected = None
+            fitted = None
+            report["state"] = "refitting"
+            checkpoint()
+            for candidate in ranked:
+                check_implementation_source()
+                attempt = {"candidate_index": candidate["index"], "parameters": candidate["parameters"]}
+                attempt_start = time.perf_counter()
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
                     try:
-                        fitted = clone(estimator).set_params(**params)
-                        fit_start = time.perf_counter()
-                        try:
-                            fitted.fit(X[training], y[training])
-                        finally:
-                            record["fit_seconds"] = time.perf_counter() - fit_start
-                        inference_start = time.perf_counter()
-                        try:
-                            with _capture_projection(fitted) as projection:
-                                predictions = fitted.predict(X[validation])
-                        finally:
-                            record["prediction_seconds"] = time.perf_counter() - inference_start
-                        score = float(balanced_accuracy_score(y[validation], predictions))
-                        if not math.isfinite(score):
-                            raise ValueError("Nonfinite calibration score.")
-                        record["balanced_accuracy"] = score
-                        record["status"] = "nonconverged" if _nonconverged(fitted, caught, projection) else "valid"
+                        parameters = clone(candidates[candidate["index"]], safe=False)
+                        model = clone(estimator).set_params(**parameters).fit(X, y)
+                        attempt["diagnostics"] = _diagnostics(model)
+                        attempt["status"] = "nonconverged" if _nonconverged(model, caught) else "valid"
+                        if attempt["status"] == "valid":
+                            fitted, selected = model, candidate
                     except Exception as error:
-                        record.update(status="failed", error_type=type(error).__name__, error=str(error))
-                record["warnings"] = _warning_records(caught)
-                if fitted is not None:
-                    record["diagnostics"] = _diagnostics(fitted, projection)
-                candidate["folds"].append(record)
-                report["tuning_seconds"] = previous_seconds + time.perf_counter() - start
+                        attempt.update(status="failed", error_type=type(error).__name__, error=str(error))
+                attempt["warnings"] = _warning_records(caught)
+                check_implementation_source()
+                attempt["seconds"] = time.perf_counter() - attempt_start
+                report["final_fit_seconds"] += attempt["seconds"]
+                report["final_fit_attempts"].append(attempt)
                 checkpoint()
-            valid = len(candidate["folds"]) == cv and all(f["status"] == "valid" for f in candidate["folds"])
-            scores = [f["balanced_accuracy"] for f in candidate["folds"]] if valid else []
-            candidate["valid"] = valid
-            candidate["mean_balanced_accuracy"] = float(np.mean(scores)) if valid else None
-            candidate["fold_score_std"] = float(np.std(scores, ddof=1)) if valid else None
-            candidate["invalid_fold_count"] = sum(f["status"] != "valid" for f in candidate["folds"])
-            checkpoint()
-        report["tuning_seconds"] = previous_seconds + time.perf_counter() - start
-        ranked = sorted((c for c in report["candidates"] if c["valid"]),
-                        key=lambda c: (-c["mean_balanced_accuracy"], c["index"]))
-        if not refit:
-            selected = ranked[0] if ranked else None
-            report.update(state="cv_completed", is_fallback=False, refit_performed=False,
-                          selected_candidate_index=None if selected is None else selected["index"],
-                          selected_parameters=None if selected is None else selected["parameters"],
-                          tuning_complete=False, defaults_frozen=False,
-                          refinement=refinement_diagnostics(candidates, None if selected is None else selected["parameters"]))
-            checkpoint()
-            return CalibrationResult(None, report)
-        selected = None
-        fitted = None
-        report["state"] = "refitting"
+                if fitted is not None:
+                    break
+            if fitted is None:
+                fallback_start = time.perf_counter()
+                fitted = DummyClassifier(strategy="most_frequent").fit(X, y)
+                seconds = time.perf_counter() - fallback_start
+                report["final_fit_seconds"] += seconds
+                report["final_fit_attempts"].append({"status": "fallback", "seconds": seconds,
+                                                    "reason": "No candidate passed all folds and final refit."})
+        report.update(state="completed", is_fallback=selected is None,
+                      selected_candidate_index=None if selected is None else selected["index"],
+                      selected_parameters=None if selected is None else selected["parameters"],
+                      selected_mean_score=None if selected is None else selected["mean_score"],
+                      tuning_complete=False, defaults_frozen=False,
+                      refinement=mark_inactive_refinement(
+                          refinement_diagnostics(candidates, None if selected is None else selected["parameters"]),
+                          screening_diagnostics, None if selected is None else selected["index"]))
         checkpoint()
-        for candidate in ranked:
-            attempt = {"candidate_index": candidate["index"], "parameters": candidate["parameters"]}
-            attempt_start = time.perf_counter()
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                try:
-                    model = clone(estimator).set_params(**candidates[candidate["index"]]).fit(X, y)
-                    attempt["diagnostics"] = _diagnostics(model)
-                    attempt["status"] = "nonconverged" if _nonconverged(model, caught) else "valid"
-                    if attempt["status"] == "valid":
-                        fitted, selected = model, candidate
-                except Exception as error:
-                    attempt.update(status="failed", error_type=type(error).__name__, error=str(error))
-            attempt["warnings"] = _warning_records(caught)
-            attempt["seconds"] = time.perf_counter() - attempt_start
-            report["final_fit_seconds"] += attempt["seconds"]
-            report["final_fit_attempts"].append(attempt)
-            checkpoint()
-            if fitted is not None:
-                break
-        if fitted is None:
-            fallback_start = time.perf_counter()
-            fitted = DummyClassifier(strategy="most_frequent").fit(X, y)
-            seconds = time.perf_counter() - fallback_start
-            report["final_fit_seconds"] += seconds
-            report["final_fit_attempts"].append({"status": "fallback", "seconds": seconds,
-                                                "reason": "No candidate passed all folds and final refit."})
-    report.update(state="completed", is_fallback=selected is None,
-                  selected_candidate_index=None if selected is None else selected["index"],
-                  selected_parameters=None if selected is None else selected["parameters"],
-                  tuning_complete=False, defaults_frozen=False,
-                  refinement=refinement_diagnostics(candidates, None if selected is None else selected["parameters"]))
-    checkpoint()
-    return CalibrationResult(fitted, report)
+        return CalibrationResult(fitted, report)
+
+
+def _unique_native_groups(values, *, return_inverse=False):
+    """Reuse exact uniform finite native groups without a sort.
+
+    Only already validated owned numeric arrays reach this private helper.
+    Nonuniform and empty arrays retain NumPy's original unique operation.
+    Zero inverse codes preserve the original indexing/counting semantics.
+    """
+    if values.size and values[0] == values[-1] and np.all(values == values[0]):
+        unique = values[:1].copy()
+        if return_inverse:
+            return unique, np.zeros(values.size, dtype=np.intp)
+        return unique
+    return np.unique(values, return_inverse=return_inverse)
 
 
 def _evaluation_metadata(y, classes, *, sample_ids, groups, train_sample_ids,
@@ -546,13 +704,16 @@ def _evaluation_metadata(y, classes, *, sample_ids, groups, train_sample_ids,
     for name, value in (("min_class_support", min_class_support), ("min_groups", min_groups)):
         if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value < 1:
             raise ValueError(f"{name} must be a positive integer.")
-    sample_ids = validate_metadata(sample_ids, len(y), name="sample_ids", unique=True)
-    groups = validate_metadata(groups, len(y), name="groups")
+    sample_ids, sample_id_identity = _validated_unique_metadata(sample_ids, len(y), name="sample_ids")
+    groups, group_native = _validate_metadata_snapshot(groups, len(y), name="groups")
     train_count = None
     if train_y is not None:
+        raw_train_y = train_y
         train_y = np.asarray(train_y)
-        if (train_y.ndim != 1 or not len(train_y)
-                or not np.all(np.isin(train_y, classes)) or len(np.unique(train_y)) != 2):
+        if train_y.ndim != 1 or not len(train_y):
+            raise ValueError("train_y must contain both fitted binary classes in a one-dimensional array.")
+        _validate_class_labels(raw_train_y, train_y)
+        if not np.all(np.isin(train_y, classes)) or len(np.unique(train_y)) != 2:
             raise ValueError("train_y must contain both fitted binary classes in a one-dimensional array.")
         train_count = len(train_y)
     for name, values in (("train_sample_ids", train_sample_ids), ("train_groups", train_groups)):
@@ -564,28 +725,119 @@ def _evaluation_metadata(y, classes, *, sample_ids, groups, train_sample_ids,
                 train_count = len(array)
     if train_count == 0:
         raise ValueError("Training metadata must not be empty.")
-    train_sample_ids = validate_metadata(train_sample_ids, train_count, name="train_sample_ids", unique=True)
-    train_groups = validate_metadata(train_groups, train_count, name="train_groups")
+    train_sample_ids, train_sample_id_identity = _validated_unique_metadata(train_sample_ids, train_count, name="train_sample_ids")
+    train_groups, train_group_native = _validate_metadata_snapshot(train_groups, train_count, name="train_groups")
     if train_sample_ids is not None:
         if sample_ids is None:
             raise ValueError("sample_ids are required when train_sample_ids are supplied.")
         # Each validated array has one ID family. Compare without coercing IDs.
         if isinstance(train_sample_ids[0], str) != isinstance(sample_ids[0], str):
             raise ValueError("Training and evaluation sample IDs must use the same identifier type (numeric or string).")
-        if set(_metadata_keys(train_sample_ids).tolist()) & set(_metadata_keys(sample_ids).tolist()):
+        if _metadata_overlap(train_sample_ids, train_sample_id_identity,
+                             sample_ids, sample_id_identity):
             raise ValueError("Training and evaluation sample IDs must not overlap.")
-    group_keys = None if groups is None else _metadata_keys(groups)
-    group_set = None if group_keys is None else set(group_keys.tolist())
-    train_group_set = None if train_groups is None else set(_metadata_keys(train_groups).tolist())
+    # Preserve the original point of group work: sample-ID rejection has
+    # already completed. All grouping uses the snapshots validated above.
+    group_unique = train_group_unique = None
+    group_inverse = None
+    mixed_group_disjoint = False
+    mixed_group_overlap = None
+    native_groups = (group_native is not None
+                     and group_native.dtype.type in _NATIVE_ID_TYPES
+                     and (train_groups is None
+                          or (train_group_native is not None
+                              and train_group_native.dtype.type in _NATIVE_ID_TYPES)))
+    # Bound the complete canonical workload; pure primitive fast sets stay.
+    if (native_groups
+            and (group_native.dtype.type is np.longdouble
+                 or (train_group_native is not None
+                     and train_group_native.dtype.type is np.longdouble))
+            and len(group_native) + (0 if train_group_native is None
+                                     else len(train_group_native)) <= 8
+            and type(y) is np.ndarray and y.ndim == 1 and y.dtype.kind in "biufUS"
+            and type(classes) is np.ndarray and classes.ndim == 1
+            and classes.dtype.kind in "biufUS"):
+        native_groups = False
+    if native_groups and group_native.dtype.type is np.longdouble:
+        group_unique, group_inverse = _unique_native_groups(group_native, return_inverse=True)
+        if (train_groups is not None
+                and (group_native.dtype == train_group_native.dtype
+                     or train_group_native.dtype.type is np.longdouble)):
+            train_group_unique = _unique_native_groups(train_group_native)
+        group_keys = group_set = train_group_set = None
+        if train_groups is not None and train_group_unique is None:
+            train_group_set = set(train_groups.tolist())
+    elif native_groups:
+        # Exact primitive snapshots convert to Python int/float objects.
+        group_keys = groups
+        group_set = set(group_keys.tolist())
+        if (train_groups is not None
+                and group_native.dtype != train_group_native.dtype
+                and train_group_native.dtype.type is np.longdouble):
+            train_group_unique = _unique_native_groups(train_group_native)
+            train_group_set = None
+        else:
+            train_group_set = None if train_groups is None else set(train_groups.tolist())
+    else:
+        # Keep the complete original key order for mixed types and subclasses.
+        group_keys = None if groups is None else _metadata_keys(groups)
+        group_set = None if group_keys is None else set(group_keys.tolist())
+        train_group_set = None if train_groups is None else set(_metadata_keys(train_groups).tolist())
+    if (native_groups and train_groups is not None
+            and group_native.dtype != train_group_native.dtype
+            and (group_unique is not None or train_group_unique is not None)):
+        # Canonicalize only endpoints first. Python numeric keys compare
+        # exactly across formats; native arrays never undergo mixed coercion.
+        query_bounds = (None if not group_unique.size else
+                        _metadata_keys(np.asarray(group_unique[[0, -1]], dtype=object))) if group_unique is not None else (
+                            None if not group_set else (min(group_set), max(group_set)))
+        training_bounds = (None if not train_group_unique.size else
+                           _metadata_keys(np.asarray(train_group_unique[[0, -1]], dtype=object))) if train_group_unique is not None else (
+                               None if not train_group_set else (min(train_group_set), max(train_group_set)))
+        if query_bounds is not None and training_bounds is not None:
+            mixed_group_disjoint = bool(query_bounds[1] < training_bounds[0]
+                                        or training_bounds[1] < query_bounds[0])
+        if not mixed_group_disjoint:
+            comparison_dtype = _exact_metadata_promotion(
+                group_native.dtype, train_group_native.dtype,
+                query_bounds, training_bounds)
+            if comparison_dtype is not None:
+                # Only comparison values widen. Native counts, inverse codes,
+                # original report objects and caller storage remain unchanged.
+                query_comparison = (group_unique if group_unique is not None
+                                    else np.unique(group_native))
+                training_comparison = (train_group_unique if train_group_unique is not None
+                                       else np.unique(train_group_native))
+                query_comparison = query_comparison.astype(comparison_dtype, copy=False)
+                training_comparison = training_comparison.astype(comparison_dtype, copy=False)
+                # Group promotion is complete here; two-field identities
+                # deliberately bypass the sample-only promotion route.
+                mixed_group_overlap = _metadata_overlap(
+                    groups, (query_comparison, None),
+                    train_groups, (training_comparison, None))
+                del query_comparison, training_comparison
+            else:
+                if group_set is None:
+                    group_set = _native_float_key_set(group_unique)
+                    if group_set is None:
+                        group_set = set(_metadata_keys(np.asarray(group_unique, dtype=object)).tolist())
+                if train_group_set is None:
+                    train_group_set = _native_float_key_set(train_group_unique)
+                    if train_group_set is None:
+                        train_group_set = set(_metadata_keys(np.asarray(train_group_unique, dtype=object)).tolist())
     if train_groups is not None:
         if groups is None:
             raise ValueError("groups are required when train_groups are supplied.")
         if isinstance(train_groups[0], str) != isinstance(groups[0], str):
             raise ValueError("Training and evaluation groups must use the same identifier type (numeric or string).")
-        if train_group_set & group_set:
+        if (mixed_group_overlap if mixed_group_overlap is not None else
+                not mixed_group_disjoint and (_metadata_overlap(train_groups, (train_group_unique, train_group_set),
+                                      groups, (group_unique, group_set))
+                    if group_unique is not None else train_group_set & group_set)):
             raise ValueError("Training and evaluation groups must not overlap.")
     counts = [int(np.sum(y == label)) for label in classes]
-    group_count = None if group_set is None else len(group_set)
+    group_count = (len(group_unique) if group_unique is not None
+                   else None if group_set is None else len(group_set))
     low_class_support = min(counts) < min_class_support
     low_group_support = group_count is not None and group_count < min_groups
     metadata = {
@@ -598,10 +850,18 @@ def _evaluation_metadata(y, classes, *, sample_ids, groups, train_sample_ids,
         "sample_overlap_checked": train_sample_ids is not None,
         "group_overlap_checked": train_groups is not None,
         "training_sample_count": train_count,
-        "training_group_count": None if train_group_set is None else len(train_group_set),
+        "training_group_count": (None if train_groups is None else
+                                 len(train_group_unique) if train_group_unique is not None
+                                 else len(train_group_set)),
     }
     if groups is not None:
-        metadata["per_class_group_count"] = [len(set(group_keys[y == label].tolist())) for label in classes]
+        if group_unique is not None:
+            metadata["per_class_group_count"] = [
+                int(np.count_nonzero(np.bincount(group_inverse[y == label],
+                                                minlength=len(group_unique))))
+                for label in classes]
+        else:
+            metadata["per_class_group_count"] = [len(set(group_keys[y == label].tolist())) for label in classes]
     if train_y is None:
         baseline = {"available": False, "reason": "Training labels were not supplied; majority class was not inferred from evaluation labels."}
     else:
@@ -613,6 +873,67 @@ def _evaluation_metadata(y, classes, *, sample_ids, groups, train_sample_ids,
                     "accuracy": float(np.mean(y == majority)),
                     "balanced_accuracy": 0.5 if min(counts) > 0 else None}
     return sample_ids, groups, metadata, baseline
+
+
+def _evaluation_pipeline_can_share(estimator):
+    """Also admit subclasses inheriting Pipeline's public prediction methods."""
+    if Pipeline not in type(estimator).__mro__:
+        return False
+    missing = object()
+    for name in ("predict", "predict_proba", "decision_function",
+                 "__getattribute__", "__getattr__", "__dict__"):
+        if getattr_static(estimator, name, missing) is not getattr_static(Pipeline, name, missing):
+            return False
+    return _evaluation_head_has_plain_prediction_access(estimator.steps[-1][1])
+
+
+def _evaluation_head_has_plain_prediction_access(head):
+    """Decline dynamic lookup/descriptor policies without evaluating them.
+
+    Existing adapter families' custom methods/callables delegate directly.
+    Dynamic score descriptors retain the whole Pipeline lookup/call sequence.
+    """
+    if not any(base in type(head).__mro__
+               for base in (KNeighborsClassifier, LogisticRegression, LinearSVC)):
+        return False
+    if (getattr_static(type(head), "__getattribute__", object.__getattribute__)
+            is not object.__getattribute__
+            or getattr_static(type(head), "__getattr__", None) is not None):
+        return False
+    for name in ("predict", "predict_proba", "decision_function"):
+        member = getattr_static(head, name, None)
+        if (member is not None and type(member) not in (FunctionType, MethodType)
+                and getattr_static(type(member), "__get__", None) is not None):
+            return False
+    return True
+
+
+def _evaluation_ordinary_numpy_error_policy():
+    """Retain native operations for explicit error and callback policies."""
+    return (np.geterr() == {"divide": "warn", "over": "warn",
+                            "under": "ignore", "invalid": "warn"}
+            and np.geterrcall() is None)
+
+
+def _evaluation_knn_can_reuse(head, coordinates):
+    """A narrow stock KNN boundary; callbacks keep native call order."""
+    return (type(head) is KNeighborsClassifier
+            and not any(name in vars(head) for name in
+                        ("predict", "predict_proba", "kneighbors"))
+            and type(head.weights) is str and head.weights in ("uniform", "distance")
+            and type(head.metric) is str and head.metric != "pyfunc"
+            and type(coordinates) in (np.ndarray, np.memmap)
+            and _evaluation_ordinary_numpy_error_policy())
+
+
+def _evaluation_svc_can_reuse(head):
+    """Keep native binary SVC thresholding only for inherited stock methods."""
+    if LinearSVC not in type(head).__mro__:
+        return False
+    missing = object()
+    return (all(getattr_static(head, name, missing) is getattr_static(LinearSVC, name, missing)
+                for name in ("predict", "decision_function", "predict_proba"))
+            and _evaluation_ordinary_numpy_error_policy())
 
 
 def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
@@ -631,13 +952,29 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
     Ranking metrics use probabilities when available, otherwise genuine binary
     decision margins oriented toward ``classes_[1]``. Margins are recorded
     separately and are never converted into purported probabilities.
+
+    Explicit combined prediction methods keep their own contract. Eligible
+    pipelines share preprocessing once; custom outer prediction methods use
+    the supplied pipeline APIs. Stock KNN and linear-SVM score reuse preserves
+    native decisions, with native calls for uncertain weighted votes, custom
+    prediction behavior and explicit NumPy error/handler policies. Warnings
+    describe operations actually performed; invalid scores still fail, but
+    their default-warning order or duplication may differ from two calls.
+
+    ``threads`` accepts positive Python/NumPy integer scalars within the native
+    C-int range. Boolean, temporal, floating-point and array values are rejected
+    before prediction or native-runtime initialization.
     """
+    threads = _validate_threads(threads)
+    raw_y = y
     X, y = check_X_y(X, y)
-    classes = np.asarray(estimator.classes_)
+    _validate_class_labels(raw_y, y)
+    raw_classes = estimator.classes_
+    classes = np.asarray(raw_classes)
+    _validate_class_labels(raw_classes, classes)
+    _validate_class_label(getattr(estimator, "positive_label_", None))
     if len(classes) != 2 or not np.all(np.isin(y, classes)):
         raise ValueError("Evaluation labels must belong to the fitted binary classes.")
-    if isinstance(threads, bool) or not isinstance(threads, int) or threads < 1:
-        raise ValueError("threads must be a positive integer.")
     sample_ids, groups, support_diagnostics, majority_reference = _evaluation_metadata(
         y, classes, sample_ids=sample_ids, groups=groups, train_sample_ids=train_sample_ids,
         train_groups=train_groups, train_y=train_y, min_class_support=min_class_support,
@@ -657,32 +994,40 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
                   and not hasattr(estimator, "predict_proba")):
                 predicted, margin = estimator.predict_with_decision_function(X)
                 prediction_operation = "joint_label_and_margin_prediction_one_projection"
-            elif isinstance(estimator, Pipeline) and isinstance(estimator.steps[-1][1], KNeighborsClassifier):
-                projected = estimator[:-1].transform(X) if len(estimator.steps) > 1 else X
-                knn = estimator.steps[-1][1]
-                all_probabilities = knn.predict_proba(projected)
-                predicted = knn.classes_[np.argmax(all_probabilities, axis=1)]
-                probability = all_probabilities[:, 1]
-                prediction_operation = "joint_label_and_probability_prediction_one_projection"
-            elif isinstance(estimator, KNeighborsClassifier):
+            elif _evaluation_pipeline_can_share(estimator):
+                check_is_fitted(estimator)
+                projected = X
+                for _, _, transform in estimator._iter(with_final=False):
+                    projected = transform.transform(projected)
+                head = estimator.steps[-1][1]
+                if _evaluation_knn_can_reuse(head, projected):
+                    all_probabilities = head.predict_proba(projected)
+                    predicted = (head.classes_[all_probabilities.argmax(axis=1)]
+                                 if _knn_probabilities_preserve_labels(head, projected, all_probabilities)
+                                 else head.predict(projected))
+                    probability = all_probabilities[:, 1]
+                    prediction_operation = "joint_label_and_probability_prediction_one_projection"
+                elif _evaluation_svc_can_reuse(head):
+                    margin = head.decision_function(projected)
+                    predicted = head.classes_[(margin > 0).astype(np.intp)]
+                    prediction_operation = "joint_label_and_margin_prediction_one_projection"
+                else:
+                    predicted = head.predict(projected)
+                    if hasattr(estimator, "predict_proba"):
+                        probability = head.predict_proba(projected)[:, 1]
+                        prediction_operation = "joint_label_and_probability_prediction_one_projection"
+                    elif hasattr(estimator, "decision_function"):
+                        margin = head.decision_function(projected)
+                        prediction_operation = "joint_label_and_margin_prediction_one_projection"
+                    else:
+                        prediction_operation = "predict_only"
+            elif _evaluation_knn_can_reuse(estimator, X):
                 all_probabilities = estimator.predict_proba(X)
-                predicted = estimator.classes_[np.argmax(all_probabilities, axis=1)]
+                predicted = (estimator.classes_[all_probabilities.argmax(axis=1)]
+                             if _knn_probabilities_preserve_labels(estimator, X, all_probabilities)
+                             else estimator.predict(X))
                 probability = all_probabilities[:, 1]
                 prediction_operation = "joint_label_and_probability_prediction_no_projection"
-            elif isinstance(estimator, Pipeline) and isinstance(estimator.steps[-1][1], LogisticRegression):
-                projected = estimator[:-1].transform(X) if len(estimator.steps) > 1 else X
-                logistic = estimator.steps[-1][1]
-                # Keep sklearn's decision-score tie rule. Probability rounding
-                # can produce a 0.5 tie for a small nonzero decision score.
-                predicted = logistic.predict(projected)
-                probability = logistic.predict_proba(projected)[:, 1]
-                prediction_operation = "joint_label_and_probability_prediction_one_projection"
-            elif isinstance(estimator, Pipeline) and isinstance(estimator.steps[-1][1], LinearSVC):
-                projected = estimator[:-1].transform(X) if len(estimator.steps) > 1 else X
-                svm = estimator.steps[-1][1]
-                margin = svm.decision_function(projected)
-                predicted = svm.classes_[(margin > 0).astype(int)]
-                prediction_operation = "joint_label_and_margin_prediction_one_projection"
             else:
                 predicted = estimator.predict(X)
                 if hasattr(estimator, "predict_proba"):
@@ -699,6 +1044,7 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
                 margin = np.asarray(margin)
                 if margin.shape != (len(y),) or not np.all(np.isfinite(margin)):
                     raise ValueError("Decision margins must be a finite one-dimensional binary score.")
+            predicted = _validate_class_labels(predicted)
         except Exception as error:
             return {"status": "failed", "error_type": type(error).__name__, "error": str(error),
                     "prediction_seconds": time.perf_counter() - start,
@@ -931,19 +1277,37 @@ def comparison_models(*, random_state=0, quick=False, max_iter=20000, tol=1e-4,
 
 
 def run_comparison(models, X_train, y_train, X_validation, y_validation, *,
-                   output_dir, seed=0, threads=1, validation_ids=None, signal_support=None):
+                   output_dir, seed=0, threads=1, validation_ids=None, signal_support=None,
+                   scoring="accuracy"):
     """Save each model independently; resume only exactly compatible results.
 
     Validation is development data, never evidence that defaults are finalized.
     No test-set loading, default selection, or claimed reproduction occurs here.
+    ``scoring`` chooses the common training-CV objective for all methods;
+    development evaluation still reports its full set of classification metrics.
+
+    ``threads`` follows the same integer-count contract as calibration and
+    evaluation. The generated-fold ``seed`` follows sklearn's random-state
+    contract, including None and RandomState; both controls are checked before
+    output creation. Seed preflight does not draw random numbers. Completed
+    compatible results retain the existing reuse policy; use a fixed integer
+    seed for reproducible new comparisons.
     """
+    threads = _validate_threads(threads)
+    # Validate the consumed generic seed without drawing from mutable/global RNGs.
+    # Keep sklearn's existing None/RandomState contract and the original identity.
+    check_random_state(seed)
+    scoring = _validate_scoring(scoring)
+    y_train = _validate_class_labels(y_train)
+    y_validation = _validate_class_labels(y_validation)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     results = {}
     for name, (estimator, grid) in models.items():
         if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
             raise ValueError("Model names must contain only letters, digits, underscore or hyphen.")
-        identity = _search_identity(estimator, list(ParameterGrid(grid)), X_train, y_train, 5, seed, threads)
+        identity = _search_identity(estimator, list(ParameterGrid(grid)), X_train, y_train, 5, seed, threads,
+                                    scoring=scoring)
         comparison_fingerprint = _digest({"calibration": identity,
                                           "validation": data_fingerprint(X_validation, y_validation),
                                           "validation_ids": validation_ids, "signal_support": signal_support})
@@ -955,8 +1319,11 @@ def run_comparison(models, X_train, y_train, X_validation, y_validation, *,
             results[name] = existing
             continue
         calibrated = calibration_search(estimator, grid, X_train, y_train, cv=5, seed=seed,
-                                        threads=threads, checkpoint_path=output_dir / f"{name}-cv.json")
+                                        threads=threads, checkpoint_path=output_dir / f"{name}-cv.json",
+                                        scoring=scoring)
         record = {"model": name, "comparison_fingerprint": comparison_fingerprint,
+                  "scoring": scoring,
+                  "selected_mean_score": calibrated.report["selected_mean_score"],
                   "is_fallback": calibrated.report["is_fallback"],
                   "selected_parameters": calibrated.report["selected_parameters"],
                   "tuning_seconds": calibrated.report["tuning_seconds"],
@@ -975,6 +1342,7 @@ def run_comparison(models, X_train, y_train, X_validation, y_validation, *,
         write_json(result_path, record)
         results[name] = record
     summary = {"author": "Chang Cheng", "phase": "development_comparison",
+               "scoring": scoring,
                "defaults_frozen": False, "tuning_complete": False,
                "remaining_work": ["Expand unconstrained boundary optima and refine interior intervals.",
                                   "Repeat experiments and verify numerical convergence.",

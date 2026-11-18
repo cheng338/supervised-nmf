@@ -158,8 +158,34 @@ the unresolved conflict. If no solver qualifies numerically, do not finalize.
 
 Sensitivity analyses vary accuracy margins, prediction workload, inclusion of
 tuning compute and omission of a dataset, task or seed as specified in JSON.
-They are descriptive, not a basis for silently replacing the primary rule. The
-[theory review](theory-implementation.md) continues to apply conditionally to
+They are descriptive, not a basis for silently replacing the primary rule.
+
+The reporter requires finite, strictly positive primary and sensitivity margins
+and, when used, a finite, strictly positive sensitivity task multiplier. Boolean
+values are not numeric settings. In `choose`, omitting `margin` (or passing
+`None`) uses the three independent primary limits. Supplying a sensitivity margin
+uses that value for both global and dataset limits and multiplies it by the
+sensitivity task multiplier for the task limit, including when it equals the
+primary global limit.
+The full report validates every listed sensitivity margin before computing any
+decision, even when no method is eligible. A listed `null` is invalid; it does not
+request another primary calculation.
+
+Effective task margins must remain positive and finite after multiplication, and
+normalized regrets must remain finite and nonnegative. Invalid or unrepresentable
+values raise a `ValueError` identifying the offending control or regret instead
+of entering the ranking or producing nonfinite JSON. Small positive margins have
+no arbitrary lower cutoff, but their calculations must satisfy those range
+requirements. Numerical comparison slack is separately required to be finite
+and nonnegative; its default remains 1e-12, and an explicit zero is allowed.
+
+Zero margins are unsupported by this normalized-regret policy. A strict no-loss
+sensitivity would need an explicitly declared fallback when no solver passes
+every gate. The frozen four-solver protocols use positive limits and retain their
+original rules. These checks do not make the historical reporter a general
+custom-protocol reporting interface.
+
+The [theory review](theory-implementation.md) continues to apply conditionally to
 the fitted representation maps; observed classification accuracy or convergence does not prove
 latent-factor recovery or consistency.
 

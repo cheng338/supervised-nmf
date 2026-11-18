@@ -37,6 +37,7 @@ from sklearn.pipeline import Pipeline
 from threadpoolctl import threadpool_limits
 
 from supervised_nmf.classifier import NMFClassifier
+from supervised_nmf import classifier as classifier_module
 from supervised_nmf.decomposition import FeatureSPA
 from supervised_nmf.evaluation import (
     _diagnostics, _digest, _nonconverged, _warning_records,
@@ -44,6 +45,9 @@ from supervised_nmf.evaluation import (
     new_run_directory, provenance, write_json,
 )
 from supervised_nmf.screening import BinaryScreening
+
+_SOURCE_SHA256_AT_IMPORT = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
 
 ATTRIBUTES = ("Smiling", "Wearing_Necktie")
 STAGES = (
@@ -106,14 +110,44 @@ class _StageProfiler:
 
         self._stack.enter_context(patch.object(cls, method, timed))
 
+    def _wrap_nmf_projection(self, name):
+        # Replacing NMF.transform changes MU eligibility and therefore policy.
+        # Observe the classifier's existing dispatch boundary instead. SPA/PCA
+        # retain their own wrappers; no transform is performed a second time.
+        original = getattr(classifier_module, name)
+
+        @wraps(original)
+        def timed(decomposition, *args, **kwargs):
+            stages = {"fit": "training_projection_seconds",
+                      "prediction": "decomposition_projection_seconds"}
+            stage = stages.get(self.phase)
+            if type(decomposition) is not NMF or stage is None:
+                return original(decomposition, *args, **kwargs)
+            start = time.perf_counter()
+            try:
+                return original(decomposition, *args, **kwargs)
+            finally:
+                self.seconds[stage] += time.perf_counter() - start
+                self.calls[stage] += 1
+
+        self._stack.enter_context(patch.object(classifier_module, name, timed))
+
     def __enter__(self):
         try:
             self._wrap(BinaryScreening, "fit_transform", {"fit": "screening_fit_seconds"})
             self._wrap(BinaryScreening, "transform", {"prediction": "screening_prediction_seconds"})
-            for cls in (NMF, FeatureSPA, PCA):
-                self._wrap(cls, "fit_transform", {"fit": "decomposition_fit_seconds"})
-                self._wrap(cls, "transform", {"fit": "training_projection_seconds",
-                                              "prediction": "decomposition_projection_seconds"})
+            # NMFClassifier fits SPA's anchor/basis first, then projects training
+            # observations separately. Wrapping fit_transform would miss that
+            # fit and, for direct transformer use, include projection in the
+            # factorization timer. CD/MU and PCA retain fit_transform training.
+            for cls, method in ((NMF, "fit_transform"), (FeatureSPA, "fit"),
+                                (PCA, "fit_transform")):
+                self._wrap(cls, method, {"fit": "decomposition_fit_seconds"})
+                if cls is not NMF:
+                    self._wrap(cls, "transform", {"fit": "training_projection_seconds",
+                                                  "prediction": "decomposition_projection_seconds"})
+            for name in ("transform_mu", "transform_mu_rowwise"):
+                self._wrap_nmf_projection(name)
             for cls in (KNeighborsClassifier, DummyClassifier):
                 self._wrap(cls, "fit", {"fit": "classifier_fit_seconds"})
                 self._wrap(cls, "predict_proba", {"prediction": "classifier_prediction_seconds"})
@@ -161,8 +195,7 @@ def _expected_stages(estimator):
         expected.update(("decomposition_fit_seconds", "decomposition_projection_seconds"))
         if estimator.screening != "none":
             expected.add("screening_fit_seconds")
-        if (estimator.training_coordinates == "transform"
-                or (estimator.training_coordinates == "auto" and estimator.solver == "spa")):
+        if estimator.solver == "spa" or estimator.training_coordinates == "transform":
             expected.add("training_projection_seconds")
     elif isinstance(estimator, Pipeline):
         expected.update(("screening_fit_seconds", "screening_prediction_seconds"))
@@ -319,7 +352,7 @@ def profile_study(run, cache, *, output=None, repeats=1):
                   "Original selected parameters are reused; validation predictions verify reproduction only.",
                   "Components are nested within total fit/prediction; do not add components to those totals.",
                   "Zero decomposition means the method has no MF/PCA; screening-only and raw KNN have none.",
-                  "Screening fit wraps original fit_transform; decomposition fit wraps original fit_transform.",
+                  "Screening fit wraps original fit_transform; SPA decomposition wraps fit, and CD/MU/PCA wrap fit_transform.",
                   "Prediction time is evaluate_classifier's joint labels/probabilities operation, excluding metrics.",
                   "NMF prediction column slicing is in total prediction but not screening_prediction_seconds.",
                   "Wrapping methods adds small measurement overhead; these serial fits differ from parallel CV load.",

@@ -65,8 +65,8 @@ def test_fit_transform_uses_the_fitted_projection(binary_data, solver, classifie
     transformed = estimator.fit_transform(X, y)
     assert isinstance(transformed, np.ndarray)
     assert transformed.dtype == X.dtype == np.dtype("float64")
-    np.testing.assert_array_equal(transformed, reference.transform(X))
-    np.testing.assert_array_equal(transformed, estimator.transform(X))
+    np.testing.assert_allclose(transformed, reference.transform(X), rtol=2e-12, atol=2e-12)
+    np.testing.assert_allclose(transformed, estimator.transform(X), rtol=2e-12, atol=2e-12)
     np.testing.assert_array_equal(estimator.training_coordinates_, reference.training_coordinates_)
     np.testing.assert_array_equal(estimator.predict(query), reference.predict(query))
     if classifier == "linear_svm":
@@ -76,14 +76,16 @@ def test_fit_transform_uses_the_fitted_projection(binary_data, solver, classifie
     assert estimator.training_coordinates_mode_ == reference.training_coordinates_mode_
 
 
-def test_legacy_spa_training_coordinates_are_not_the_transformer_return(binary_data):
+def test_explicit_spa_training_coordinates_match_the_transformer_return(binary_data):
     X, y, _ = binary_data
     estimator = model(training_coordinates="fit_transform")
     transformed = estimator.fit_transform(X, y)
-    np.testing.assert_array_equal(estimator.training_coordinates_, estimator.decomposition_.fit_coordinates_)
+    # Fit and public transform can present different memory layouts to BLAS;
+    # the coordinate map must agree to numerical tolerance, not bitwise.
+    np.testing.assert_allclose(estimator.training_coordinates_, transformed, rtol=2e-12, atol=2e-12)
     np.testing.assert_array_equal(estimator.classifier_._fit_X, estimator.training_coordinates_)
-    np.testing.assert_array_equal(transformed, estimator.transform(X))
-    assert not np.allclose(transformed, estimator.training_coordinates_, rtol=1e-6, atol=1e-8)
+    np.testing.assert_allclose(transformed, estimator.transform(X), rtol=2e-12, atol=2e-12)
+    assert not np.allclose(transformed, estimator.decomposition_.fit_coordinates_, rtol=1e-6, atol=1e-8)
 
 
 @pytest.mark.parametrize("explicit_none", [False, True])
@@ -114,9 +116,11 @@ def test_clone_pickle_and_projection_diagnostics_preserve_the_interface(binary_d
     with _capture_projection(estimator) as training_record:
         transformed = estimator.fit_transform(X, y)
     assert training_record is not None
-    assert training_record["last_transform_performed"]
+    assert not training_record["last_transform_performed"]
+    assert estimator.training_projection_performed_
+    assert estimator.training_projection_converged_
     assert training_record["last_transform_error"] is None
-    np.testing.assert_array_equal(transformed, estimator.transform(X))
+    np.testing.assert_allclose(transformed, estimator.transform(X), rtol=2e-12, atol=2e-12)
     expected = estimator.predict(query)
     restored = pickle.loads(pickle.dumps(estimator))
     assert is_classifier(restored)
@@ -148,13 +152,13 @@ def test_classifier_pipeline_and_cross_validation_keep_classifier_semantics(bina
     np.testing.assert_array_equal(actual, expected)
 
 
-def test_feature_pipeline_receives_projected_coordinates_in_legacy_mode(binary_data):
+def test_feature_pipeline_receives_projected_coordinates_in_explicit_mode(binary_data):
     X, y, query = binary_data
     features = model(training_coordinates="fit_transform")
     reference = clone(features).fit(X, y)
     head = KNeighborsClassifier(n_neighbors=3).fit(reference.transform(X), y)
     pipeline = Pipeline([("features", features), ("head", KNeighborsClassifier(n_neighbors=3))]).fit(X, y)
-    np.testing.assert_array_equal(pipeline.named_steps["head"]._fit_X, reference.transform(X))
+    np.testing.assert_allclose(pipeline.named_steps["head"]._fit_X, reference.transform(X), rtol=2e-12, atol=2e-12)
     np.testing.assert_array_equal(pipeline.predict(query), head.predict(reference.transform(query)))
 
 
@@ -172,7 +176,7 @@ def test_global_output_configuration_does_not_add_container_support(binary_data,
         queried = estimator.transform(query)
         prediction = estimator.predict(query)
     assert isinstance(transformed, np.ndarray) and isinstance(queried, np.ndarray)
-    np.testing.assert_array_equal(transformed, expected.transform(X))
+    np.testing.assert_allclose(transformed, expected.transform(X), rtol=2e-12, atol=2e-12)
     np.testing.assert_array_equal(queried, expected.transform(query))
     np.testing.assert_array_equal(prediction, expected.predict(query))
 

@@ -66,7 +66,17 @@ class NeighborReuseTests(unittest.TestCase):
                     actual, metadata, _ = reuse.predict(18)
                 np.testing.assert_array_equal(actual, reference)
                 self.assertFalse(metadata["accelerated"])
-                self.assertGreater(metadata["near_vote_rows"], 0)
+                if metadata.get("vote_checks_performed", True):
+                    self.assertGreater(metadata["near_vote_rows"], 0)
+                else:
+                    # A known boundary tie can precede all vote arithmetic.
+                    # Uncomputed diagnostics are not fabricated zero counts.
+                    self.assertGreater(metadata["near_boundary_rows"], 0)
+                    self.assertEqual(metadata["uncertainty_lower_bound_rows"],
+                                     metadata["near_boundary_rows"])
+                    for key in ("near_vote_rows", "near_threshold_rows",
+                                "invalid_vote_rows", "vote_guard", "uncertain_rows"):
+                        self.assertIsNone(metadata[key])
                 public.assert_called_once()
                 self.assertIs(public.call_args.args[0], Q)
                 self.assertEqual(metadata["public_fallback_query_rows"], len(Q))

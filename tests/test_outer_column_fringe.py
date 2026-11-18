@@ -10,7 +10,6 @@ import pytest
 from threadpoolctl import threadpool_limits
 from supervised_nmf import _aocl
 assert Path(_aocl.__file__).resolve()==ROOT/'src/supervised_nmf/_aocl.py'
-AXIS='column'
 POLICY='5e283198c322520ef8829590b1b4b7de55502b290281e9efc4f23bdbdd9b3efa'
 
 @pytest.fixture(autouse=True)
@@ -40,8 +39,7 @@ def layout(a,kind):
 @pytest.mark.parametrize('borrowed_view',[False,True])
 def test_two_full_k_products_preserve_padding_and_cover_output(monkeypatch,m,k,n,other_layout,borrowed_view):
     a,b=operands(m,k,n)
-    if AXIS=='column':a=layout(a,other_layout);b=layout(b,'c_view' if borrowed_view else 'c')
-    else:b=layout(b,other_layout);a=layout(a,'c_view' if borrowed_view else 'c')
+    a=layout(a,other_layout);b=layout(b,'c_view' if borrowed_view else 'c')
     a.setflags(write=False);b.setflags(write=False);before=state(a),state(b)
     calls=[];allocated=[]
     class Proxy:
@@ -59,26 +57,15 @@ def test_two_full_k_products_preserve_padding_and_cover_output(monkeypatch,m,k,n
     mp,npad=(m+7)//8*8,(n+7)//8*8;mc,nc=m//8*8,n//8*8
     assert len(calls)==2 and [tag for tag,_ in allocated]==['zeros','zeros','empty']
     assert allocated[-1][1] is actual
-    if AXIS=='column':
-        assert [(x.shape,y.shape) for x,y,_ in calls]==[((mp,k),(k,nc)),((mp,k),(k,8))]
-        full,core,fringe=calls[0][0],calls[0][1],calls[1][1]
-        assert calls[1][0] is full and allocated[0][1] is full and allocated[1][1] is fringe
-        old=np.zeros((mp,k));old[:m]=a
-        np.testing.assert_array_equal(bits(full),bits(old))
-        assert np.shares_memory(core,b) and core.strides==b.strides
-        np.testing.assert_array_equal(bits(core),bits(b[:,:nc]))
-        np.testing.assert_array_equal(bits(fringe[:,:n-nc]),bits(b[:,nc:]))
-        assert not np.any(bits(fringe[:,n-nc:]))
-    else:
-        assert [(x.shape,y.shape) for x,y,_ in calls]==[((mc,k),(k,npad)),((8,k),(k,npad))]
-        core,full,fringe=calls[0][0],calls[0][1],calls[1][0]
-        assert calls[1][1] is full and allocated[0][1] is fringe and allocated[1][1] is full
-        old=np.zeros((k,npad));old[:,:n]=b
-        np.testing.assert_array_equal(bits(full),bits(old))
-        assert np.shares_memory(core,a) and core.strides==a.strides
-        np.testing.assert_array_equal(bits(core),bits(a[:mc]))
-        np.testing.assert_array_equal(bits(fringe[:m-mc]),bits(a[mc:]))
-        assert not np.any(bits(fringe[m-mc:]))
+    assert [(x.shape,y.shape) for x,y,_ in calls]==[((mp,k),(k,nc)),((mp,k),(k,8))]
+    full,core,fringe=calls[0][0],calls[0][1],calls[1][1]
+    assert calls[1][0] is full and allocated[0][1] is full and allocated[1][1] is fringe
+    old=np.zeros((mp,k));old[:m]=a
+    np.testing.assert_array_equal(bits(full),bits(old))
+    assert np.shares_memory(core,b) and core.strides==b.strides
+    np.testing.assert_array_equal(bits(core),bits(b[:,:nc]))
+    np.testing.assert_array_equal(bits(fringe[:,:n-nc]),bits(b[:,nc:]))
+    assert not np.any(bits(fringe[:,n-nc:]))
     for x in (full,fringe):assert x.dtype==np.float64 and x.flags.c_contiguous and x.flags.aligned
     np.testing.assert_array_equal(actual,reference(a,b))
     assert np.isfinite(actual).all() and actual.flags.owndata and actual.flags.c_contiguous and actual.flags.writeable and actual.base is None
@@ -89,15 +76,14 @@ class Subclass(np.ndarray):pass
 
 @pytest.mark.parametrize('kind',['f','strided','negative','float32','swapped','subclass','unaligned'])
 def test_borrowed_core_exclusions_keep_original_single_product(monkeypatch,kind):
-    a,b=operands(19,13,21);value=b if AXIS=='column' else a
+    a,b=operands(19,13,21);value=b
     if kind in ('f','strided'):value=layout(value,kind)
     elif kind=='negative':value=value[:,::-1].copy()[:,::-1]
     elif kind=='float32':value=value.astype(np.float32)
     elif kind=='swapped':value=value.astype(np.dtype(float).newbyteorder('S'))
     elif kind=='subclass':value=value.view(Subclass)
     else:value.setflags(align=False)
-    if AXIS=='column':b=value
-    else:a=value
+    b=value
     a.setflags(write=False);b.setflags(write=False);before=state(a),state(b);calls=[]
     class Proxy:
         def __getattr__(self,name):return getattr(np,name)
@@ -111,12 +97,11 @@ def test_borrowed_core_exclusions_keep_original_single_product(monkeypatch,kind)
 
 @pytest.mark.parametrize('kind',['float32','subclass','unaligned'])
 def test_other_operand_type_and_alignment_preserve_fallback(monkeypatch,kind):
-    a,b=operands(19,13,21);value=a if AXIS=='column' else b
+    a,b=operands(19,13,21);value=a
     if kind=='float32':value=value.astype(np.float32)
     elif kind=='subclass':value=value.view(Subclass)
     else:value.setflags(align=False)
-    if AXIS=='column':a=value
-    else:b=value
+    a=value
     calls=[]
     class Proxy:
         def __getattr__(self,name):return getattr(np,name)
@@ -127,8 +112,7 @@ def test_other_operand_type_and_alignment_preserve_fallback(monkeypatch,kind):
 
 def test_contiguous_singleton_with_noncanonical_stride_keeps_fallback(monkeypatch):
     a,b=operands(19,1,21)
-    if AXIS=='column':b=np.arange(21,dtype=float)[None,:];value=b
-    else:a=np.arange(19,dtype=float)[:,None];value=a
+    b=np.arange(21,dtype=float)[None,:];value=b
     assert value.flags.c_contiguous and value.strides!=(value.shape[1]*8,8)
     calls=[]
     class Proxy:

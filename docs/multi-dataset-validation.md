@@ -132,7 +132,11 @@ implementation and the earlier full-suite evidence remain unchanged.
 
 The protocol and machine-readable evidence are saved in
 `runs/multi-dataset-validation-20261006/`. Source caches are under the ignored
-`data/` directory. Reproduction uses `scripts/validate_multi_dataset.py` for
-`prepare`, `freeze`, `tune`, `finalize`, and `validate`, with the independent
-`scripts/audit_multi_dataset.py pretest` gate before `validate` and `posttest`
-afterwards. Existing completed test access cannot be repeated in that run.
+`data/` directory. Historical reproduction uses `scripts/validate_multi_dataset.py`
+(retained locally) for `prepare`, `freeze`, `tune`, `finalize`, and `validate`,
+with the independent `scripts/audit_multi_dataset.py pretest` gate (script
+retained locally) before `validate` and `posttest` afterwards. These commands
+require the frozen study source and runtime, prepared data caches, and
+focused-test receipts and logs retained in the local study workspace. A public
+source checkout or package installation alone does not supply these study
+inputs. Existing completed test access cannot be repeated in that run.

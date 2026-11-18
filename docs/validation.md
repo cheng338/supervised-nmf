@@ -193,9 +193,8 @@ The scoped finding-4c scientific comparison is available regardless of whether
 SPA wins. Four historical native failures remain recorded, and one earlier
 Smiling/PCA controller interruption still has an unknown duration and missing
 final process observations. The report consequently distinguishes complete
-scientific outcomes from an incomplete execution history. Chang Cheng authorized
-the subsequent [0.4.1 GitHub release](release-0.4.1.md) on October 29, 2026;
-no default or general methodological claim is changed by that decision.
+scientific outcomes from an incomplete execution history. Release remains
+paused; no default or general methodological claim is changed.
 
 ## October 6 implementation checks
 
@@ -781,3 +780,46 @@ the release scope and additional validation evidence.
 - Broader compatibility verification and any package-index
   publication. Chang Cheng's original work is All Rights Reserved while the
   distribution license remains undecided; see [LICENSE](../LICENSE).
+
+
+## Current regressions and archived qualification
+
+The default pytest suite checks current package behavior and rejects incompatible
+study requests. Current-consumer fixtures declare the installed package version
+before request fingerprints are computed. They do not replace package metadata,
+claim an old runtime, or rewrite saved experiment records.
+
+The original research checkout also contains tests marked `archived_qualification`.
+Those checks require the frozen study sources and runtime and are skipped by default.
+For example, the following command runs in the original three-label study checkout.
+
+```shell
+python -X faulthandler -m pytest --run-archived-qualification tests/test_three_label_compute.py
+```
+
+Replace the module in this example with the archived module being qualified.
+The option removes only the archive-selection skip; original runtime checks,
+study-specific numerical-smoke opt-ins and other prerequisites still apply.
+It neither restores an old environment nor authorizes a study run. Source
+fingerprint unit tests use controlled files and runtime records to exercise the
+actual fingerprint function; they do not certify an archived numerical study.
+
+Test-module collection restores native-thread environment settings changed by
+historical CLI imports. This does not undo native libraries already initialized
+by an import, and test bodies remain responsible for restoring their own state.
+Linux lifecycle tests require actual PID-safe process capabilities before
+spawning and reap only their owned synthetic process families.
+
+Supporting screening and worker utilities now close the arrays they open after
+their consumers finish, including exceptional exits. Caller-owned arrays remain
+open; cached and held-out views remain usable until their last consumer exits.
+This fixes resource leaks and Windows file-release failures without introducing
+extra matrix copies. It does not change core estimator mathematics or defaults.
+
+In the paired investigation, the total time for 21 representative utility calls
+changed by +0.45% on Windows AOCL and +0.50% on WSL MKL; both paired 95% intervals
+included zero. Individual retained costs included +2.78 ms for a Windows cached
+CV call and +0.40 ms in a WSL fresh representation-fit interval. These measured
+costs are disclosed for the resource-lifetime correction; timing neutrality is
+not claimed. Historical results below or elsewhere remain records of their
+original sources and environments, not qualification of the current checkout.

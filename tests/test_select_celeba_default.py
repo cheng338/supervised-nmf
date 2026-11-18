@@ -1,7 +1,8 @@
 """Synthetic default-selection regressions. Author: Chang Cheng.
 
-No estimator fits, private data, saved study outcomes or ignored protocol files
-are required. The literal decision fixture preserves the version-1 rule.
+No private data, saved study outcomes or ignored protocol files are required.
+The literal decision fixture preserves the version-1 rule; a tiny current-source
+calibration fixture separately checks the current receipt schema.
 """
 
 from copy import deepcopy
@@ -18,6 +19,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import numpy as np
 from sklearn.model_selection import ParameterGrid
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -159,6 +161,131 @@ def build_fixture(run, protocol_path):
     write(run / "comparison.json", {"state": "development_evaluation_completed", "configuration_sha256": identity,
                                    "jobs": evaluations, "official_test_loaded": False}, True)
     return configuration, summaries, evaluations
+
+
+class CurrentSchemaReceiptTests(unittest.TestCase):
+    def test_current_calibration_receipts_and_rechecksummed_tampering(self):
+        from scripts.celeba_default_study import _estimator
+        from supervised_nmf.study import calibration_knn_grid
+
+        rng = np.random.default_rng(734)
+        y = np.arange(40) % 2
+        X = rng.uniform(.1, 1, (40, 8)) + y[:, None] * .2
+        grid = {"n_components": [2], "score_threshold": [0], "n_neighbors": [3]}
+        job = {"id": "current-spa", "cache": "training-fixture", "attribute": "Smiling",
+               "method": "screened_spa_absolute", "seed": 7, "max_iter": 1000, "tol": 1e-4}
+        points = list(ParameterGrid(grid))
+        plan = {"job": job, "candidates": points,
+                "chunks": [{"id": "c0000", "candidate_indices": [0], "grid": grid}]}
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            report = calibration_knn_grid(_estimator(job), grid, X, y, cv=5, seed=7,
+                                          scoring="balanced_accuracy", checkpoint_dir=directory / "c0000")
+            calibration = report["identity"]["calibration"]
+            configuration = {"sources": {"package_source_sha256": calibration["source_sha256"]},
+                "caches": {job["cache"]: {"manifest": {"splits": {"train": {"attributes": {
+                    "Smiling": {"data_sha256": calibration["data_sha256"]}}}}}}}}
+            candidates = [{**row, "chunk": "c0000"} for row in report["candidates"]]
+            self.assertTrue(candidates[0]["valid"])
+            summary = {"state": "cv_completed", "job": job, "configuration_sha256": selector.digest(configuration),
+                "official_test_loaded": False, "candidates": candidates, "selected_candidate": candidates[0],
+                "selected_parameters": points[0], "cv_balanced_accuracy": candidates[0]["mean_balanced_accuracy"],
+                "compute_seconds": report["compute_seconds"], "tuning_compute_seconds": sum(report["compute_seconds"].values()),
+                "report_receipts": {"c0000": selector.digest(report)}}
+            self.assertEqual(selector.check_cv_summary(summary, plan, configuration, selector.Inputs(), directory), [])
+            relocated = deepcopy(report)
+            def relocate(value):
+                if isinstance(value, dict):
+                    if set(value) == {"path", "sha256"}:
+                        value["path"] = "/archive/relocated/source/" + value["path"].rsplit("/", 1)[-1]
+                    else:
+                        for item in value.values():
+                            relocate(item)
+                elif isinstance(value, list):
+                    for item in value:
+                        relocate(item)
+            relocated_calibration = relocated["identity"]["calibration"]
+            relocate(relocated_calibration["structural_configuration"])
+            relocated_calibration["implementation_source"] = {
+                key.split("@", 1)[0] + "@/archive/relocated/source/" + key.rsplit("/", 1)[-1]: value
+                for key, value in relocated_calibration["implementation_source"].items()}
+            relocated["fingerprint"] = selector.digest(relocated["identity"])
+            relocated_summary = deepcopy(summary)
+            relocated_summary["report_receipts"]["c0000"] = selector.digest(relocated)
+            write(directory / "c0000" / "report.json", relocated, True)
+            write(directory / "c0000" / "identity.json", relocated["identity"], True)
+            self.assertEqual(selector.check_cv_summary(relocated_summary, plan, configuration, selector.Inputs(), directory), [])
+
+            def republish(changed):
+                # Keep checksums and independent summary copies consistent so
+                # rejection must reach the receipt contract under test.
+                changed["fingerprint"] = selector.digest(changed["identity"])
+                changed_summary = deepcopy(summary)
+                rows = [{**row, "chunk": "c0000"} for row in changed["candidates"]]
+                self.assertEqual(len(rows), 1)
+                changed_summary.update(candidates=rows, selected_candidate=rows[0],
+                    selected_parameters=rows[0]["parameters"],
+                    cv_balanced_accuracy=rows[0]["mean_balanced_accuracy"])
+                changed_summary["report_receipts"]["c0000"] = selector.digest(changed)
+                write(directory / "c0000" / "report.json", changed, True)
+                write(directory / "c0000" / "identity.json", changed["identity"], True)
+                return changed_summary
+
+            missing = object()
+            different_fold = .25 if report["candidates"][0]["folds"][0]["score"] != .25 else .75
+            different_mean = .25 if report["selected_mean_score"] != .25 else .75
+            for target, field, value, message in (
+                    ("report", "scoring", "accuracy", "scoring"),
+                    ("identity", "scoring", "accuracy", "scoring"),
+                    ("calibration", "scoring", "accuracy", "scoring"),
+                    ("calibration", "identity_schema", 1, "schema"),
+                    ("report", "schema_version", 4.0, "schema"),
+                    ("identity", "schema_version", 4.0, "schema"),
+                    ("calibration", "identity_schema", 2.0, "schema"),
+                    ("report", "refit_performed", 0, "final refit"),
+                    ("report", "refit_performed", True, "final refit"),
+                    ("report", "refit_performed", missing, "final refit"),
+                    ("candidate", "valid", 1, "qualification must be boolean"),
+                    ("candidate", "valid", 1.0, "qualification must be boolean"),
+                    ("fold", "score", different_fold, "score aliases"),
+                    ("fold", "score", missing, "score aliases"),
+                    ("candidate", "mean_score", different_mean, "score aliases"),
+                    ("candidate", "mean_score", missing, "score aliases"),
+                    ("report", "selected_mean_score", different_mean, "score aliases"),
+                    ("report", "selected_mean_score", missing, "score aliases"),
+                    ("report", "selected_mean_balanced_accuracy", different_mean, "score aliases"),
+                    ("report", "selected_mean_balanced_accuracy", missing, "score aliases"),
+                    ("calibration", "structural_configuration", {}, "identity"),
+                    ("calibration", "implementation_source", {}, "source")):
+                with self.subTest(target=target, field=field, value="missing" if value is missing else value):
+                    broken = deepcopy(report)
+                    records = {"report": broken, "identity": broken["identity"],
+                               "calibration": broken["identity"]["calibration"],
+                               "candidate": broken["candidates"][0],
+                               "fold": broken["candidates"][0]["folds"][0]}
+                    if value is missing:
+                        records[target].pop(field)
+                    else:
+                        records[target][field] = value
+                    changed_summary = republish(broken)
+                    with self.assertRaisesRegex(ValueError, message):
+                        selector.check_cv_summary(changed_summary, plan, configuration, selector.Inputs(), directory)
+
+            for score in (True, "0.8", 2.0):
+                with self.subTest(coherent_score=score):
+                    broken = deepcopy(report)
+                    row = broken["candidates"][0]
+                    for fold in row["folds"]:
+                        fold.update(score=score, balanced_accuracy=score)
+                    # Numeric means preserve the arithmetic for Boolean/string
+                    # fold values; equal aliases alone must not admit them.
+                    row.update(mean_score=float(score), mean_balanced_accuracy=float(score))
+                    broken.update(selected_mean_score=float(score), selected_mean_balanced_accuracy=float(score))
+                    changed_summary = republish(broken)
+                    with self.assertRaisesRegex(ValueError, "finite number in"):
+                        selector.check_cv_summary(changed_summary, plan, configuration, selector.Inputs(), directory)
+            restored_summary = republish(deepcopy(report))
+            self.assertEqual(selector.check_cv_summary(restored_summary, plan, configuration, selector.Inputs(), directory), [])
 
 
 class DecisionTests(unittest.TestCase):

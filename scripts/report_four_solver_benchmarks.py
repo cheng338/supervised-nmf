@@ -16,6 +16,7 @@ import json
 import math
 from pathlib import Path
 import statistics
+import sys
 
 import numpy as np
 from sklearn.metrics import (accuracy_score, average_precision_score, balanced_accuracy_score,
@@ -187,7 +188,24 @@ def verify_plan(plan, configuration):
     require(plan == expected, "Declared grid, canonical order, extras or training-only dimensional exclusions differ.")
 
 
-def verify_solver_parameters(calibration, job):
+def verify_solver_parameters(calibration, job, candidates=None):
+    if "identity_schema" in calibration or "structural_configuration" in calibration:
+        require(type(calibration.get("identity_schema")) is int
+                and calibration["identity_schema"] == 2 and candidates is not None,
+                "Unsupported structural CV identity schema or missing declared grid.")
+        require(calibration.get("scoring") == "balanced_accuracy",
+                "CV scoring differs from the declared balanced-accuracy objective.")
+        if str(ROOT / "scripts") not in sys.path:
+            sys.path.insert(0, str(ROOT / "scripts"))
+        from _audit_identity import verify_configuration_identity, verify_implementation_sources
+        from fashion_mnist_study import _estimator
+        from supervised_nmf._identity import configuration_identity, implementation_sources
+        estimator = _estimator(job)
+        verify_configuration_identity(calibration.get("structural_configuration"),
+            configuration_identity({"estimator": estimator, "candidates": candidates}))
+        verify_implementation_sources(calibration.get("implementation_source"),
+                                      implementation_sources(estimator, candidates))
+        return
     params, method = calibration["parameters"], job["method"]
     if method in METHODS[:2]:
         expected = {"solver": "cd" if method == METHODS[0] else "spa", "screening": "absolute",
@@ -223,11 +241,22 @@ def verify_cv(inputs, directory, plan, configuration, summary):
                 and summary["report_receipts"][chunk["id"]] == digest(report)
                 and report["state"] == "cv_completed", "CV chunk receipt/identity mismatch.")
         calibration = checkpoint_identity["calibration"]
-        verify_solver_parameters(calibration, job)
         expected = list(ParameterGrid(chunk["grid"]))
+        structural = ("identity_schema" in calibration or "structural_configuration" in calibration
+                      or report.get("schema_version") == 4 or checkpoint_identity.get("schema_version") == 4)
+        if structural:
+            if str(ROOT / "scripts") not in sys.path:
+                sys.path.insert(0, str(ROOT / "scripts"))
+            from _audit_identity import verify_shared_knn_cv_receipt
+            verify_shared_knn_cv_receipt(report)
+            verify_solver_parameters(calibration, job, expected)
+            candidates_match = True  # The structural configuration above binds this exact grid.
+        else:
+            verify_solver_parameters(calibration, job)
+            candidates_match = calibration["candidates"] == expected
         require(calibration["data_sha256"] == job["training_data_sha256"] and calibration["cv"] == 5
                 and calibration["seed"] == job["seed"] and calibration["threads"] == 1 and calibration["refit"] is False
-                and calibration["candidates"] == expected and calibration["source_sha256"] == configuration["sources"]["package_source_sha256"]
+                and candidates_match and calibration["source_sha256"] == configuration["sources"]["package_source_sha256"]
                 and digest(checkpoint_identity["folds"]) == plan["fold_indices_sha256"], "CV data, folds, source or grid differs.")
         require([row["parameters"] for row in report["candidates"]] == expected, "CV chunk coverage differs.")
         for index, row in zip(chunk["candidate_indices"], report["candidates"]):
@@ -393,7 +422,34 @@ def case_cost(row, multiplier=1, include_tuning=False):
     return value + (row["tuning_compute_seconds"] if include_tuning else 0)
 
 
+def _margin_value(value, label, *, positive=True):
+    """Validate a JSON margin control without changing its numeric representation."""
+    domain = "strictly positive" if positive else "nonnegative"
+    message = f"{label} must be a finite {domain} number (booleans are not allowed)."
+    require(isinstance(value, (int, float)) and not isinstance(value, bool), message)
+    try:
+        valid = math.isfinite(value) and (value > 0 if positive else value >= 0)
+    except OverflowError:
+        valid = False
+    require(valid, message)
+    return value
+
+
+def _decision_margins(rule, margin=None, *, label="sensitivity margin"):
+    """Resolve primary limits or an explicit global/dataset sensitivity limit."""
+    if margin is None:
+        return tuple(_margin_value(rule[key], key) for key in
+                     ("global_regret_limit", "per_dataset_regret_limit", "per_task_regret_limit"))
+    margin = _margin_value(margin, label)
+    multiplier = _margin_value(rule["sensitivities"]["per_task_limit_multiplier"],
+                               "sensitivities.per_task_limit_multiplier")
+    task_margin = _margin_value(margin * multiplier, f"{label} * sensitivities.per_task_limit_multiplier")
+    return margin, margin, task_margin
+
+
 def choose(rows, rule, *, margin=None, prediction_multiplier=1, include_tuning=False, allowed_methods=None):
+    margin, dataset_margin, task_margin = _decision_margins(rule, margin)
+    slack = _margin_value(rule.get("numerical_comparison_slack", 1e-12), "numerical_comparison_slack", positive=False)
     rows = [row for row in rows if row["method"] in METHODS]
     require(rows, "No solver cases.")
     indexed = {(row["method"], case_key(row)): row for row in rows}
@@ -404,10 +460,6 @@ def choose(rows, rule, *, margin=None, prediction_multiplier=1, include_tuning=F
     weight = weights_for(keys)
     eligible = [method for method in METHODS if all(indexed[method, key]["qualified"] for key in keys)
                 and (allowed_methods is None or method in allowed_methods)]
-    margin = rule["global_regret_limit"] if margin is None else margin
-    dataset_margin = rule["per_dataset_regret_limit"] if margin == rule["global_regret_limit"] else margin
-    task_margin = rule["per_task_regret_limit"] if margin == rule["global_regret_limit"] else margin * rule["sensitivities"]["per_task_limit_multiplier"]
-    slack = rule.get("numerical_comparison_slack", 1e-12)
     result = {"winner": None, "eligible_methods": eligible, "global_margin": margin, "dataset_margin": dataset_margin,
               "task_margin": task_margin, "prediction_multiplier": prediction_multiplier, "include_tuning": include_tuning,
               "scores": {}, "fallback_used": False, "case_weights": [{"case": list(key), "weight": weight[key]} for key in keys]}
@@ -427,6 +479,8 @@ def choose(rows, rule, *, margin=None, prediction_multiplier=1, include_tuning=F
         task_regrets = {name: max(s["tasks"][name] for s in scores.values()) - value for name, value in score["tasks"].items()}
         normalized = [global_regret / margin, *[r / dataset_margin for r in dataset_regrets.values()],
                       *[r / task_margin for r in task_regrets.values()]]
+        require(all(math.isfinite(value) and value >= 0 for value in normalized),
+                f"Invalid normalized regret for {method}: outside the finite nonnegative range; check regret margins.")
         passed = global_regret <= margin + slack and all(r <= dataset_margin + slack for r in dataset_regrets.values()) \
                  and all(r <= task_margin + slack for r in task_regrets.values())
         score.update(global_regret=global_regret, dataset_regrets=dataset_regrets, task_regrets=task_regrets,
@@ -459,6 +513,15 @@ def choose(rows, rule, *, margin=None, prediction_multiplier=1, include_tuning=F
 
 
 def describe(rows, rule):
+    # Validate every consumed margin even if no method or workload is eligible.
+    _decision_margins(rule)
+    _margin_value(rule.get("numerical_comparison_slack", 1e-12), "numerical_comparison_slack", positive=False)
+    margins = rule["sensitivities"]["global_and_dataset_regret_limits"]
+    require(isinstance(margins, list), "sensitivities.global_and_dataset_regret_limits must be a list.")
+    for index, margin in enumerate(margins):
+        label = f"sensitivities.global_and_dataset_regret_limits[{index}]"
+        _margin_value(margin, label)
+        _decision_margins(rule, margin, label=label)
     primary = choose(rows, rule)
     sensitivities = [choose(rows, rule, margin=margin, prediction_multiplier=multiplier, include_tuning=include)
                      for include in (False, True) for margin in rule["sensitivities"]["global_and_dataset_regret_limits"]

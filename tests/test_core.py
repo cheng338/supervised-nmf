@@ -38,8 +38,25 @@ class CoreTestCase(unittest.TestCase):
 
 
 class ScreeningTests(CoreTestCase):
+    def test_default_absolute_screen_matches_classifier_and_serializes(self):
+        default = BinaryScreening().fit(self.X, self.y)
+        explicit = BinaryScreening(screening="absolute", score_threshold=2.0).fit(self.X, self.y)
+        classifier = NMFClassifier(n_components=1, n_neighbors=3).fit(self.X, self.y)
+        self.assertEqual(default.screening, "absolute")
+        self.assertEqual(default.score_threshold, 2.0)
+        np.testing.assert_array_equal(default.get_support(), explicit.get_support())
+        np.testing.assert_array_equal(default.get_support(), classifier.get_support())
+        copied = clone(default)
+        self.assertEqual(copied.get_params(), default.get_params())
+        self.assertFalse(hasattr(copied, "support_"))
+        np.testing.assert_array_equal(copied.fit(self.X, self.y).get_support(), default.get_support())
+        restored = pickle.loads(pickle.dumps(default))
+        self.assertEqual(restored.get_params(), default.get_params())
+        np.testing.assert_array_equal(restored.get_support(), default.get_support())
+        np.testing.assert_array_equal(restored.transform(self.X), default.transform(self.X))
+
     def test_pooled_t_and_anova_scores(self):
-        selector = BinaryScreening(percentile=100).fit(self.X, self.y)
+        selector = BinaryScreening(screening="percentile", percentile=100).fit(self.X, self.y)
         expected_f = f_classif(self.X, self.y)[0]
         expected_t = -ttest_ind(self.X[:24], self.X[24:], equal_var=True, axis=0).statistic
         np.testing.assert_allclose(selector.scores_, expected_f, rtol=1e-11, atol=1e-12)
@@ -49,7 +66,7 @@ class ScreeningTests(CoreTestCase):
     def test_percentile_agrees_with_sklearn(self):
         for percentile in (1, 10, 25, 33, 75, 100):
             expected = SelectPercentile(f_classif, percentile=percentile).fit(self.X, self.y)
-            actual = BinaryScreening(percentile=percentile).fit(self.X, self.y)
+            actual = BinaryScreening(screening="percentile", percentile=percentile).fit(self.X, self.y)
             np.testing.assert_array_equal(actual.get_support(), expected.get_support())
 
     def test_percentile_rounding_and_ties(self):
@@ -61,7 +78,7 @@ class ScreeningTests(CoreTestCase):
                 np.testing.assert_array_equal(_percentile_support(scores, np.ones(scores.size, bool), percentile), expected)
 
     def test_inclusive_absolute_t_threshold(self):
-        probe = BinaryScreening(percentile=100).fit(self.X, self.y)
+        probe = BinaryScreening(screening="percentile", percentile=100).fit(self.X, self.y)
         index = int(np.argsort(np.abs(probe.t_scores_))[-2])
         threshold = abs(probe.t_scores_[index])
         exact = BinaryScreening(screening="absolute", score_threshold=threshold).fit(self.X, self.y)
@@ -77,14 +94,14 @@ class ScreeningTests(CoreTestCase):
         self.assertEqual(selector.n_infinite_scores_, 1)
         self.assertEqual(selector.n_classwise_constant_features_, 1)
         self.assertTrue(np.isposinf(selector.t_scores_[1]))
-        percentile = BinaryScreening(percentile=40).fit(X, self.y)
+        percentile = BinaryScreening(screening="percentile", percentile=40).fit(X, self.y)
         np.testing.assert_array_equal(percentile.get_support(), [False, True, False])
 
     def test_statistic_scale_invariance_and_no_input_mutation(self):
         original = self.X.copy()
-        base = BinaryScreening(percentile=100).fit(self.X, self.y)
+        base = BinaryScreening(screening="percentile", percentile=100).fit(self.X, self.y)
         scales = np.geomspace(1e-200, 1e200, self.X.shape[1])
-        rescaled = BinaryScreening(percentile=100).fit(self.X * scales, self.y)
+        rescaled = BinaryScreening(screening="percentile", percentile=100).fit(self.X * scales, self.y)
         np.testing.assert_allclose(base.t_scores_, rescaled.t_scores_, rtol=1e-12, atol=1e-12)
         np.testing.assert_array_equal(self.X, original)
         np.testing.assert_array_equal(base.transform(self.X), original)
@@ -96,9 +113,9 @@ class ScreeningTests(CoreTestCase):
             with self.assertRaises(ValueError):
                 BinaryScreening().fit(X, y)
         with self.assertRaisesRegex(ValueError, "zero features"):
-            BinaryScreening(percentile=0).fit(self.X, self.y)
+            BinaryScreening(screening="percentile", percentile=0).fit(self.X, self.y)
         with self.assertRaises(ValueError):
-            BinaryScreening(percentile=100).fit(self.X * np.nan, self.y)
+            BinaryScreening(screening="percentile", percentile=100).fit(self.X * np.nan, self.y)
 
 
 class SPATests(CoreTestCase):
@@ -145,9 +162,10 @@ class SPATests(CoreTestCase):
         _, _, X = self.separable()
         X += np.random.default_rng(6).uniform(0, .05, X.shape)
         estimator = FeatureSPA(3)
-        anchor_coordinates = estimator.fit_transform(X)
+        fitted = estimator.fit_transform(X)
         projected = estimator.transform(X)
-        self.assertGreater(np.linalg.norm(anchor_coordinates - projected), 1e-6)
+        np.testing.assert_array_equal(fitted, projected)
+        self.assertGreater(np.linalg.norm(estimator.fit_coordinates_ - projected), 1e-6)
         self.assertLessEqual(np.linalg.norm(X - projected @ estimator.components_), estimator.reconstruction_err_ + 1e-10)
 
 
@@ -251,7 +269,7 @@ class ClassifierTests(CoreTestCase):
                 result = cross_validate(self.model(solver=solver), self.X, self.y, cv=folds,
                                         return_estimator=True, error_score="raise")
                 for (train, _), model in zip(folds, result["estimator"]):
-                    expected = BinaryScreening(percentile=50).fit(self.X[train], self.y[train])
+                    expected = BinaryScreening(screening="percentile", percentile=50).fit(self.X[train], self.y[train])
                     self.assertEqual(model.selector_.n_samples_seen_, len(train))
                     np.testing.assert_allclose(model.selector_.scores_, expected.scores_)
                     np.testing.assert_array_equal(model.selected_features_, expected.selected_features_)
@@ -291,7 +309,8 @@ class ClassifierTests(CoreTestCase):
                     ("knn", KNeighborsClassifier(n_neighbors=3, weights="distance")),
                 ])
                 reference = Pipeline(steps).fit(X, self.y)
-                model = self.model(solver="mu", screening=screening, weights="distance").fit(X, self.y)
+                model = self.model(solver="mu", screening=screening, weights="distance",
+                                   mu_projection="batch").fit(X, self.y)
                 expected_coordinates = reference.named_steps["knn"]._fit_X
                 np.testing.assert_array_equal(model.training_coordinates_, expected_coordinates)
                 np.testing.assert_array_equal(model.selected_components_, reference.named_steps["nmf"].components_)

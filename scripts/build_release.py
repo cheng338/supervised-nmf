@@ -5,12 +5,18 @@ already be available, or use `python -m pip wheel .` to install them in an isola
 build environment.
 """
 
-import os
-from pathlib import Path
 
-from setuptools.build_meta import build_sdist, build_wheel
+def main():
+    import os
+    from pathlib import Path
 
-root = Path(__file__).resolve().parents[1]
-os.chdir(root)
-build_wheel(str(root / "dist"))
-build_sdist(str(root / "dist"))
+    from setuptools.build_meta import build_sdist, build_wheel
+
+    root = Path(__file__).resolve().parents[1]
+    os.chdir(root)
+    build_wheel(str(root / "dist"))
+    build_sdist(str(root / "dist"))
+
+
+if __name__ == "__main__":
+    main()

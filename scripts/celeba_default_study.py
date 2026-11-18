@@ -27,6 +27,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
 import json
+import multiprocessing
 from numbers import Integral, Real
 import os
 from pathlib import Path
@@ -45,13 +46,23 @@ from sklearn.base import clone
 from sklearn.model_selection import ParameterGrid, StratifiedKFold
 from threadpoolctl import threadpool_limits
 
+from supervised_nmf._completed_reuse import _try_completed
+from supervised_nmf._identity import configuration_identity, implementation_sources
 from supervised_nmf.evaluation import (
-    _diagnostics, _digest, _jsonable, _nonconverged, _warning_records,
+    _diagnostics, _digest, _initialized_provenance, _jsonable, _nonconverged, _warning_records,
     comparison_models, data_fingerprint, evaluate_classifier, provenance,
     refinement_diagnostics, write_json,
 )
-from supervised_nmf.study import _checkpoint_lock, _read_receipt, _write_receipt, calibration_knn_grid
-from profile_celeba_stages import _runtime_identity, profile_selected_estimator
+from supervised_nmf.study import (_checkpoint_lock, _read_receipt, _write_receipt,
+                                  calibration_knn_grid, _reuse_calibration_knn_grid)
+import profile_celeba_stages as _profile_helper
+if (getattr(_profile_helper, "__file__", None) is None
+        or Path(_profile_helper.__file__).resolve()
+        != (ROOT / "scripts" / "profile_celeba_stages.py").resolve()):
+    raise ImportError("The study requires its sibling profile_celeba_stages.py; "
+                      "restart with the intended checkout on the import path.")
+_runtime_identity = _profile_helper._runtime_identity
+profile_selected_estimator = _profile_helper.profile_selected_estimator
 
 
 def _now():
@@ -62,16 +73,20 @@ def _read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def _source_identity():
-    environment = provenance(1)
+def _source_identity(*, _environment=None):
+    environment = _initialized_provenance(1) if _environment is None else _environment(1)
     files = [Path(__file__), ROOT / "scripts" / "profile_celeba_stages.py"]
+    sources = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
+    if getattr(_profile_helper, "_SOURCE_SHA256_AT_IMPORT", None) != sources["profile_celeba_stages.py"]:
+        raise ValueError("profile_celeba_stages.py changed after import or lacks an import source pin; "
+                         "restart the interpreter before continuing this study.")
     return {"package_source_sha256": environment["source_sha256"],
-            "runner_source_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in files},
+            "runner_source_sha256": sources,
             "runtime": _runtime_identity(environment)}
 
 
-def _check_source(expected):
-    if _source_identity() != expected:
+def _check_source(expected, *, _environment=None):
+    if _source_identity(_environment=_environment) != expected:
         raise ValueError("Source or numerical runtime changed; preserve this run and start another directory.")
 
 
@@ -212,15 +227,32 @@ def initialize(protocol_path, output):
     return identity
 
 
-def _worker(work):
+def _worker(work, *, reuse_only=False, _reuse_environment=None):
     output, plan, chunk, expected_sources = work
-    _check_source(expected_sources)
+    if reuse_only:
+        if _source_identity(_environment=_reuse_environment) != expected_sources:
+            return None
+    else:
+        _check_source(expected_sources, _environment=_reuse_environment)
     job = plan["job"]
     X = np.load(Path(job["cache"]) / "train-X.npy", mmap_mode="r", allow_pickle=False)
-    y = np.load(Path(job["cache"]) / f"train-{job['attribute']}-y.npy", allow_pickle=False)
-    report = calibration_knn_grid(_estimator(job), chunk["grid"], X, y, cv=5, seed=job["seed"], threads=1,
-                                  checkpoint_dir=Path(output) / job["id"] / chunk["id"])
-    _check_source(expected_sources)
+    try:
+        y = np.load(Path(job["cache"]) / f"train-{job['attribute']}-y.npy", allow_pickle=False)
+        # This recorded protocol selects by balanced accuracy, independently of
+        # the general calibration API's default scoring objective.
+        calibrate = _reuse_calibration_knn_grid if reuse_only else calibration_knn_grid
+        options = {} if _reuse_environment is None else {"_reuse_environment": _reuse_environment}
+        report = calibrate(_estimator(job), chunk["grid"], X, y, cv=5, seed=job["seed"], threads=1,
+                                      scoring="balanced_accuracy",
+                                      checkpoint_dir=Path(output) / job["id"] / chunk["id"], **options)
+        if report is not None:
+            _check_source(expected_sources, _environment=_reuse_environment)
+    finally:
+        # The worker owns this mapping, and calibration copies its input before
+        # fitting. Close even when an exception traceback still references X.
+        X._mmap.close()
+    if report is None:
+        return None
     return {"job": job["id"], "chunk": chunk["id"], "candidates": len(report["candidates"]),
             "valid_candidates": sum(row["valid"] for row in report["candidates"]),
             "new_representation_fits": report["new_representation_fits"],
@@ -245,6 +277,9 @@ def aggregate_cv(output, configuration, *, require_complete=False):
         y = np.load(Path(job["cache"]) / f"train-{job['attribute']}-y.npy", allow_pickle=False)
         expected_folds = _jsonable([{"training_indices": a, "validation_indices": b}
                                    for a, b in StratifiedKFold(5, shuffle=True, random_state=job["seed"]).split(X, y)])
+        # No subsequent check needs the mapped array. Release it before a
+        # validation exception can retain it in a traceback on Windows.
+        del X
         report_receipts = {}
         for chunk, path in zip(plan["chunks"], paths):
             report = _read_receipt(path)
@@ -253,11 +288,18 @@ def aggregate_cv(output, configuration, *, require_complete=False):
                 raise ValueError("CV report does not match its original checkpoint identity.")
             calibration = identity["calibration"]
             expected_candidates = list(ParameterGrid(chunk["grid"]))
+            estimator = _estimator(job)
+            expected_configuration = configuration_identity({"estimator": estimator,
+                                                             "candidates": expected_candidates})
             if (report["state"] != "cv_completed" or report["fingerprint"] != _digest(identity)
+                    or report.get("schema_version") != 4 or identity.get("schema_version") != 4
+                    or calibration.get("identity_schema") != 2
+                    or any(record.get("scoring") != "balanced_accuracy"
+                           for record in (report, identity, calibration))
                     or calibration["data_sha256"] != manifest["splits"]["train"]["attributes"][job["attribute"]]["data_sha256"]
-                    or calibration["candidates"] != expected_candidates or calibration["cv"] != 5
+                    or calibration.get("structural_configuration") != expected_configuration or calibration["cv"] != 5
                     or calibration["seed"] != job["seed"] or calibration["threads"] != 1 or calibration["refit"] is not False
-                    or calibration["parameters"] != _jsonable(_estimator(job).get_params(deep=True))
+                    or calibration.get("implementation_source") != implementation_sources(estimator, expected_candidates)
                     or calibration["source_sha256"] != configuration["sources"]["package_source_sha256"]
                     or identity["folds"] != expected_folds):
                 raise ValueError(f"CV report identity differs: {path}")
@@ -305,7 +347,45 @@ def aggregate_cv(output, configuration, *, require_complete=False):
     return report
 
 
-def run_cv(output, configuration, *, workers=8, job_ids=None):
+def _checkpoint_files_present(work):
+    """Negative routing hint only; workers still validate every checkpoint."""
+    try:
+        for output, plan, chunk, _ in work:
+            directory = Path(output) / plan["job"]["id"] / chunk["id"]
+            if not (directory / "identity.json").is_file():
+                return False
+            if not (directory / "report.json").is_file():
+                return False
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+    return True
+
+
+def _completed_or_spawned(work, workers, *, _cli_forkserver=False):
+    def describe(item):
+        output, plan, chunk, _ = item
+        return _estimator(plan["job"]), chunk["grid"], Path(output) / plan["job"]["id"] / chunk["id"], 1
+
+    def invoke(item, environment):
+        return _worker(item, reuse_only=True, _reuse_environment=environment)
+
+    completed = _try_completed(work, workers, describe=describe, invoke=invoke)
+    if completed is not None:
+        yield from completed
+        return
+    if work:
+        method = ("forkserver" if _cli_forkserver is True and workers > 1 and sys.platform == "linux"
+                  and _checkpoint_files_present(work) else "spawn")
+        context = multiprocessing.get_context(method)
+        if method == "forkserver":
+            context.set_forkserver_preload([])
+        with ProcessPoolExecutor(max_workers=workers, mp_context=context) as executor:
+            futures = [executor.submit(_worker, item) for item in work]
+            for future in as_completed(futures):
+                yield future.result()
+
+
+def run_cv(output, configuration, *, workers=8, job_ids=None, _cli_forkserver=False):
     workers = _integer(workers, "workers", 1, 8)
     chosen = set(job_ids or [plan["job"]["id"] for plan in configuration["plans"]])
     if not chosen <= {plan["job"]["id"] for plan in configuration["plans"]}:
@@ -313,14 +393,13 @@ def run_cv(output, configuration, *, workers=8, job_ids=None):
     work = [(str(output), plan, chunk, configuration["sources"]) for plan in configuration["plans"]
             if plan["job"]["id"] in chosen for chunk in plan["chunks"]]
     receipts = []
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(_worker, item): item for item in work}
-        for index, future in enumerate(as_completed(futures), 1):
-            result = future.result()
-            receipts.append(result)
-            print(f"CV {index}/{len(work)} {result['job']} {result['chunk']} "
-                  f"valid={result['valid_candidates']}/{result['candidates']} "
-                  f"new={result['new_representation_fits']} reused={result['reused_representation_folds']}", flush=True)
+    completed = (_completed_or_spawned(work, workers, _cli_forkserver=True)
+                 if _cli_forkserver is True else _completed_or_spawned(work, workers))
+    for index, result in enumerate(completed, 1):
+        receipts.append(result)
+        print(f"CV {index}/{len(work)} {result['job']} {result['chunk']} "
+              f"valid={result['valid_candidates']}/{result['candidates']} "
+              f"new={result['new_representation_fits']} reused={result['reused_representation_folds']}", flush=True)
     summary = aggregate_cv(output, configuration)
     return {"state": summary["state"], "completed_chunks": receipts, "missing_chunks": summary["missing_chunks"]}
 
@@ -416,7 +495,7 @@ def evaluate(output, configuration):
             "models_with_valid_profiling": sum(row["profiling_valid"] for row in results.values())}
 
 
-def main():
+def main(*, _cli_forkserver=False):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--protocol", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True, help="Exact resumable run directory.")
@@ -438,8 +517,12 @@ def main():
         _write_receipt(attempt_path, attempt)
         start = time.perf_counter()
         try:
-            result = (run_cv(args.output, configuration, workers=args.workers, job_ids=args.jobs)
-                      if args.mode == "cv" else evaluate(args.output, configuration))
+            if args.mode == "cv" and _cli_forkserver is True:
+                result = run_cv(args.output, configuration, workers=args.workers,
+                                job_ids=args.jobs, _cli_forkserver=True)
+            else:
+                result = (run_cv(args.output, configuration, workers=args.workers, job_ids=args.jobs)
+                          if args.mode == "cv" else evaluate(args.output, configuration))
             attempt.update(state="completed", result=result)
         except BaseException as error:
             attempt.update(state="interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "failed",
@@ -452,4 +535,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(_cli_forkserver=True)

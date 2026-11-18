@@ -218,6 +218,35 @@ class FashionStudyTests(unittest.TestCase):
         profiled.reset_mock()
         self.assertEqual(saved, {path: path.read_bytes() for path in saved})
 
+    def test_rechecksummed_identity_cannot_change_schema_scoring_or_configuration(self):
+        config = self.initialize()
+        self.complete(config)
+        path = self.output / config["plans"][0]["job"]["id"] / "c0000" / "report.json"
+        original = _read_receipt(path)
+        self.assertEqual(original["scoring"], "balanced_accuracy")
+        for target, field, value in (
+                ("report", "scoring", "accuracy"),
+                ("identity", "scoring", "accuracy"),
+                ("calibration", "scoring", "accuracy"),
+                ("identity", "schema_version", 3),
+                ("calibration", "identity_schema", 1),
+                ("calibration", "structural_configuration", {}),
+                ("calibration", "implementation_source", {})):
+            with self.subTest(target=target, field=field):
+                report = deepcopy(original)
+                identity = report["identity"]
+                records = {"report": report, "identity": identity,
+                           "calibration": identity["calibration"]}
+                records[target][field] = value
+                report["fingerprint"] = _digest(identity)
+                _write_receipt(path.parent / "identity.json", identity)
+                _write_receipt(path, report)
+                with self.assertRaisesRegex(ValueError, "CV checkpoint identity or grid coverage differs"):
+                    runner.aggregate_cv(self.output, config)
+        _write_receipt(path.parent / "identity.json", original["identity"])
+        _write_receipt(path, original)
+        runner.aggregate_cv(self.output, config, require_complete=True)
+
     def test_numerical_nonconvergence_is_invalid_and_not_replaced(self):
         self.protocol.update(methods=["screened_mu_absolute"], max_iter=1)
         self.protocol["grid"]["score_threshold"] = [0]
@@ -254,6 +283,7 @@ class FashionStudyTests(unittest.TestCase):
         self.assertEqual(profile["status"], "valid")
         self.assertTrue(profile["exact_prediction_match"])
         self.assertEqual(profile["stage_calls"]["decomposition_fit_seconds"], 1)
+        self.assertEqual(profile["stage_calls"]["training_projection_seconds"], 0)
         self.assertEqual(profile["stage_calls"]["decomposition_projection_seconds"], 1)
         self.assertEqual(profile["diagnostics"]["basis_dtype"], "float32")
 
@@ -277,11 +307,101 @@ class FashionStudyTests(unittest.TestCase):
         self.assertEqual(profile["status"], "valid")
         self.assertTrue(profile["exact_prediction_match"])
         self.assertEqual(profile["stage_calls"]["decomposition_fit_seconds"], 1)
+        self.assertEqual(profile["stage_calls"]["training_projection_seconds"], 0)
         self.assertEqual(profile["stage_calls"]["decomposition_projection_seconds"], 1)
         self.assertEqual(profile["diagnostics"]["basis_dtype"], "float64")
         model.named_steps["nmf"].converged_ = False
         self.assertTrue(runner._model_nonconverged(model, []))
 
+
+    def test_cd_pipeline_local_profile_counts_projection_once(self):
+        job = {"method": "screened_mu_absolute", "seed": 43, "max_iter": 2000, "tol": 1e-4}
+        model = runner._estimator(job).set_params(
+            nmf__solver="cd", nmf__n_components=2, screen__score_threshold=0, knn__n_neighbors=3)
+        y = (self.y == 6).astype(np.uint8)
+        original_transform = runner.NMF.transform
+        with threadpool_limits(limits=1):
+            model.fit(self.X, y)
+            original = evaluate_classifier(model, self.X[:12], y[:12], threads=1, sample_ids=list(range(12)))
+            profile = runner._profile(model, self.X, y, self.X[:12], y[:12],
+                                      reference=original, sample_ids=list(range(12)))
+        self.assertIs(runner.NMF.transform, original_transform)
+        self.assertEqual(profile["status"], "valid", profile)
+        self.assertTrue(profile["exact_prediction_match"])
+        self.assertEqual(profile["stage_calls"]["decomposition_fit_seconds"], 1)
+        self.assertEqual(profile["stage_calls"]["training_projection_seconds"], 0)
+        self.assertEqual(profile["stage_calls"]["decomposition_projection_seconds"], 1)
+
+    def test_classifier_mu_profile_keeps_native_transform_identity(self):
+        from supervised_nmf import classifier as classifier_module
+        from supervised_nmf.classifier import NMFClassifier
+
+        model = NMFClassifier(
+            solver="mu", mu_projection="batch", training_coordinates="transform",
+            screening="absolute", score_threshold=0, n_components=2, n_neighbors=3,
+            max_iter=2000, tol=1e-4, random_state=43)
+        y = (self.y == 6).astype(np.uint8)
+        original_transform = runner.NMF.transform
+        dispatch_code = classifier_module.transform_mu.__code__
+        observed = []
+        previous = sys.getprofile()
+        self.assertIsNone(previous)
+
+        def observe(frame, event, value):
+            if event == "call" and frame.f_code is dispatch_code:
+                observed.append(runner.NMF.transform is original_transform)
+
+        with threadpool_limits(limits=1):
+            model.fit(self.X, y)
+            original = evaluate_classifier(model, self.X[:12], y[:12], threads=1, sample_ids=list(range(12)))
+            try:
+                sys.setprofile(observe)
+                profile = runner._profile(model, self.X, y, self.X[:12], y[:12],
+                                          reference=original, sample_ids=list(range(12)))
+            finally:
+                sys.setprofile(previous)
+        self.assertIs(runner.NMF.transform, original_transform)
+        self.assertEqual(observed, [True, True])  # training and query dispatch
+        self.assertEqual(profile["status"], "valid", profile)
+        self.assertTrue(profile["exact_prediction_match"])
+        self.assertEqual(profile["instrumented_method_calls"]["decomposition_fit_seconds"], 1)
+        self.assertEqual(profile["instrumented_method_calls"]["training_projection_seconds"], 1)
+        self.assertEqual(profile["instrumented_method_calls"]["decomposition_projection_seconds"], 1)
+
+    def test_pipeline_projection_errors_restore_profiled_methods(self):
+        for solver in ("mu", "cd", "anls_bpp"):
+            with self.subTest(solver=solver), threadpool_limits(limits=1):
+                job = {"method": "screened_anls_bpp_absolute" if solver == "anls_bpp" else "screened_mu_absolute",
+                       "seed": 43, "max_iter": 2000, "tol": 1e-4, "anls_max_iter": 1000}
+                model = runner._estimator(job).set_params(
+                    nmf__n_components=2, screen__score_threshold=0, knn__n_neighbors=3)
+                if solver == "cd":
+                    model.set_params(nmf__solver="cd")
+                y = (self.y == 6).astype(np.uint8)
+                model.fit(self.X, y)
+                original = evaluate_classifier(model, self.X[:12], y[:12], threads=1, sample_ids=list(range(12)))
+                decomposition_type = type(model.named_steps["nmf"])
+                watched = [(cls, method) for cls in {runner.NMF, decomposition_type}
+                           for method in ("fit_transform", "transform")]
+                originals = {(cls, method): getattr(cls, method) for cls, method in watched}
+
+                def fail_projection(*args, **kwargs):
+                    raise RuntimeError("required projection error")
+
+                with patch.object(decomposition_type, "transform", fail_projection):
+                    patched = {(cls, method): getattr(cls, method) for cls, method in watched}
+                    profile = runner._profile(model, self.X, y, self.X[:12], y[:12],
+                                              reference=original, sample_ids=list(range(12)))
+                    for (cls, method), expected in patched.items():
+                        self.assertIs(getattr(cls, method), expected)
+                for (cls, method), expected in originals.items():
+                    self.assertIs(getattr(cls, method), expected)
+                self.assertEqual(profile["status"], "invalid_reproduction", profile)
+                self.assertFalse(profile["exact_prediction_match"])
+                self.assertEqual(profile["evaluation"]["status"], "failed")
+                self.assertEqual(profile["evaluation"]["error_type"], "RuntimeError")
+                self.assertEqual(profile["evaluation"]["error"], "required projection error")
+                self.assertEqual(profile["stage_calls"]["decomposition_projection_seconds"], 1)
 
 if __name__ == "__main__":
     unittest.main()

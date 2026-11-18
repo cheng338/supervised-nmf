@@ -16,6 +16,30 @@ historical records. Their original support declarations and results are not
 changed retroactively. Do not use them as installation guidance for current
 source.
 
+The three-label and shared-screening setup/launch workflows are frozen study
+tooling, outside current runtime support and qualification. Their retained
+scripts, package locks and guides describe the original kits; they are not
+installation instructions for the current package. Preserve their source and
+runtime checks, and do not resume a frozen run with changed source. For current
+subject-separated tuning, final fitting and held-out evaluation, use the
+[grouped example](../examples/grouped_tuning.py) and [public API guide](api.md).
+Retaining historical tools does not qualify new runs or require maintaining
+Python 3.10 compatibility.
+
+## Class-label strings
+
+Version 0.5.0 rejects class labels ending in U+0000 (NUL). Earlier source
+could accept these values and silently compute incorrect class statistics,
+predictions or evaluation metrics. Ordinary labels and NUL followed by other
+text retain their behavior. This is an explicit input restriction; the package
+does not trim or merge categories.
+
+Original labels must remain available for detection. Fixed-width Unicode arrays
+can erase a terminal-NUL distinction before package entry, and casting such an
+array to `object` does not restore it. Older fitted models still containing
+unsupported labels require safely encoded original targets and refitting.
+See the [class-label domain](api.md#class-label-domain) for API scope and encoding.
+
 ## CD/MU numerical reproducibility
 
 A fixed `random_state` controls initialization randomness; it does not promise
@@ -111,6 +135,14 @@ recorded runtime and other settings. Existing saved study results remain
 historical evidence and are not revised by this source change. The corrected
 simulation portable retains its pinned released 0.2.0 wheel and explicitly
 projects training observations; it does not depend on this new default.
+
+The coordinate behavior in the version 0.3.0 section above describes that
+historical release. Since the November 3, 2026 development change, newly fitted
+`FeatureSPA` pipelines and every accepted SPA `NMFClassifier` coordinate mode
+use fixed-basis NNLS for training. Explicit `training_coordinates="fit_transform"`
+no longer selects anchor coordinates on refit with current source. Reproducing
+an older anchor-trained study requires its archived implementation and settings;
+loading an existing fitted model does not retrain it or rewrite its metadata.
 
 ## Use an existing target environment
 

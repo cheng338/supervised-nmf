@@ -17,9 +17,10 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import LinearSVC
 from sklearn.utils.metaestimators import available_if
-from sklearn.utils.validation import check_is_fitted
+from sklearn.utils.validation import check_consistent_length, check_is_fitted
 
 from .decomposition import FeatureSPA
+from ._labels import _validate_class_label, _validate_class_labels
 from ._mu import transform_mu
 from ._mu_rowwise import transform_mu_rowwise
 from ._projection import validate_projection_parameters
@@ -96,6 +97,30 @@ def _head_supports(method):
             return classifier in {"knn", "logistic"}
         return classifier in {"logistic", "linear_svm"}
     return check
+
+
+def _knn_probabilities_preserve_labels(head, coordinates, probabilities):
+    """Reuse stock KNN scores only away from uncertain weighted-vote ties.
+
+    Callers own head-method qualification and their native fallback operation.
+    Probability accumulation and native weighted voting can round differently.
+    The conservative nonnegative-summation bound admits separated votes;
+    uncertain votes require native prediction on the whole original batch.
+    Float32 query or training geometry uses a float32 error bound.
+    """
+    if head.weights == "uniform":
+        return True
+    if head.weights != "distance":
+        return False
+    train_dtype = getattr(getattr(head, "_fit_X", None), "dtype", None)
+    single = coordinates.dtype == np.float32 or train_dtype == np.float32
+    epsilon = np.finfo(np.float32 if single else np.float64).eps
+    product = (head.n_neighbors + len(head.classes_) + 4) * epsilon
+    guard = 32.0 * product / (1.0 - product) if product < .25 else np.inf
+    largest = np.sort(probabilities, axis=1)[:, -2:]
+    return (np.isfinite(probabilities).all()
+            and not (probabilities < 0).any() and not (probabilities > 1).any()
+            and not (largest[:, -1] - largest[:, 0] <= guard).any())
 
 
 class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
@@ -200,13 +225,15 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
     including ``max_iter``, ``tol``, head settings and KNN normalization.
     Prediction uses the saved feature mask, decomposition and classifier;
     ``get_params()`` can describe settings queued for a future fit. Saving and
-    loading preserves both the constructor settings and fitted objects and
+    loading with the same implementation and dependencies preserves both the
+    constructor settings and fitted objects and
     does not perform a pending refit. This excludes direct mutation of fitted
     internals or stateful custom callables. Standalone ``FeatureSPA`` differs:
     its ``nnls_max_iter`` also affects subsequent transforms without refitting.
 
-    ``mu_projection='batch'`` retains MU's shared query-batch stopping rule.
-    Optional ``'rowwise'`` gives each observation its own initialization and
+    ``mu_projection='auto'`` (the default) resolves to ``'rowwise'`` for MU
+    and no MU projection policy for SPA/CD. Explicit ``'batch'`` retains MU's
+    shared query-batch stopping rule. ``'rowwise'`` gives each observation its own initialization and
     stopping decision, with float64 working arithmetic for ordinary projection and guarded numerical
     recovery. It preserves the fixed-basis Frobenius objective and projection
     output dtype, but changes numerical coordinates and can cost more time.
@@ -214,24 +241,28 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
     batches. It removes shared stopping, not every possible floating-point
     difference across batch shapes. ``mu_projection_`` records the fitted
     policy for MU and is ``None`` for other solvers; ``'rowwise'`` requires MU.
-    This policy changes only on refit. Existing serialized models retain batch
-    projection. Joint factorization is unchanged. Explicitly combine rowwise
+    This policy changes only on refit. Current-format persistence retains the
+    fitted policy. Joint factorization is unchanged. Explicitly combine rowwise
     projection with ``training_coordinates='transform'`` to use the same
     projection policy for classifier-training and query coordinates.
 
     ``training_coordinates='auto'`` uses fixed-basis ``'transform'`` coordinates
     for SPA and the historical ``'fit_transform'`` coordinates for CD and MU.
-    Explicit ``'fit_transform'`` reproduces the scripts' convention;
+    Explicit ``'fit_transform'`` also uses fixed-basis coordinates for SPA;
+    CD and MU retain their factorization coordinates in that mode.
     ``'transform'`` reprojects training data against the fitted basis using the
     same operation as prediction. ``training_coordinates_mode_`` records the
     resolved fitted choice; ``training_coordinates_`` holds the actual array.
     Changing this parameter takes effect on the next fit, not prediction.
 
-    ``fit_transform(X, y)`` fits the complete classifier, then returns
-    ``transform(X)``. Labels are required. These projected coordinates can
-    differ from ``training_coordinates_`` when the head uses factorization
-    or anchor coordinates. The method does not change the training-coordinate
-    policy and performs an additional projection after fitting.
+    ``fit_transform(X, y)`` fits the complete classifier and returns projected
+    training coordinates. For the standard SPA classifier it returns an
+    independent copy of the coordinates already computed during fit, avoiding
+    a second NNLS projection. Other solvers and custom transform implementations
+    call ``transform(X)`` after fitting. Labels are required. These coordinates can
+    differ from ``training_coordinates_`` when the head uses CD/MU factorization
+    coordinates. The method does not change the training-coordinate
+    policy. Only paths that call ``transform`` perform an additional projection.
 
     No operation on test data refits
     the screening or basis. ``components_`` is padded with zeros to the original
@@ -241,15 +272,17 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
     SPA may first make a bounded batched attempt, then pass the original cap
     to SciPy fallback; this is not a shared total-work budget. Batched pivot
     rounds and SciPy iterations are different units. Converged routines can
-    terminate earlier. CD and MU use their respective
-    sklearn stopping criteria for fitting and default projection; optional
-    rowwise MU projection checks residual improvement per observation.
+    terminate earlier. CD uses sklearn's stopping criterion for fitting and
+    projection. MU uses sklearn's shared stopping criterion for fitting and
+    explicit batch projection; default rowwise MU projection checks residual
+    improvement per observation.
     Identical tolerances do not imply identical
     numerical accuracy. SPA's NNLS routine does not use ``tol``. Increasing the
     cap can change a previously truncated fit without changing its objective
     or stopping tolerance.
 
-    ``n_iter_`` records factorization iterations. ``classifier_n_iter_`` records
+    ``n_iter_`` records CD/MU factorization iterations or SPA's anchor count,
+    not prediction or NNLS iterations. ``classifier_n_iter_`` records
     logistic regression/SVM iterations, or is ``None`` for KNN. ``converged_`` and
     ``convergence_warnings_`` include factorization, training projection, and
     classifier fitting; classifier-specific diagnostics are also available as
@@ -260,7 +293,9 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
     conditions, global optimality or agreement across environments. A skipped
     training projection has ``training_projection_converged_=None``. For an
     already fitted estimator, prediction leaves learned parameters and
-    package-owned inference state unchanged. Evaluation reports contain call-local
+    model-owned inference state unchanged. Eligible explicit QR calls may populate
+    a transient external weak cache for the shared basis; its factors are not
+    persisted with the estimator. Evaluation reports contain call-local
     projection diagnostics; ``last_transform_*`` attributes are no longer written
     on the model. A failed prediction does not change the fit's ``converged_``.
     Third-party query counters may still change. Use separate processes for
@@ -271,7 +306,7 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
     def __init__(self, n_components=2, *, solver="spa", screening="absolute", percentile=10.0,
                  score_threshold=2.0, n_neighbors=5, weights="uniform", max_iter=20000,
                  tol=1e-4, random_state=None, training_coordinates="auto",
-                 mu_projection="batch",
+                 mu_projection="auto",
                  classifier="knn", knn_normalization="none",
                  logistic_C=1.0, logistic_max_iter=1000,
                  logistic_tol=1e-4, logistic_class_weight=None,
@@ -315,44 +350,31 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
         tags.classifier_tags.multi_class = False
         return tags
 
-    def __setstate__(self, state):
-        # Legacy fitted models retain their original serial projection policy;
-        # restoring constructor defaults also keeps get_params/clone usable.
-        state = state.copy()
-        for name, value in (("decision_threshold", None), ("positive_label", None),
-                            ("knn_normalization", "none"),
-                            ("svm_C", 1.0), ("svm_max_iter", 20000),
-                            ("svm_tol", 1e-5), ("svm_class_weight", None),
-                            ("training_coordinates", "fit_transform"),
-                            ("mu_projection", "batch"),
-                            ("projection_solver", "scipy"), ("projection_workers", 1),
-                            ("projection_batch_size", 256), ("projection_native_threads", 1)):
-            state.setdefault(name, value)
-        if "classifier_" in state and "mu_projection_" not in state:
-            # A missing fitted policy predates rowwise projection. Constructor
-            # parameters may have changed after fitting; preserve the saved map.
-            state["mu_projection_"] = (
-                "batch" if getattr(state.get("decomposition_"), "solver", None) == "mu" else None)
-        if "classifier_" in state and "knn_normalization_" not in state:
-            head = state["classifier_"]
-            if isinstance(head, KNeighborsClassifier):
-                state["knn_normalization_"] = "none"
-            elif isinstance(head, Pipeline) and isinstance(head.steps[-1][1], KNeighborsClassifier):
-                state["knn_normalization_"] = "sd"
-            else:
-                state["knn_normalization_"] = None
-        if "classifier_" in state and "training_coordinates_mode_" not in state:
-            # This records the saved fit, even if set_params subsequently
-            # changed its constructor policy. It never re-encodes fitted data.
-            if "training_projection_performed_" in state:
-                state["training_coordinates_mode_"] = (
-                    "transform" if state["training_projection_performed_"] else "fit_transform")
-            elif state["training_coordinates"] in {"fit_transform", "transform"}:
-                state["training_coordinates_mode_"] = state["training_coordinates"]
-        super().__setstate__(state)
-
     def fit(self, X, y):
         return self._fit(X, y)
+
+    def fit_transform(self, X, y=None, **fit_params):
+        """Fit the classifier and return its fixed-basis training representation.
+
+        Standard SPA fits already compute that representation. Return a copy
+        without projecting again; preserve fit/transform delegation for other
+        solvers, subclasses and overridden transform methods.
+        """
+        if (type(self) is not NMFClassifier or self.solver != "spa"
+                or getattr(self.transform, "__func__", None) is not NMFClassifier.transform):
+            return super().fit_transform(X, y, **fit_params)
+        # Match TransformerMixin's label and fit-parameter delegation, including
+        # the existing TypeError for missing labels or unsupported parameters.
+        if y is None:
+            self.fit(X, **fit_params)
+        else:
+            self.fit(X, y, **fit_params)
+        if (type(self) is NMFClassifier
+                and getattr(self.transform, "__func__", None) is NMFClassifier.transform
+                and type(self.decomposition_) is FeatureSPA
+                and self.training_coordinates_mode_ == "transform"):
+            return self.training_coordinates_.copy()
+        return self.transform(X)
 
     def _fit_with_screening(self, X, y, selector):
         """Reuse a selector fitted on this training fold by the study runner.
@@ -372,7 +394,7 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
 
     def _fit_impl(self, X, y, prepared_selector=None):
         start = time.perf_counter()
-        threshold = getattr(self, "decision_threshold", None)
+        threshold = self.decision_threshold
         if threshold is not None and (
                 isinstance(threshold, (bool, np.bool_)) or not isinstance(threshold, Real)
                 or not np.isfinite(threshold)
@@ -382,19 +404,26 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
         projection_settings = self._projection_settings()
         if self.solver not in {"cd", "spa", "mu"}:
             raise ValueError("solver must be 'cd', 'spa', or 'mu'.")
-        if not isinstance(self.mu_projection, str) or self.mu_projection not in {"batch", "rowwise"}:
-            raise ValueError("mu_projection must be 'batch' or 'rowwise'.")
+        if not isinstance(self.mu_projection, str) or self.mu_projection not in {"auto", "batch", "rowwise"}:
+            raise ValueError("mu_projection must be 'auto', 'batch', or 'rowwise'.")
         if self.mu_projection == "rowwise" and self.solver != "mu":
             raise ValueError("mu_projection='rowwise' requires solver='mu'.")
-        mu_projection_mode = self.mu_projection if self.solver == "mu" else None
+        mu_projection_mode = None
+        if self.solver == "mu":
+            mu_projection_mode = "rowwise" if self.mu_projection == "auto" else self.mu_projection
         if self.screening not in {"percentile", "absolute", "none"}:
             raise ValueError("screening must be 'percentile', 'absolute', or 'none'.")
         if (not isinstance(self.training_coordinates, str)
                 or self.training_coordinates not in {"auto", "fit_transform", "transform"}):
             raise ValueError("training_coordinates must be 'auto', 'fit_transform', or 'transform'.")
         training_coordinates_mode = self.training_coordinates
-        if training_coordinates_mode == "auto":
-            training_coordinates_mode = "transform" if self.solver == "spa" else "fit_transform"
+        if self.solver == "spa":
+            # FeatureSPA.fit_transform uses the same fixed-basis NNLS map.
+            # Resolve all public SPA modes to that map and account for its
+            # one training projection separately from anchor/basis fitting.
+            training_coordinates_mode = "transform"
+        elif training_coordinates_mode == "auto":
+            training_coordinates_mode = "fit_transform"
         if not isinstance(self.classifier, str) or self.classifier not in {"knn", "logistic", "linear_svm"}:
             raise ValueError("classifier must be 'knn', 'logistic', or 'linear_svm'.")
         if (not isinstance(self.knn_normalization, str)
@@ -421,11 +450,12 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
                     isinstance(class_weight, str) and class_weight == "balanced"):
                 raise ValueError(f"{prefix}_class_weight must be None, 'balanced', or a dictionary.")
         X, y, classes, counts = _binary_data(X, y)
-        positive_label = getattr(self, "positive_label", None)
+        positive_label = self.positive_label
         positive_index = 1
         if positive_label is not None:
             if not np.isscalar(positive_label):
                 raise ValueError("positive_label must be one of the two training classes.")
+            _validate_class_label(positive_label)
             matches = [i for i, label in enumerate(classes) if label == positive_label]
             if len(matches) != 1:
                 raise ValueError("positive_label must be one of the two training classes.")
@@ -474,7 +504,12 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
                 n_components=self.n_components, nnls_max_iter=self.max_iter,
                 **projection_settings)
         stage = time.perf_counter()
-        W, fitting_warnings = _record_warnings(lambda: decomposition.fit_transform(X_selected))
+        if self.solver == "spa":
+            # Calling fit_transform here would already project training data.
+            # Fit only the anchors/basis, then project once in the stage below.
+            _, fitting_warnings = _record_warnings(lambda: decomposition.fit(X_selected))
+        else:
+            W, fitting_warnings = _record_warnings(lambda: decomposition.fit_transform(X_selected))
         factorization_seconds = time.perf_counter() - stage
         stage = time.perf_counter()
         projection_warnings = ()
@@ -555,12 +590,20 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
 
     def _projection_settings(self):
         settings = dict(
-            projection_solver=getattr(self, "projection_solver", "scipy"),
-            projection_workers=getattr(self, "projection_workers", 1),
-            projection_batch_size=getattr(self, "projection_batch_size", 256),
-            projection_native_threads=getattr(self, "projection_native_threads", 1))
+            projection_solver=self.projection_solver,
+            projection_workers=self.projection_workers,
+            projection_batch_size=self.projection_batch_size,
+            projection_native_threads=self.projection_native_threads)
         validate_projection_parameters(**settings)
         return settings
+
+    def _validate_fitted_labels(self):
+        """Check saved label values without consulting queued constructor policy."""
+        for classes in (getattr(self, "classes_", None),
+                        getattr(self.classifier_, "classes_", None)):
+            if classes is not None:
+                _validate_class_labels(classes)
+        _validate_class_label(getattr(self, "positive_label_", None))
 
     def transform(self, X):
         check_is_fitted(self, "classifier_")
@@ -585,6 +628,7 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
                     f"X has {X.shape[1]} features, but {type(self).__name__} is expecting "
                     f"{self.n_features_in_} features as input."
                 )
+            self._validate_fitted_labels()
             X_selected = X[:, self.selected_features_]
             if type(decomposition) is NMF and "transform" not in vars(decomposition):
                 basis = decomposition.components_
@@ -597,7 +641,7 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
                     if basis.dtype != np.float64:
                         decomposition.components_ = basis.astype(np.float64)
             projection_transform = (transform_mu_rowwise
-                                    if getattr(self, "mu_projection_", "batch") == "rowwise"
+                                    if self.mu_projection_ == "rowwise"
                                     else transform_mu)
             W, messages = _record_warnings(
                 lambda: projection_transform(decomposition, X_selected), diagnostics=diagnostics)
@@ -614,10 +658,27 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
 
     def predict(self, X):
         check_is_fitted(self, "classifier_")
-        head, coordinates = self._head_input(self.transform(X))
-        if getattr(self, "decision_threshold_", None) is None:
+        head, coordinates = self._head_input(self._prediction_coordinates(X))
+        if self.decision_threshold_ is None:
             return head.predict(coordinates)
         return self._labels_from_probabilities(head.predict_proba(coordinates))
+
+    def score(self, X, y, sample_weight=None):
+        """Return sklearn accuracy while rejecting unsupported target labels."""
+        from sklearn.metrics import accuracy_score
+
+        predicted = self.predict(X)
+        check_consistent_length(y, predicted, sample_weight)
+        y = _validate_class_labels(y)
+        return accuracy_score(y, predicted, sample_weight=sample_weight)
+
+    def _prediction_coordinates(self, X):
+        coordinates = self.transform(X)
+        if getattr(self.transform, "__func__", None) is not NMFClassifier.transform:
+            # Standard transform already checks saved labels after X validation.
+            # Preserve custom transform delegation while guarding its consumers.
+            self._validate_fitted_labels()
+        return coordinates
 
     def _head_input(self, coordinates):
         """Apply a fitted head scaler once, without changing the NMF map."""
@@ -635,7 +696,7 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
     @available_if(_head_supports("predict_proba"))
     def predict_proba(self, X):
         check_is_fitted(self, "classifier_")
-        return self.classifier_.predict_proba(self.transform(X))
+        return self.classifier_.predict_proba(self._prediction_coordinates(X))
 
     @available_if(_head_supports("predict_proba"))
     def predict_with_probabilities(self, X):
@@ -645,15 +706,18 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
         and logistic labels use sklearn's decision rule, including when a small
         nonzero decision rounds to a probability of one half. An explicit
         fitted threshold uses the same strict probability rule as ``predict``.
-        This avoids repeating expensive projection, and KNN neighbor searches, when
-        benchmark metrics require both predicted labels and probabilities.
+        This avoids repeating expensive projection and normally reuses KNN
+        probabilities for labels. Near weighted-vote ties use the native label
+        calculation because its floating-point reduction can differ; callable
+        weights also retain their native decision.
         """
         check_is_fitted(self, "classifier_")
-        head, coordinates = self._head_input(self.transform(X))
+        head, coordinates = self._head_input(self._prediction_coordinates(X))
         probabilities = head.predict_proba(coordinates)
-        if getattr(self, "decision_threshold_", None) is not None:
+        if self.decision_threshold_ is not None:
             labels = self._labels_from_probabilities(probabilities)
-        elif isinstance(head, KNeighborsClassifier):
+        elif (type(head) is KNeighborsClassifier
+              and _knn_probabilities_preserve_labels(head, coordinates, probabilities)):
             labels = self.classes_[probabilities.argmax(axis=1)]
         else:
             labels = head.predict(coordinates)
@@ -663,7 +727,7 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
     def decision_function(self, X):
         """Return genuine margins toward classes_[1], with one projection."""
         check_is_fitted(self, "classifier_")
-        head, coordinates = self._head_input(self.transform(X))
+        head, coordinates = self._head_input(self._prediction_coordinates(X))
         return head.decision_function(coordinates)
 
     @available_if(_head_supports("decision_function"))
@@ -676,9 +740,9 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
         ``classes_[0]``.
         """
         check_is_fitted(self, "classifier_")
-        head, coordinates = self._head_input(self.transform(X))
+        head, coordinates = self._head_input(self._prediction_coordinates(X))
         margins = head.decision_function(coordinates)
-        if getattr(self, "decision_threshold_", None) is not None:
+        if self.decision_threshold_ is not None:
             labels = self._labels_from_probabilities(head.predict_proba(coordinates))
         else:
             # Both supported binary margin heads use sklearn's strict > 0
@@ -688,6 +752,7 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
 
     def get_support(self, indices=False):
         check_is_fitted(self, "classifier_")
+        self._validate_fitted_labels()
         if indices:
             return self.selected_features_.copy()
         support = np.zeros(self.n_features_in_, dtype=bool)

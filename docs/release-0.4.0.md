@@ -90,6 +90,17 @@ These checks reuse development cohorts and do not constitute a new held-out
 study. Python 3.11 or later is required. Chang Cheng's original work remains
 All Rights Reserved, with the separate third-party notices preserved.
 
+The separate [October 29 current-package comparison](current-package-evidence-20261029.md)
+qualified 34 final evaluations with the AOCL-specific workaround. Its primary
+Smiling SPA-minus-PCA balanced-accuracy difference was +1.24 percentage points
+(95% interval −1.00 to +3.47), with mixed outcomes on the secondary task and poor
+untuned-constructor results. Calibration preserved completed pre-fix evidence;
+all final fits used current source. The scientific comparison is available,
+while one historical controller observation remains incomplete. This dated
+evidence does not reattribute the earlier test counts to the later workaround,
+provide fresh independent confirmation, or change defaults. **Release remains
+paused.**
+
 ```shell
 python -m pip install --upgrade supervised_nmf-0.4.0-py3-none-any.whl
 ```

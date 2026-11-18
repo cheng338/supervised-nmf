@@ -72,9 +72,9 @@ class SharedKNNGridTests(unittest.TestCase):
             self.assertEqual(expected["parameters"], actual["parameters"])
             self.assertTrue(expected["valid"], expected)
             self.assertTrue(actual["valid"], actual)
-            self.assertEqual(expected["mean_balanced_accuracy"], actual["mean_balanced_accuracy"])
-            self.assertEqual([fold["balanced_accuracy"] for fold in expected["folds"]],
-                             [fold["balanced_accuracy"] for fold in actual["folds"]])
+            self.assertEqual(expected["mean_score"], actual["mean_score"])
+            self.assertEqual([fold["score"] for fold in expected["folds"]],
+                             [fold["score"] for fold in actual["folds"]])
             for expected_fold, actual_fold in zip(expected["folds"], actual["folds"]):
                 for field in ("n_iter", "converged", "last_transform_converged",
                               "n_selected_features", "selected_feature_indices"):
@@ -110,7 +110,7 @@ class SharedKNNGridTests(unittest.TestCase):
         self.assertEqual(result["tuning_seconds"], sum(result["compute_seconds"].values()))
 
     def test_pca_pipeline_uses_original_fit_transform_coordinates(self):
-        estimator = Pipeline([("screen", BinaryScreening(percentile=100)),
+        estimator = Pipeline([("screen", BinaryScreening(screening="percentile", percentile=100)),
                               ("pca", PCA(n_components=2, svd_solver="full", random_state=7, whiten=True)),
                               ("knn", KNeighborsClassifier(weights="distance"))])
         grid = {"pca__n_components": [2, 3], "knn__n_neighbors": [1, 3]}
@@ -129,7 +129,7 @@ class SharedKNNGridTests(unittest.TestCase):
         self.assertTrue(all(shape[0] == 16 for shape in transformed_shapes))
 
     def test_screening_only_and_raw_knn_match_ordinary_grid(self):
-        estimator = Pipeline([("screen", BinaryScreening(percentile=50)),
+        estimator = Pipeline([("screen", BinaryScreening(screening="percentile", percentile=50)),
                               ("knn", KNeighborsClassifier())])
         self.assert_equivalent(estimator, {"knn__n_neighbors": [1, 3, 5]}, "screen")
         self.assert_equivalent(KNeighborsClassifier(weights="distance"), {"n_neighbors": [1, 3, 5]}, "raw")
@@ -180,15 +180,15 @@ class SharedKNNGridTests(unittest.TestCase):
             self.assertEqual(shared["selected_parameters"], ordinary["selected_parameters"])
             for expected, actual in zip(ordinary["candidates"], shared["candidates"]):
                 self.assertTrue(actual["valid"])
-                self.assertEqual([row["balanced_accuracy"] for row in expected["folds"]],
-                                 [row["balanced_accuracy"] for row in actual["folds"]])
+                self.assertEqual([row["score"] for row in expected["folds"]],
+                                 [row["score"] for row in actual["folds"]])
 
     def test_shared_costs_are_counted_once_and_resume_never_queries(self):
         estimator = KNeighborsClassifier(algorithm="brute")
         grid = {"n_neighbors": [1, 3, 5, 200]}
         report = self.shared(estimator, grid, "cost-accounting")
         costs = report["compute_seconds"]
-        self.assertEqual(report["schema_version"], 3)
+        self.assertEqual(report["schema_version"], 4)
         self.assertEqual(costs["knn_shared_query_seconds"],
                          sum(row["neighbor_query_seconds"] for row in report["representation_folds"]))
         self.assertEqual(costs["knn_reuse_setup_seconds"],
@@ -228,7 +228,7 @@ class SharedKNNGridTests(unittest.TestCase):
                             for fold in report["representation_folds"]))
 
     def test_screening_is_fit_on_each_training_fold_once_without_refit(self):
-        estimator = Pipeline([("screen", BinaryScreening(percentile=50)),
+        estimator = Pipeline([("screen", BinaryScreening(screening="percentile", percentile=50)),
                               ("knn", KNeighborsClassifier())])
         observed = []
         original_fit = BinaryScreening.fit
@@ -252,7 +252,7 @@ class SharedKNNGridTests(unittest.TestCase):
         for candidate in result["candidates"]:
             self.assertFalse(candidate["valid"])
             self.assertEqual(candidate["invalid_fold_count"], 5)
-            self.assertIsNone(candidate["mean_balanced_accuracy"])
+            self.assertIsNone(candidate["mean_score"])
         self.assertIsNone(result["selected_parameters"])
         self.assertFalse(result["is_fallback"])
 
@@ -265,7 +265,7 @@ class SharedKNNGridTests(unittest.TestCase):
         raw = self.shared(KNeighborsClassifier(), {"n_neighbors": [1, 1000]}, "large-k")
         self.assertTrue(raw["candidates"][0]["valid"])
         self.assertFalse(raw["candidates"][1]["valid"])
-        self.assertIsNone(raw["candidates"][1]["mean_balanced_accuracy"])
+        self.assertIsNone(raw["candidates"][1]["mean_score"])
 
     def test_projection_warning_invalidates_all_neighbors_for_that_representation(self):
         estimator = NMFClassifier(solver="spa", screening="none", n_components=2, random_state=7)
@@ -283,7 +283,7 @@ class SharedKNNGridTests(unittest.TestCase):
         self.assertTrue(all(not row["neighbors"] for row in result["representation_folds"]))
 
     def test_resume_reuses_folds_and_preserves_shared_compute_totals(self):
-        estimator = Pipeline([("screen", BinaryScreening(percentile=50)),
+        estimator = Pipeline([("screen", BinaryScreening(screening="percentile", percentile=50)),
                               ("knn", KNeighborsClassifier())])
         first = self.shared(estimator, {"knn__n_neighbors": [1, 3]})
         with patch.object(BinaryScreening, "fit", side_effect=AssertionError("Completed fold should not refit")):
@@ -303,13 +303,13 @@ class SharedKNNGridTests(unittest.TestCase):
                                  seed=19, checkpoint_dir=Path(self.temp.name) / "shared")
         path = next((Path(self.temp.name) / "shared" / "folds").glob("*.json"))
         envelope = json.loads(path.read_text())
-        envelope["payload"]["neighbors"]["1"]["balanced_accuracy"] = 0.123
+        envelope["payload"]["neighbors"]["1"]["score"] = 0.123
         path.write_text(json.dumps(envelope))
         with self.assertRaisesRegex(ValueError, "integrity"):
             self.shared(estimator, {"n_neighbors": [1, 3]})
 
     def test_interrupted_fold_keeps_completed_folds_and_failed_attempt(self):
-        estimator = Pipeline([("screen", BinaryScreening(percentile=50)),
+        estimator = Pipeline([("screen", BinaryScreening(screening="percentile", percentile=50)),
                               ("knn", KNeighborsClassifier())])
         original_fit = BinaryScreening.fit
         calls = []

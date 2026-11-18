@@ -38,7 +38,8 @@ def reference_product(left, right):
 def source_product_sites():
     sites = {}
     # The three outer role aliases select either the original callable or its
-    # scoped output workspace. Keep all original22 logical product sites in coverage.
+    # scoped output workspace. Retain original22 fallback sites plus the final-report opt-in, the three
+    # consumer sites, and the two quiet-only helper sites as distinct routes.
     # The private residual helper is the diagnostic reconstruction role;
     # its protected native branches have separate operand/storage tests.
     product_names = {"matmul", "outer_reconstruction", "outer_gradient_w", "outer_gradient_h", "_diagnostic_residual"}
@@ -52,6 +53,31 @@ def source_product_sites():
                                 child.end_lineno, child.end_col_offset)
                     sites[position] = node.name
     return sites
+
+
+def handoff_consumer_product_sites():
+    """Identify only the three products in the capsule-present PG branch."""
+    fit = next(node for node in ast.walk(SOURCE_TREE)
+               if isinstance(node, ast.FunctionDef) and node.name == "fit_transform")
+    branches = [node for node in ast.walk(fit)
+                if isinstance(node, ast.If)
+                and ast.unparse(node.test) == "_handoff is None or _handoff[3] is None"]
+    assert len(branches) == 1
+    calls = sorted((child for statement in branches[0].orelse
+                    for child in ast.walk(statement)
+                    if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+                    and child.func.id in {"outer_gradient_w", "outer_gradient_h"}),
+                   key=lambda child: (child.lineno, child.col_offset))
+    assert [child.func.id for child in calls] == [
+        "outer_gradient_w", "outer_gradient_w", "outer_gradient_h"]
+    return tuple((child.lineno, child.col_offset, child.end_lineno, child.end_col_offset)
+                 for child in calls)
+
+
+def quiet_helper_product_sites():
+    """The duplicated quiet tail has two sites; it is not the ordinary route."""
+    return {site for site, owner in source_product_sites().items()
+            if owner == "_nnls_final_state"}
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -110,22 +136,45 @@ def unit_initializer(data, rank, **kwargs):
     return np.ones((len(data), 1)), np.ones((1, data.shape[1]))
 
 
-def test_all_twenty_two_source_products_use_the_selected_callable():
+def test_all_source_products_use_the_selected_callable():
     sites = source_product_sites()
-    assert len(sites) == 22
+    assert len(sites) == 28
+    assert len(quiet_helper_product_sites()) == 2
+    assert len(set(sites) - set(handoff_consumer_product_sites())
+               - quiet_helper_product_sites()) == 23
     assert Counter(sites.values()) == {
-        # The public two-result/signature wrapper delegates to the shared core;
-        # its six original products and the total routing coverage are retained.
-        "projected_gradient_kkt": 5, "_nnls_block_pivot": 6, "fit_transform": 11,
+        # Ordinary/replay products remain in the original core. The helper
+        # duplicates two quiet-only products; three consumer sites are separate.
+        "projected_gradient_kkt": 5, "_nnls_block_pivot": 6,
+        "_nnls_final_state": 2, "fit_transform": 15,
     }
-    # Nested products on the same source line have different AST spans.
-    assert len({position[0] for position in sites}) < len(sites)
 
 
-def test_every_product_site_is_exercised_including_nested_calls(monkeypatch):
+def final_report_product_sites():
+    fit = next(node for node in ast.walk(SOURCE_TREE)
+               if isinstance(node, ast.FunctionDef) and node.name == "fit_transform")
+    sites = {}
+    for node in ast.walk(fit):
+        if (isinstance(node, ast.Assign) and any(isinstance(target, ast.Attribute)
+                and target.attr == "reconstruction_err_" for target in node.targets)):
+            calls = [child for child in ast.walk(node) if isinstance(child, ast.Call)
+                     and isinstance(child.func, ast.Name) and child.func.id == "matmul"]
+            assert len(calls) == 1
+            call = calls[0]
+            explicit = bool(call.keywords)
+            if explicit:
+                assert len(call.keywords) == 1 and call.keywords[0].arg == "_final_report_copy4"
+                assert isinstance(call.keywords[0].value, ast.Constant) and call.keywords[0].value.value is True
+            sites[explicit] = (call.lineno, call.col_offset, call.end_lineno, call.end_col_offset)
+    assert set(sites) == {False, True}
+    return sites
+
+
+@pytest.mark.parametrize("padded", [False, True], ids=["ordinary-report", "padded-report-opt-in"])
+def test_every_product_site_is_exercised_including_nested_calls(monkeypatch, padded):
     observed, selections = set(), []
 
-    def recorded(left, right):
+    def recorded(left, right, **kwargs):
         frame = inspect.currentframe().f_back
         if frame.f_globals is experimental.__dict__ and frame.f_code.co_name == "_diagnostic_residual":
             assert frame.f_back.f_globals is experimental.__dict__
@@ -136,8 +185,11 @@ def test_every_product_site_is_exercised_including_nested_calls(monkeypatch):
                 frame.f_code, show_caches=True) if item.offset == frame.f_lasti)
             position = instruction.positions
             assert position.col_offset is not None, "Python code-position metadata is required"
-            observed.add((position.lineno, position.col_offset,
-                          position.end_lineno, position.end_col_offset))
+            site = (position.lineno, position.col_offset,
+                    position.end_lineno, position.end_col_offset)
+            assert kwargs == ({"_final_report_copy4": True}
+                              if padded and site == final_report_product_sites()[True] else {})
+            observed.add(site)
         finally:
             del frame
         return reference_product(left, right)
@@ -155,6 +207,8 @@ def test_every_product_site_is_exercised_including_nested_calls(monkeypatch):
         return answer, 1, 0
 
     monkeypatch.setattr(experimental, "nnls_matmul", select)
+    if padded:
+        monkeypatch.setattr(experimental, "padded_matmul", recorded)
     monkeypatch.setattr(experimental, "_passive_solve", diagonal_passive_solve)
     monkeypatch.setattr(experimental, "_initialize_nmf", unit_initializer)
     design, targets, expected = analytic_problem()
@@ -169,10 +223,109 @@ def test_every_product_site_is_exercised_including_nested_calls(monkeypatch):
     assert model.converged_
     assert model.n_iter_ == 1
     experimental.projected_gradient_kkt(data, coordinates, model.components_)
-    model.transform(data / 2)
-    assert model.last_transform_converged_
+    with experimental.capture_transform_diagnostics(model) as diagnostic:
+        model.transform(data / 2)
+    assert diagnostic["converged"]
     assert len(selections) == 6  # direct NNLS, fit, two sweeps, diagnostic, transform NNLS
-    assert observed == set(source_product_sites())
+    # Replaced numerical bindings deliberately decline capsule admission.
+    fallback_sites = (set(source_product_sites()) - set(handoff_consumer_product_sites())
+                      - quiet_helper_product_sites())
+    # Each policy executes exactly one report expression; the parameter pair
+    # covers both sites and asserts the opt-in keyword is confined to its site.
+    fallback_sites -= {final_report_product_sites()[not padded]}
+    assert observed == fallback_sites and len(observed) == 22
+    # Controlled private-tail routing only: not natural admission or an added
+    # public API obligation. Use the same selected callable and known exact
+    # feasible state; the independent profile-only science proves admission.
+    scale = np.maximum(np.max(np.abs(reference_product(design.T, targets)), axis=0),
+                       np.finfo(float).tiny)
+    returned, tail_info, residual, gradient = experimental._nnls_final_state(
+        recorded, design, targets, expected.copy(), np.empty(0, dtype=int),
+        scale, 1e-10, 1, 3, 1, 0, 0)
+    np.testing.assert_allclose(returned, expected, rtol=0, atol=1e-13)
+    np.testing.assert_array_equal(residual, reference_product(design, returned) - targets)
+    np.testing.assert_array_equal(gradient, reference_product(design.T, residual))
+    assert tail_info["success"]
+    assert observed == fallback_sites | quiet_helper_product_sites()
+
+
+@pytest.mark.parametrize("replay", [False, True], ids=["quiet", "gw-replay"])
+def test_handoff_consumer_product_sites_use_selected_callable(monkeypatch, replay):
+    """Exercise actual fit consumer branches with a controlled valid offer.
+
+    This isolates routing and FPE replay. The supplied offer bypasses producer
+    admission deliberately; real admission is covered by profile-only science.
+    """
+    quiet_site, replay_site, h_site = handoff_consumer_product_sites()
+    observed, policies, offers, checks = [], [], [], []
+    original_policy = np.geterr().copy()
+    injected = FloatingPointError("controlled strict W-gradient boundary")
+    fired = []
+
+    def recorded(left, right):
+        frame = inspect.currentframe().f_back
+        try:
+            instruction = next(item for item in dis.get_instructions(
+                frame.f_code, show_caches=True) if item.offset == frame.f_lasti)
+            position = instruction.positions
+            site = (position.lineno, position.col_offset,
+                    position.end_lineno, position.end_col_offset)
+        finally:
+            del frame
+        if site in (quiet_site, replay_site, h_site):
+            observed.append(site)
+            policies.append(np.geterr().copy())
+        if site == quiet_site and replay:
+            assert not fired
+            fired.append(injected)
+            raise injected
+        return reference_product(left, right)
+
+    def diagonal_passive_solve(design, targets, gram, cross, passive):
+        diagonal = np.diag(gram)
+        np.testing.assert_array_equal(gram, np.diag(diagonal))
+        return np.where(passive, cross / diagonal[:, None], 0.0), 1, 0
+
+    def offer(role, W, H, X, operation):
+        assert operation is recorded and role is None
+        residual = reference_product(W, H) - X
+        gradient = reference_product(W.T, residual)
+        payload = (W, H, residual, gradient, np.geterr().copy())
+        offers.append(payload)
+        return payload
+
+    def usable(payload, role, W, H, X, operation):
+        assert payload is offers[-1] and role is None and operation is recorded
+        assert payload[0] is W and payload[1] is H
+        np.testing.assert_array_equal(payload[2], reference_product(W, H) - X)
+        np.testing.assert_array_equal(payload[3], reference_product(W.T, payload[2]))
+        checks.append(True)
+        return True
+
+    monkeypatch.setattr(experimental, "nnls_matmul", lambda: recorded)
+    monkeypatch.setattr(experimental, "_passive_solve", diagonal_passive_solve)
+    monkeypatch.setattr(experimental, "_initialize_nmf", unit_initializer)
+    monkeypatch.setattr(experimental, "_take_handoff", offer)
+    monkeypatch.setattr(experimental, "_handoff_usable", usable)
+    # Retain controlled consumer routing above the fixed rank-one early gate.
+    data = np.tile(np.array([[2., 4., 6., 8.]]), (4097, 1))
+    assert data.size > 16384
+    model = experimental.ANLSBPP(1, max_iter=4)
+    coordinates = model.fit_transform(data)
+    assert model.converged_ and model.n_iter_ == 1
+    assert len(offers) == 1
+    np.testing.assert_allclose(reference_product(coordinates, model.components_),
+                               data, rtol=0, atol=1e-13)
+    assert observed == ([quiet_site, replay_site, h_site] if replay else [quiet_site])
+    assert fired == ([injected] if replay else [])
+    # The injected take bypasses initial usability; quiet joint consumption
+    # still performs the selected parent's second check. Replay drops the offer.
+    assert checks == ([] if replay else [True])
+    probe_policy = dict.fromkeys(original_policy, "raise")
+    if original_policy["under"] == "ignore":
+        probe_policy["under"] = "ignore"
+    assert policies == [probe_policy] + ([original_policy, original_policy] if replay else [])
+    assert np.geterr() == original_policy
 
 
 AOCL = {"user_api": "blas", "internal_api": "blis", "prefix": "aocl-libblis",
@@ -278,9 +431,10 @@ def test_fit_transform_clone_serialization_and_nonmutation(monkeypatch, referenc
     np.testing.assert_allclose(reference_product(coordinates, model.components_), data,
                                rtol=1e-12, atol=1e-12)
     basis = model.components_.copy()
-    np.testing.assert_allclose(model.transform(data / 2), coordinates / 2,
-                               rtol=1e-12, atol=1e-12)
-    assert model.last_transform_converged_
+    with experimental.capture_transform_diagnostics(model) as diagnostic:
+        np.testing.assert_allclose(model.transform(data / 2), coordinates / 2,
+                                   rtol=1e-12, atol=1e-12)
+    assert diagnostic["converged"]
     np.testing.assert_array_equal(model.components_, basis)
     np.testing.assert_array_equal(data, original)
     # A local selected callable must not become fitted/serialized backend state.
@@ -313,10 +467,10 @@ def test_transform_cap_retains_warning_and_basis(reference_dispatch):
     basis = model.components_.copy()
     queries = layout_copy(np.array([[1., 3.], [2., 6.]]), "strided")
     before = queries.copy()
-    with pytest.warns(ConvergenceWarning, match="inner NNLS failed"):
+    with pytest.warns(ConvergenceWarning, match="inner NNLS failed"), experimental.capture_transform_diagnostics(model) as diagnostic:
         result = model.transform(queries)
-    assert not model.last_transform_converged_
-    assert not model.last_transform_diagnostics_["success"]
+    assert not diagnostic["converged"]
+    assert not diagnostic["diagnostics"]["success"]
     assert result.shape == (2, 2) and np.all(result >= 0)
     np.testing.assert_array_equal(model.components_, basis)
     np.testing.assert_array_equal(queries, before)

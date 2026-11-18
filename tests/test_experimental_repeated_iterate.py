@@ -164,9 +164,9 @@ class _InjectedFailure(RuntimeError):
     pass
 
 
-def _scripted_fit(monkeypatch, scenario, model=None):
+def _scripted_fit(monkeypatch, scenario, model=None, *, expected_failure=None):
     """Run the real outer loop with controlled inner/PG outcomes and real arrays."""
-    retain_traceback = scenario in ("retained_hash", "retained_equality")
+    retain_traceback = scenario in ("retained_hash", "retained_equality", "retained_crc")
     rank = 2 if scenario == "rank_bypass" else 1
     cap = 12 if retain_traceback else 1 if scenario == "one_sweep" else 4
     tol = 0.0 if scenario == "tol_zero" else 1e-4
@@ -280,13 +280,15 @@ def _scripted_fit(monkeypatch, scenario, model=None):
         else:
             model.set_params(n_components=rank, max_iter=cap, tol=tol)
         output, raised = None, None
-        # Ordinary exit checks dispose of tracebacks. The two dedicated failure
-        # cases deliberately retain them to test explicit history clearing.
+        # Ordinary exit checks dispose of tracebacks. Dedicated failure cases
+        # deliberately retain them to test explicit history clearing.
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             try:
                 output = model.fit_transform(x)
-            except _InjectedFailure as error:
+            except (_InjectedFailure, MemoryError) as error:
+                if error is not expected_failure and not isinstance(error, _InjectedFailure):
+                    raise
                 raised = str(error)
                 if retain_traceback:
                     state["retained_error"] = error
@@ -396,10 +398,10 @@ def test_small_actual_rank1_fit_preserves_truthful_status_and_projection():
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         w = model.fit_transform(x)
-    with warnings.catch_warnings():
+    with warnings.catch_warnings(), experimental.capture_transform_diagnostics(model) as diagnostic:
         warnings.simplefilter("ignore", ConvergenceWarning)
         projected = model.transform(query)
-    assert model.last_transform_converged_
+    assert diagnostic["converged"]
     assert w.shape == (64, 1) and model.components_.shape == (1, 32) and projected.shape == (8, 1)
     assert all(np.isfinite(value).all() and (value >= 0).all() for value in (w, model.components_, projected))
     assert (x.tobytes(), query.tobytes()) == before
@@ -416,3 +418,96 @@ def test_small_actual_rank1_fit_preserves_truthful_status_and_projection():
         assert any(issubclass(item.category, ConvergenceWarning) and model.convergence_reason_ in str(item.message)
                    for item in caught)
     assert model.cycle_event_ is None or model.relative_projected_gradient_ > model.tol
+
+
+@pytest.mark.parametrize("shape", [(3, 4), (32752, 16)])
+def test_crc_fingerprint_streams_original_factor_buffers_in_order(monkeypatch, shape):
+    w = (np.arange(shape[0], dtype=np.float64) + 1).reshape(-1, 1)
+    h = (np.arange(shape[1], dtype=np.float64) + 2).reshape(1, -1)
+    pair = w, h
+    for value in pair:
+        value.setflags(write=False)
+    before = _signature(pair)
+    crc32 = experimental._cycle_zlib.crc32
+    # Independent stream oracle; copies are confined to this test setup.
+    expected = crc32(w.tobytes(order="C") + h.tobytes(order="C"))
+    calls = []
+
+    def record(data, seed=0):
+        factor = pair[len(calls)]
+        assert isinstance(data, memoryview)
+        assert data.obj is factor and data.format == "B" and data.ndim == 1
+        assert data.nbytes == factor.nbytes and data.readonly
+        digest = crc32(data, seed)
+        calls.append((seed, digest))
+        return digest
+
+    monkeypatch.setattr(experimental._cycle_zlib, "crc32", record)
+    assert experimental._ExactFactorCycle._fingerprint(w, h) == expected
+    assert len(calls) == 2
+    assert calls[0][0] == 0 and calls[1][0] == calls[0][1]
+    assert _signature(pair) == before
+    assert all(not value.flags.writeable for value in pair)
+
+
+def test_actual_crc_collisions_verify_both_factors_and_first_match(monkeypatch):
+    first = _pair(0)
+    changed_w = tuple(value.copy() for value in first)
+    changed_h = tuple(value.copy() for value in first)
+    changed_w[0][-1, -1] += 1
+    changed_h[1][-1, -1] += 1
+    pairs = [first, changed_w, changed_h, tuple(value.copy() for value in first)]
+    for pair in pairs:
+        for value in pair:
+            value.setflags(write=False)
+    before = [_signature(pair) for pair in pairs]
+    calls = []
+
+    def collide(data, seed=0):
+        pair_index, factor_index = divmod(len(calls), 2)
+        assert isinstance(data, memoryview)
+        assert data.obj is pairs[pair_index][factor_index]
+        calls.append(seed)
+        return 29
+
+    monkeypatch.setattr(experimental._cycle_zlib, "crc32", collide)
+    detector = experimental._ExactFactorCycle()
+    for iteration, pair in enumerate(pairs[:3], 1):
+        assert detector.observe(*pair, iteration) is None
+    event = detector.observe(*pairs[3], 4)
+    _assert_scalar_event(event)
+    assert event["detector"] == "fingerprint"
+    assert (event["matched_iteration"], event["period"]) == (1, 3)
+    assert calls == [0, 29] * 4
+    assert [_signature(pair) for pair in pairs] == before
+    assert all(not value.flags.writeable for pair in pairs for value in pair)
+
+
+@pytest.mark.parametrize("factor", ["W", "H"])
+def test_crc_failure_preserves_error_and_releases_history(monkeypatch, factor):
+    crc32 = experimental._cycle_zlib.crc32
+    failure = MemoryError("required CRC for " + factor)
+    # Eleven complete observations populate history before the twelfth fails.
+    target_call = 23 if factor == "W" else 24
+    calls = 0
+
+    def fail(data, seed=0):
+        nonlocal calls
+        calls += 1
+        if calls == target_call:
+            raise failure
+        return crc32(data, seed)
+
+    monkeypatch.setattr(experimental._cycle_zlib, "crc32", fail)
+    _, state = _scripted_fit(monkeypatch, "retained_crc", expected_failure=failure)
+    error = state.pop("retained_error")
+    assert error is failure and error.__traceback__ is not None
+    assert calls == target_call
+    assert state["detector_calls"] == list(range(1, 13))
+    # The shared fixture already checked empty history/checkpoint and released
+    # older factors while this traceback was still alive.
+    error.__traceback__ = None
+    del error, failure
+    gc.collect()
+    assert all(reference() is None for reference in state["detector_refs"])
+    assert all(reference() is None for reference, *_ in state["factor_refs"])

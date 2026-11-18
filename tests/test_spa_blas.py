@@ -77,7 +77,12 @@ class SPABlasEquivalenceTests(unittest.TestCase):
         model = FeatureSPA(rank, normalize=normalize, nnls_max_iter=500)
         fitted = model.fit_transform(X)
         np.testing.assert_array_equal(model.anchor_indices_, indices)
-        np.testing.assert_array_equal(fitted, coordinates)
+        # SPA's anchor diagnostics still match the original BLAS/reference
+        # selection exactly. Public fit_transform now uses the same fitted-
+        # basis NNLS map as transform, so check that separate objective too.
+        np.testing.assert_array_equal(model.fit_coordinates_, coordinates)
+        expected_fitted = original_nnls_transform(components, X)
+        np.testing.assert_allclose(fitted, expected_fitted, rtol=rtol, atol=rtol)
         np.testing.assert_allclose(model.column_scales_, scales, rtol=2e-14, atol=2e-14)
         np.testing.assert_allclose(model.components_, components, rtol=rtol, atol=rtol)
         expected = original_nnls_transform(components, incoming)
@@ -222,7 +227,7 @@ class SPABlasEquivalenceTests(unittest.TestCase):
         with self.assertRaises(NotFittedError):
             model.transform(np.ones((1, 4)))
 
-    def test_knn_and_logistic_predictions_match_independent_original_pipeline(self):
+    def test_knn_and_logistic_predictions_match_independent_fixed_basis_pipeline(self):
         rng = np.random.default_rng(819)
         y = np.where(np.arange(84) % 2, "present", "absent")
         coefficients = rng.uniform(.1, .8, (84, 3))
@@ -234,9 +239,8 @@ class SPABlasEquivalenceTests(unittest.TestCase):
         selected = screen.transform(X)
         _, reference_train, reference_basis, _, _ = original_numpy_reference(selected, 3)
         reference_test = original_nnls_transform(reference_basis, screen.transform(incoming))
-        for coordinates in ("fit_transform", "transform"):
-            W = (reference_train if coordinates == "fit_transform"
-                 else original_nnls_transform(reference_basis, selected))
+        W = original_nnls_transform(reference_basis, selected)
+        for coordinates in ("auto", "fit_transform", "transform"):
             for classifier in ("knn", "logistic"):
                 with self.subTest(coordinates=coordinates, classifier=classifier):
                     model = NMFClassifier(n_components=3, solver="spa", screening="absolute", score_threshold=0,
@@ -256,6 +260,8 @@ class SPABlasEquivalenceTests(unittest.TestCase):
                     np.testing.assert_allclose(probabilities, downstream.predict_proba(reference_test),
                                                rtol=2e-8, atol=2e-9)
                     np.testing.assert_allclose(model.training_coordinates_, W, rtol=2e-11, atol=2e-11)
+                    np.testing.assert_array_equal(model.decomposition_.fit_coordinates_, reference_train)
+                    self.assertEqual(model.training_coordinates_mode_, "transform")
                     self.assertTrue(model.converged_)
 
 

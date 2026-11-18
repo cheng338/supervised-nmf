@@ -113,7 +113,7 @@ class StageProfilerTests(unittest.TestCase):
 
     def test_invalid_rank_reports_unreached_projection_for_all_coordinate_policies(self):
         cases = (
-            ("spa", "auto", True), ("spa", "fit_transform", False), ("spa", "transform", True),
+            ("spa", "auto", True), ("spa", "fit_transform", True), ("spa", "transform", True),
             ("cd", "auto", False), ("cd", "fit_transform", False), ("cd", "transform", True),
             ("mu", "auto", False), ("mu", "fit_transform", False), ("mu", "transform", True),
         )
@@ -153,7 +153,7 @@ class StageProfilerTests(unittest.TestCase):
         def fail_factorization(*args, **kwargs):
             raise RuntimeError("factorization stage fixture")
 
-        with patch.object(FeatureSPA, "fit_transform", fail_factorization):
+        with patch.object(FeatureSPA, "fit", fail_factorization):
             record = self.profile(self.model())
         self.assertEqual(record["status"], "failed")
         self.assertEqual(record["error"], "factorization stage fixture")
@@ -165,6 +165,7 @@ class StageProfilerTests(unittest.TestCase):
         methods = [(BinaryScreening, "fit_transform"), (BinaryScreening, "transform")]
         methods += [(cls, method) for cls in (NMF, FeatureSPA, PCA)
                     for method in ("fit_transform", "transform")]
+        methods += [(FeatureSPA, "fit")]
         methods += [(cls, method) for cls in (KNeighborsClassifier, DummyClassifier)
                     for method in ("fit", "predict_proba")]
         methods += [(DummyClassifier, "predict")]
@@ -198,9 +199,9 @@ class StageProfilerTests(unittest.TestCase):
                              "classifier_fit_seconds")
         self.assert_unreached(record, "decomposition_projection_seconds", "classifier_prediction_seconds")
 
-    def test_successful_spa_auto_and_explicit_transform_reproduce_predictions(self):
+    def test_successful_spa_all_coordinate_modes_reproduce_predictions(self):
         references = []
-        for mode in ("auto", "transform"):
+        for mode in ("auto", "fit_transform", "transform"):
             with self.subTest(coordinates=mode):
                 model = self.model(training_coordinates=mode)
                 reference, fitted = self.reference(model)
@@ -216,12 +217,12 @@ class StageProfilerTests(unittest.TestCase):
                 self.assert_absent(record, "screening_fit_seconds", "screening_prediction_seconds")
                 self.assertFalse(hasattr(model, "classifier_"))
                 references.append(reference["predictions"])
-        for field in ("predicted_labels", "positive_class_probability"):
-            np.testing.assert_array_equal(references[0][field], references[1][field])
+        for reference in references[1:]:
+            for field in ("predicted_labels", "positive_class_probability"):
+                np.testing.assert_array_equal(references[0][field], reference[field])
 
-    def test_legacy_and_cd_mu_auto_skip_training_projection(self):
-        for solver, mode in (("spa", "fit_transform"), ("cd", "auto"),
-                             ("cd", "fit_transform"), ("mu", "auto"),
+    def test_cd_mu_factorization_coordinates_skip_training_projection(self):
+        for solver, mode in (("cd", "auto"), ("cd", "fit_transform"), ("mu", "auto"),
                              ("mu", "fit_transform")):
             with self.subTest(solver=solver, coordinates=mode):
                 model = self.model(solver=solver, training_coordinates=mode)

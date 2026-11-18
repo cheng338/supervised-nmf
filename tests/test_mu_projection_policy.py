@@ -79,7 +79,7 @@ def fitted_with_basis(h):
     return model
 
 
-@pytest.mark.parametrize("bad", [None, True, 1, "auto", "single", [], np.asarray(["batch"])])
+@pytest.mark.parametrize("bad", [None, True, 1, "unsupported", "single", [], np.asarray(["batch"])])
 def test_invalid_policy_fails_before_factorization(data, bad, monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("Invalid policy reached factorization")
@@ -97,16 +97,17 @@ def test_rowwise_policy_rejects_non_mu_solver(data, solver):
     assert model.mu_projection_ is None
 
 
-def test_default_keeps_joint_fit_and_batch_transform(data):
+def test_default_keeps_joint_fit_and_rowwise_transform(data):
     x, y, q = data
     default = estimator().fit(x, y)
-    explicit = estimator(mu_projection="batch").fit(x, y)
-    assert default.mu_projection == default.mu_projection_ == "batch"
+    explicit = estimator(mu_projection="rowwise").fit(x, y)
+    assert default.mu_projection == "auto"
+    assert default.mu_projection_ == "rowwise"
     assert default.training_coordinates_mode_ == "fit_transform"
     np.testing.assert_array_equal(default.training_coordinates_, explicit.training_coordinates_)
     np.testing.assert_array_equal(default.decomposition_.components_, explicit.decomposition_.components_)
     selected = q[:, default.selected_features_]
-    expected = transform_mu(deepcopy(default.decomposition_), selected)
+    expected = transform_mu_rowwise(deepcopy(default.decomposition_), selected)
     np.testing.assert_array_equal(default.transform(q), expected)
     np.testing.assert_array_equal(default.predict(q), explicit.predict(q))
 
@@ -144,10 +145,9 @@ def test_policy_clone_pickle_and_set_params_take_effect_on_refit(data, policy):
 
 
 @pytest.mark.parametrize("keep_constructor", [False, True])
-def test_legacy_fitted_state_retains_batch_policy(data, keep_constructor):
+def test_absent_mu_policy_is_not_repaired_or_replaced_from_constructor(data, keep_constructor):
     x, y, q = data
     model = estimator().fit(x, y)
-    expected = model.transform(q)
     del model.mu_projection_
     if keep_constructor:
         model.mu_projection = "rowwise"
@@ -155,13 +155,21 @@ def test_legacy_fitted_state_retains_batch_policy(data, keep_constructor):
         del model.mu_projection
     assert "mu_projection" not in _diagnostics(model)
     restored = pickle.loads(pickle.dumps(model))
-    assert restored.mu_projection_ == "batch"
-    assert restored.mu_projection == ("rowwise" if keep_constructor else "batch")
-    np.testing.assert_array_equal(restored.transform(q), expected)
-    assert clone(restored).get_params() == restored.get_params()
+    assert not hasattr(restored, "mu_projection_")
+    if keep_constructor:
+        assert restored.mu_projection == "rowwise"
+        assert clone(restored).get_params() == restored.get_params()
+    else:
+        assert not hasattr(restored, "mu_projection")
+    with pytest.raises(AttributeError, match="mu_projection_"):
+        restored.transform(q)
     report = evaluate_classifier(restored, x, y)
-    assert report["status"] == "valid"
-    assert report["diagnostics"]["mu_projection"] == "batch"
+    assert report["status"] == "failed"
+    assert report["error_type"] == "AttributeError"
+    assert "mu_projection_" in report["error"]
+    assert "mu_projection" not in report["diagnostics"]
+    assert report["diagnostics"]["last_transform_performed"] is True
+    assert report["diagnostics"]["last_transform_converged"] is False
 
 
 def test_failed_refit_clears_fitted_policy(data):

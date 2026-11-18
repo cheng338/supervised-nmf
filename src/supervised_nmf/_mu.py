@@ -2,6 +2,7 @@
 
 import math
 from copy import copy
+from collections import namedtuple
 from fractions import Fraction
 from numbers import Integral, Real
 import warnings
@@ -10,6 +11,10 @@ import numpy as np
 from scipy.special import logsumexp
 from sklearn.decomposition import NMF
 from sklearn.exceptions import ConvergenceWarning
+
+
+_CappedPrefix = namedtuple("_CappedPrefix", "count coordinates")
+_SuffixSetup = namedtuple("_SuffixSetup", "result cache")
 
 
 _NMF_TRANSFORM = NMF.transform
@@ -119,7 +124,7 @@ def _log_sum(values, axis=None):
         return logsumexp(values, axis=axis)
 
 
-def _log_cross(left, right):
+def _log_cross_reference(left, right):
     """Log of a nonnegative product; no three-dimensional product workspace."""
     result = np.empty((len(left), len(right)), dtype=np.float64)
     for column in range(len(right)):
@@ -127,7 +132,48 @@ def _log_cross(left, right):
     return result
 
 
-def _log_error(log_x, log_w, log_h, row_shifts):
+def _log_cross_panel(left, right):
+    """Batch log products with an optional owned-workspace reduction."""
+    if (type(left) is np.ndarray and type(right) is np.ndarray
+            and left.ndim == right.ndim == 2
+            and left.dtype == right.dtype == np.dtype(np.float64)
+            and left.shape[1] == right.shape[1]
+            and left.flags.c_contiguous and _owned_log_sum_compatible()):
+        result = np.empty((len(left), len(right)), dtype=np.float64)
+        budget = 65536 if right.flags.c_contiguous else 262144
+        panel_width = max(1, budget // max(1, left.size))
+        for start in range(0, len(right), panel_width):
+            stop = min(start + panel_width, len(right))
+            products = np.empty((stop - start, len(left), left.shape[1]),
+                                dtype=np.float64)
+            np.add(left[None, :, :], right[start:stop, None, :], out=products)
+            result[:, start:stop] = _owned_log_sum(products).T
+        return result
+
+    result = np.empty((len(left), len(right)), dtype=np.float64)
+    budget = 65536 if right.flags.c_contiguous else 262144
+    panel_width = max(1, budget // max(1, left.size))
+    for start in range(0, len(right), panel_width):
+        stop = min(start + panel_width, len(right))
+        products = np.empty((stop - start, len(left), left.shape[1]),
+                            dtype=np.float64)
+        np.add(left[None, :, :], right[start:stop, None, :], out=products)
+        result[:, start:stop] = _log_sum(products, axis=2).T
+    return result
+
+
+def _log_cross(left, right):
+    if not left.flags.c_contiguous:
+        return _log_cross_reference(left, right)
+    try:
+        with np.errstate(all="raise"):
+            return _log_cross_panel(left, right)
+    except FloatingPointError:
+        return _log_cross_reference(left, right)
+
+
+
+def _log_error_reference(log_x, log_w, log_h, row_shifts):
     total = -np.inf
     for column in range(log_h.shape[1]):
         fitted = _log_sum(log_w + log_h[:, column], axis=1)
@@ -145,6 +191,54 @@ def _log_error(log_x, log_w, log_h, row_shifts):
         with np.errstate(under="ignore"):
             total = np.logaddexp(total, _log_sum(2 * (residual + row_shifts)))
     return 0.5 * float(total)
+
+
+def _log_error_panel(log_x, log_w, log_h, row_shifts):
+    """Evaluate unchanged per-feature residuals in bounded feature panels.
+
+    The rank axis remains the last contiguous axis, followed by the original
+    row reduction. Accumulate the feature totals in their original order.
+    Paneling changes dispatch/allocation, not the objective or stopping test.
+    """
+    total = -np.inf
+    rows, rank = log_w.shape
+    panel_width = max(1, 262144 // max(1, rows * rank))
+    for start in range(0, log_h.shape[1], panel_width):
+        stop = min(start + panel_width, log_h.shape[1])
+        products = np.empty((stop - start, rows, rank), dtype=np.float64)
+        np.add(log_w[None, :, :], log_h[:, start:stop].T[:, None, :],
+               out=products)
+        fitted = _log_sum(products, axis=2)
+        observed = log_x[:, start:stop].T
+        observed_finite, fitted_finite = np.isfinite(observed), np.isfinite(fitted)
+        residual = np.full(fitted.shape, -np.inf)
+        observed_only = observed_finite & ~fitted_finite
+        fitted_only = fitted_finite & ~observed_finite
+        residual[observed_only] = observed[observed_only]
+        residual[fitted_only] = fitted[fitted_only]
+        different = observed_finite & fitted_finite & (observed != fitted)
+        gap = np.abs(observed[different] - fitted[different])
+        residual[different] = (np.maximum(observed[different], fitted[different])
+                               + np.log(-np.expm1(-gap)))
+        with np.errstate(under="ignore"):
+            columns = _log_sum(2 * (residual + row_shifts[None, :]), axis=1)
+            for value in columns:
+                total = np.logaddexp(total, value)
+    return 0.5 * float(total)
+
+
+def _log_error(log_x, log_w, log_h, row_shifts):
+    if not log_w.flags.c_contiguous:
+        return _log_error_reference(log_x, log_w, log_h, row_shifts)
+    # Exceptional arithmetic replays the scalar implementation under the
+    # caller's original errstate, preserving its first error, warning or error
+    # callback. No process-global warning filter is changed on the fast path.
+    try:
+        with np.errstate(all="raise"):
+            return _log_error_panel(log_x, log_w, log_h, row_shifts)
+    except FloatingPointError:
+        return _log_error_reference(log_x, log_w, log_h, row_shifts)
+
 
 
 def _stopped(previous, current, initial, tolerance):
@@ -231,16 +325,77 @@ def _rank_one_output(x, h):
     return result
 
 
-def _project_log_mu(x, h, max_iter, tol):
+def _row_log_basis(h, cache):
+    """Lazily share successful invariant setup within one public rowwise call."""
+    if cache is None:
+        return _centered_logs(h.astype(np.float64, copy=False), per_row=False)
+    previous = cache.get("basis")
+    try:
+        reusable = (previous is not None and previous[0] is h
+                    and previous[1].dtype == h.dtype
+                    and previous[1].shape == h.shape
+                    and previous[2] == h.strides
+                    and np.array_equal(previous[1], h))
+    except MemoryError:
+        cache.clear()
+        previous = None
+        return _centered_logs(h.astype(np.float64, copy=False), per_row=False)
+    if reusable:
+        return previous[3]
+    # A warning callback could have replaced or edited H between rows. Reuse
+    # never crosses such a change, nor any failed setup calculation.
+    cache.clear()
+    try:
+        with np.errstate(all="raise"):
+            value = _centered_logs(h.astype(np.float64, copy=False), per_row=False)
+    except FloatingPointError:
+        return _centered_logs(h.astype(np.float64, copy=False), per_row=False)
+    try:
+        cache["basis"] = (h, h.copy(order="K"), h.strides, value)
+    except MemoryError:
+        # The owned snapshot is optional. The required centered basis
+        # was already computed and remains valid for this scalar row.
+        cache.clear()
+    return value
+
+
+def _row_log_invariant(cache, key, calculate):
+    if cache is None or "basis" not in cache:
+        return calculate()
+    if key in cache:
+        return cache[key]
+    try:
+        with np.errstate(all="raise"):
+            value = calculate()
+    except FloatingPointError:
+        return calculate()
+    try:
+        cache[key] = value
+    except MemoryError:
+        cache.clear()
+    return value
+
+
+def _project_log_mu(x, h, max_iter, tol, *, _basis_cache=None):
     """Frobenius MU with fixed H and positive products represented by logs.
 
     A uniform initializer and the every-ten-iterations relative-improvement
     criterion match the ordinary recurrence in exact arithmetic. Logarithmic
     arithmetic changes rounding, not the objective; final coordinates keep the
     input dtype. Initial residual equality is numerical, not a symbolic proof.
+    Rank-one zero-tolerance recovery uses the existing closed-form restoration
+    directly, without logarithmic setup or updates.
     """
+    if len(h) == 1 and tol == 0:
+        # Rank-one restoration already supplies the final result. With no
+        # stopping test, logarithmic setup and updates cannot affect it.
+        return _rank_one_output(x, h)
     log_x, row_exponents = _centered_logs(x.astype(np.float64, copy=False), per_row=True)
-    log_h, basis_exponent = _centered_logs(h.astype(np.float64, copy=False), per_row=False)
+    if _basis_cache is None:
+        log_h, basis_exponent = _centered_logs(
+            h.astype(np.float64, copy=False), per_row=False)
+    else:
+        log_h, basis_exponent = _row_log_basis(h, _basis_cache)
     row_shifts = row_exponents * math.log(2.0)
     basis_shift = basis_exponent * math.log(2.0)
     log_mean = (float(_log_sum(log_x + row_shifts[:, None]))
@@ -256,10 +411,19 @@ def _project_log_mu(x, h, max_iter, tol):
         return (_rank_one_output(x, h) if len(h) == 1
                 else _restore(log_w, x.dtype, row_exponents - basis_exponent))
     previous = initial
-    numerator, gram = _log_cross(log_x, log_h), _log_cross(log_h, log_h)
+    numerator = _log_cross(log_x, log_h)
+    gram = (_log_cross(log_h, log_h) if _basis_cache is None
+            else _row_log_invariant(
+                _basis_cache, "gram", lambda: _log_cross(log_h, log_h)))
     for iteration in range(1, max_iter + 1):
-        denominator = (_log_sum(gram, axis=0)[None, :] + np.zeros((len(x), 1))
-                       if iteration == 1 else _log_cross(log_w, gram.T))
+        if iteration == 1:
+            first = (_log_sum(gram, axis=0)[None, :] if _basis_cache is None
+                     else _row_log_invariant(
+                         _basis_cache, "first_denominator",
+                         lambda: _log_sum(gram, axis=0)[None, :]))
+            denominator = first + np.zeros((len(x), 1))
+        else:
+            denominator = _log_cross(log_w, gram.T)
         active = np.isfinite(log_w) & np.isfinite(numerator)
         if not np.isfinite(denominator[active]).all():
             raise FloatingPointError("MU has a positive numerator with an undefined denominator.")
@@ -278,10 +442,241 @@ def _project_log_mu(x, h, max_iter, tol):
                 break
             previous = current
     if iteration == max_iter and tol > 0:
+        if _basis_cache is not None:
+            _basis_cache.clear()
         warnings.warn(f"Maximum number of iterations {max_iter} reached. "
                       "Increase it to improve convergence.", ConvergenceWarning, stacklevel=2)
     return (_rank_one_output(x, h) if len(h) == 1
             else _restore(log_w, x.dtype, row_exponents - basis_exponent))
+
+
+def _log_row_errors(log_x, log_w, log_h, row_shifts):
+    """Independent singleton log residuals, with feature order unchanged.
+
+    Rows are an outer vectorization axis, never a reduction axis. The trailing
+    singleton reduction retains the original one-row logsumexp operation.
+    Identical operation order alone is not a universal libm bitwise guarantee.
+    """
+    rows, rank = log_w.shape
+    total = np.full(rows, -np.inf, dtype=np.float64)
+    panel_width = max(1, 262144 // max(1, rows * rank))
+    for start in range(0, log_h.shape[1], panel_width):
+        stop = min(start + panel_width, log_h.shape[1])
+        products = np.empty((stop - start, rows, rank), dtype=np.float64)
+        np.add(log_w[None, :, :], log_h[:, start:stop].T[:, None, :],
+               out=products)
+        fitted = _log_sum(products, axis=2)
+        observed = log_x[:, start:stop].T
+        observed_finite, fitted_finite = np.isfinite(observed), np.isfinite(fitted)
+        residual = np.full(fitted.shape, -np.inf)
+        observed_only = observed_finite & ~fitted_finite
+        fitted_only = fitted_finite & ~observed_finite
+        residual[observed_only] = observed[observed_only]
+        residual[fitted_only] = fitted[fitted_only]
+        different = observed_finite & fitted_finite & (observed != fitted)
+        gap = np.abs(observed[different] - fitted[different])
+        residual[different] = (np.maximum(observed[different], fitted[different])
+                               + np.log(-np.expm1(-gap)))
+        with np.errstate(under="ignore"):
+            terms = 2 * (residual + row_shifts[None, :])
+            columns = _log_sum(terms[:, :, None], axis=2)
+            for values in columns:
+                total = np.logaddexp(total, values)
+    errors = 0.5 * total
+    if np.any(np.isnan(errors)) or np.any(np.isposinf(errors)):
+        raise FloatingPointError("Independent MU log residuals became invalid.")
+    return errors
+
+
+def _handoff_log_setup(result, x, h, log_h, basis_exponent, gram,
+                       first_denominator, max_iter, tol):
+    """Offer only successful silent vector setup to the first scalar row.
+
+    There are no caller callbacks between this qualified vector calculation
+    and its first scalar replay. The scalar entry still checks its live model,
+    bindings, basis identity/layout and owned snapshot before consuming setup.
+    Warning/native boundaries keep the ordinary cache-clearing rules.
+    """
+    try:
+        if (type(x) is not np.ndarray or type(h) is not np.ndarray
+                or x.dtype != np.float64 or h.dtype != np.float64
+                or type(max_iter) is not int or max_iter <= 10
+                or (type(tol) is not int and type(tol) is not float) or tol <= 0
+                or not all(actual is original for actual, original in zip(
+                    (_standard_mu_basis, _centered_logs, _logs, _log_sum,
+                     _log_cross, _log_cross_panel, _log_cross_reference,
+                     _owned_log_sum, _owned_log_sum_compatible,
+                     _log_error, _log_error_panel, _log_error_reference,
+                     _stopped, _restore, _row_log_basis, _row_log_invariant,
+                     _project_log_mu, _project_scaled_float64_mu),
+                    _SUFFIX_CACHE_FUNCTIONS))
+                or not all(actual is original for actual, original in zip(
+                    (_project_log_mu_rows, _try_log_row_recovery,
+                     _log_row_errors, _handoff_log_setup, _SuffixSetup),
+                    _SUFFIX_SETUP_FUNCTIONS))):
+            return result
+        cache = {"basis": (h, h.copy(order="K"), h.strides,
+                           (log_h, basis_exponent)),
+                 "gram": gram, "first_denominator": first_denominator}
+        return _SuffixSetup(result, cache)
+    except MemoryError:
+        # Metadata/snapshot ownership is optional. Keep the v5 prefix/decline
+        # result and let its scalar suffix prepare its own setup normally.
+        return result
+
+
+def _project_log_mu_rows(x, h, max_iter, tol, *, _retain_capped_prefix=False,
+                         _return_suffix_setup=False):
+    """Speculate on independent log solves; publish no partial coordinates.
+
+    The caller supplies a qualified double-precision log-only recovery cohort.
+    Every initializer retains the scalar solver's one-row reduction. Only the
+    independent update/residual operations share array dispatch. By default any
+    capped row invalidates the whole attempt before warnings/results are exposed.
+    The private opt-in may return a restored ordered prefix before the first cap;
+    the caller must replay that first capped row and every later row serially.
+    With plain built-in controls, opt-in speculation ends at the last stopping
+    checkpoint strictly before the cap. Still-active rows must be replayed; their
+    discarded final updates cannot change an already-stopped prefix.
+    """
+    log_h, basis_exponent = _centered_logs(h, per_row=False)
+    basis_shift = basis_exponent * math.log(2.0)
+    log_x = np.empty(x.shape, dtype=np.float64)
+    row_exponents = np.empty(len(x), dtype=np.int64)
+    row_shifts = np.empty(len(x), dtype=np.float64)
+    log_w = np.empty((len(x), len(h)), dtype=np.float64)
+    for index in range(len(x)):
+        row, exponents = _centered_logs(x[index:index + 1], per_row=True)
+        shifts = exponents * math.log(2.0)
+        log_mean = (float(_log_sum(row + shifts[:, None]))
+                    - math.log(1) - math.log(x.shape[1]))
+        initializer = np.broadcast_to(
+            0.5 * (log_mean - math.log(len(h))) + basis_shift - shifts[:, None],
+            (1, len(h))).copy()
+        log_x[index] = row[0]
+        row_exponents[index] = exponents[0]
+        row_shifts[index] = shifts[0]
+        log_w[index] = initializer[0]
+    initial = _log_row_errors(log_x, log_w, log_h, row_shifts)
+    previous = initial.copy()
+    iterations = np.zeros(len(x), dtype=np.int64)
+    active_rows = initial != -np.inf
+    indices = np.flatnonzero(active_rows)
+    if len(indices):
+        numerator = np.full(log_w.shape, -np.inf)
+        numerator[indices] = _log_cross(log_x[indices], log_h)
+        gram = _log_cross(log_h, log_h)
+        first_denominator = _log_sum(gram, axis=0)[None, :]
+        precap = (_retain_capped_prefix is True and type(max_iter) is int
+                  and (type(tol) is int or type(tol) is float)
+                  and max_iter > 10 and tol > 0)
+        iteration_limit = ((max_iter - 1) // 10) * 10 if precap else max_iter
+        for block_start in range(1, iteration_limit + 1, 10):
+            indices = np.flatnonzero(active_rows)
+            if not len(indices):
+                break
+            current = log_w[indices]
+            active_numerator = numerator[indices]
+            block_end = min(block_start + 9, iteration_limit)
+            for iteration in range(block_start, block_end + 1):
+                denominator = (first_denominator + np.zeros((len(indices), 1))
+                               if iteration == 1 else _log_cross(current, gram.T))
+                supported = np.isfinite(current) & np.isfinite(active_numerator)
+                if not np.isfinite(denominator[supported]).all():
+                    raise FloatingPointError(
+                        "MU has a positive numerator with an undefined denominator.")
+                updated = np.full(current.shape, -np.inf)
+                if iteration == 1:
+                    updated[supported] = active_numerator[supported] - denominator[supported]
+                else:
+                    updated[supported] = (current[supported] + active_numerator[supported]
+                                          - denominator[supported])
+                if not np.isfinite(updated[supported]).all():
+                    raise FloatingPointError("MU logarithmic coordinates became nonfinite.")
+                current = updated
+            log_w[indices] = current
+            iterations[indices] = block_end
+            if tol > 0 and block_end % 10 == 0:
+                errors = _log_row_errors(log_x[indices], current, log_h, row_shifts[indices])
+                for offset, index in enumerate(indices):
+                    if _stopped(float(previous[index]), float(errors[offset]),
+                                float(initial[index]), tol):
+                        active_rows[index] = False
+                previous[indices] = errors
+        # Active rows have not stopped strictly before the cap. Their original
+        # scalar replay is authoritative, including a stop exactly at max_iter.
+        # Keep executed iteration counts intact; this is a separate cap mask.
+        capped_rows = active_rows if precap else None
+        if tol > 0 and np.any(capped_rows if precap else iterations == max_iter):
+            if not _retain_capped_prefix:
+                return None
+            # The scalar solver warns at the first capped row, including a
+            # stop exactly at max_iter. Nothing at or beyond it is reusable.
+            count = int(np.flatnonzero(capped_rows if precap else iterations == max_iter)[0])
+            if count == 0:
+                if (_return_suffix_setup is True
+                        and _handoff_log_setup is _SUFFIX_SETUP_FUNCTIONS[3]):
+                    return _handoff_log_setup(None, x, h, log_h, basis_exponent,
+                        gram, first_denominator, max_iter, tol)
+                return None
+            prefix = _restore(log_w[:count], x.dtype,
+                              row_exponents[:count] - basis_exponent)
+            if (prefix.shape != (count, len(h)) or prefix.dtype != x.dtype
+                    or not np.isfinite(prefix).all() or np.any(prefix < 0)):
+                raise FloatingPointError("Independent MU log coordinates are invalid.")
+            result = _CappedPrefix(count, prefix)
+            if (_return_suffix_setup is True
+                    and _handoff_log_setup is _SUFFIX_SETUP_FUNCTIONS[3]):
+                return _handoff_log_setup(result, x, h, log_h, basis_exponent,
+                    gram, first_denominator, max_iter, tol)
+            return result
+    result = _restore(log_w, x.dtype, row_exponents - basis_exponent)
+    if (result.shape != (len(x), len(h)) or result.dtype != x.dtype
+            or not np.isfinite(result).all() or np.any(result < 0)):
+        raise FloatingPointError("Independent MU log coordinates are invalid.")
+    return result
+
+
+def _try_log_row_recovery(x, h, max_iter, tol, *, _retain_capped_prefix=False,
+                          _return_suffix_setup=False):
+    """Attempt only a double cohort whose original rows must reach log MU.
+
+    Tiny positive H bypasses ordinary sklearn in transform_mu. Its singleton
+    scaling bounds below are independent of X: an empty H interval proves that
+    adding either X bound cannot make coupled scaling admissible. Tiny X skips
+    that failed scaling attempt too. No other original recovery route is moved.
+    """
+    if (x.dtype != np.float64 or h.dtype != np.float64 or len(x) < 2
+            or len(h) <= 1 or (tol > 0 and max_iter <= 10)):
+        return None
+    small = math.sqrt(float(np.finfo(np.float64).tiny))
+    if not np.any((h > 0) & (h < small)):
+        return None
+    positive_h = h[h > 0]
+    h_min = math.frexp(float(positive_h.min()))[1] - 1
+    h_max = math.frexp(float(positive_h.max()))[1] - 1
+    shape_bits = max(1, (max(x.shape[1], h.size, len(h)) - 1).bit_length())
+    lower_h = max(0, -500 - h_min)
+    upper_h = 240 - shape_bits - h_max
+    if lower_h <= upper_h:
+        return None
+    # No global warning filters or caller callbacks run during speculation.
+    # The established helpers still ignore their intentional negligible-term
+    # underflow. Any other arithmetic failure replays the original row order.
+    try:
+        with np.errstate(all="raise"):
+            if _retain_capped_prefix:
+                if (_return_suffix_setup is True
+                        and type(x) is np.ndarray and type(h) is np.ndarray
+                        and _project_log_mu_rows is _SUFFIX_SETUP_FUNCTIONS[0]):
+                    return _project_log_mu_rows(
+                        x, h, max_iter, tol, _retain_capped_prefix=True,
+                        _return_suffix_setup=True)
+                return _project_log_mu_rows(
+                    x, h, max_iter, tol, _retain_capped_prefix=True)
+            return _project_log_mu_rows(x, h, max_iter, tol)
+    except (FloatingPointError, OverflowError):
+        return None
 
 
 def _project_float64_mu(decomposition, selected, basis):
@@ -305,7 +700,7 @@ def _project_float64_mu(decomposition, selected, basis):
     return result
 
 
-def _project_scaled_float64_mu(decomposition, selected, basis):
+def _project_scaled_float64_mu(decomposition, selected, basis, *, _basis_cache=None):
     """Retry a bounded float64 problem using coupled power-of-two scaling.
 
     H' = 2**k H and X' = 2**(2k) X imply W' = 2**k W, including
@@ -353,6 +748,10 @@ def _project_scaled_float64_mu(decomposition, selected, basis):
     del gram, cross, gram_support, cross_support, product
     temporary = copy(decomposition)
     temporary.components_ = scaled_h
+    # Native transform can warn and invoke caller callbacks. Strict
+    # admission failures above this boundary are silent and may reuse H.
+    if _basis_cache is not None:
+        _basis_cache.clear()
     with np.errstate(invalid="raise", divide="raise", over="raise", under="raise"):
         result = temporary.transform(scaled_x)
     if (result.shape != (len(selected), len(basis))
@@ -368,17 +767,199 @@ def _project_scaled_float64_mu(decomposition, selected, basis):
     return restored
 
 
-def transform_mu(decomposition, selected):
+def _make_owned_log_sum():
+    """Capture an optional in-place reduction for a qualified implementation.
+
+    The panel supplies fresh scratch arrays. Unknown numerical implementations
+    keep the original reduction; these checks do not constrain installation.
+    """
+    import hashlib
+    import importlib
+    from pathlib import Path
+    import sys
+
+    SCIPY_VERSION = "1.18.1"
+    NUMPY_VERSION = "2.5.4"
+    SCIPY_SOURCE = (
+        "7da908306d6382cd8214628b24f0f753ea035378ff6285276828b7af33c5b101"
+    )
+    VALUE_BOUND = 2.0 ** 60
+    COUNT_BOUND = 2 ** 53
+    mu = sys.modules[__name__]
+    np = mu.np
+    scipy = importlib.import_module("scipy")
+    # A diagnostic snapshot, not mutable authority for subsequent admission.
+    contract = {
+        "scope": (
+            "owned native-float64 C products with finite bounded row maxima; "
+            "mixed negative infinity admitted"
+        ),
+        "numpy": np.__version__,
+        "scipy": scipy.__version__,
+        "required_numpy": NUMPY_VERSION,
+        "required_scipy": SCIPY_VERSION,
+        "normalized_scipy_source_required": SCIPY_SOURCE,
+        "row_max_abs_bound": VALUE_BOUND,
+        "feature_count_bound": COUNT_BOUND,
+        "admitted_implementation": False,
+        "reason": None,
+    }
+    implementation = xp = None
+    try:
+        if scipy.__version__ != SCIPY_VERSION or np.__version__ != NUMPY_VERSION:
+            contract["reason"] = "unqualified numerical version"
+        else:
+            implementation = importlib.import_module("scipy.special._logsumexp")
+            xp = importlib.import_module("scipy._external.array_api_compat.numpy")
+            scipy_path = Path(implementation.__file__).resolve()
+            scipy_bytes = scipy_path.read_bytes()
+            contract.update(
+                scipy_source_path=str(scipy_path),
+                scipy_raw_sha256=hashlib.sha256(scipy_bytes).hexdigest(),
+                scipy_normalized_sha256=hashlib.sha256(
+                    scipy_bytes.replace(b"\r\n", b"\n")
+                ).hexdigest(),
+            )
+            if (contract["scipy_normalized_sha256"] != SCIPY_SOURCE
+                    or mu.logsumexp is not implementation.logsumexp):
+                contract["reason"] = "unqualified source or logsumexp binding"
+            else:
+                contract["admitted_implementation"] = True
+    except (ImportError, OSError, AttributeError) as error:
+        contract["reason"] = "optional implementation unavailable: " + type(error).__name__
+
+    def token(value):
+        keywords = getattr(value, "__kwdefaults__", None)
+        return (
+            value, getattr(value, "__code__", None),
+            getattr(value, "__defaults__", None), keywords,
+            tuple(keywords.items()) if type(keywords) is dict else None,
+        )
+
+    def unchanged(value, saved):
+        if (value is not saved[0] or getattr(value, "__code__", None) is not saved[1]
+                or getattr(value, "__defaults__", None) is not saved[2]):
+            return False
+        keywords = getattr(value, "__kwdefaults__", None)
+        if keywords is not saved[3]:
+            return False
+        if saved[4] is not None:
+            return (type(keywords) is dict and len(keywords) == len(saved[4])
+                    and all(key in keywords and keywords[key] is item
+                            for key, item in saved[4]))
+        return True
+
+    admitted = bool(contract["admitted_implementation"])
+    watched = []
+    if admitted:
+        declarations = [
+            (mu, ("np", "logsumexp", "_log_sum", "_log_cross",
+                  "_log_cross_reference", "_log_cross_panel")),
+            (implementation, (
+                "logsumexp", "_logsumexp", "_elements_and_indices_with_max_real",
+                "array_namespace",
+            )),
+            (np, ("empty", "add", "subtract", "exp", "errstate", "ndarray",
+                  "dtype", "float64", "inf")),
+            (xp, ("max", "min", "astype", "sum", "where", "log1p", "log",
+                  "all", "isfinite", "isdtype")),
+        ]
+        for owner, names in declarations:
+            for name in names:
+                watched.append((owner, name, token(getattr(owner, name))))
+
+    def compatible():
+        return (admitted
+                and all(unchanged(getattr(owner, name), saved)
+                        for owner, name, saved in watched))
+
+    def owned_sum(products):
+        # Only the panel's fresh allocation enters this private closure.
+        # Complete every decline check before changing the workspace.
+        if (not compatible() or type(products) is not np.ndarray
+                or products.dtype != np.dtype(np.float64) or products.ndim != 3
+                or not products.flags.c_contiguous or not products.flags.owndata
+                or not products.flags.writeable or products.base is not None
+                or not products.size or not 1 <= products.shape[2] <= COUNT_BOUND
+                or implementation.array_namespace(products) is not xp):
+            return mu._log_sum(products, axis=2)
+        a_max, at_max = implementation._elements_and_indices_with_max_real(
+            products, axis=2, xp=xp
+        )
+        # A finite maximum guarantees a finite contributor. Other entries may
+        # be -inf; NaN, +inf and all--inf rows decline without mutation.
+        if (not bool(xp.all(xp.isfinite(a_max)))
+                or not bool(xp.all(a_max >= -VALUE_BOUND))
+                or not bool(xp.all(a_max <= VALUE_BOUND))):
+            return mu._log_sum(products, axis=2)
+        # Keep SciPy's float64 mask conversion and last-axis sum, including
+        # every tied maximum. The count bound makes the multiplicity exact.
+        m = xp.sum(xp.astype(at_max, products.dtype), axis=2, keepdims=True,
+                   dtype=products.dtype)
+        with np.errstate(under="ignore"):
+            products[at_max] = -np.inf
+            np.subtract(products, a_max, out=products)
+            np.exp(products, out=products)
+            total = xp.sum(products, axis=2, keepdims=True, dtype=products.dtype)
+            s = xp.where(total == 0, total, total / m)
+            # Here m > 0 and s >= 0, so the sign/absolute-value branches are
+            # identities. Preserve the qualified arithmetic association.
+            out = (xp.log1p(s) + xp.log(m)) + a_max
+        if not bool(xp.all(xp.isfinite(out))):
+            # The outer dispatcher replays untouched left/right operands.
+            # Never pass the mutated scratch array to the original reducer.
+            raise FloatingPointError(
+                "Qualified in-place logsumexp produced nonfinite output"
+            )
+        return out[:, :, 0]
+
+    owned_sum.implementation_contract = dict(contract)
+    return owned_sum, compatible
+
+_owned_log_sum, _owned_log_sum_compatible = _make_owned_log_sum()
+
+
+# A warning callback can replace private helpers as well as the model.
+_SUFFIX_CACHE_FUNCTIONS = (
+    _standard_mu_basis, _centered_logs, _logs, _log_sum,
+    _log_cross, _log_cross_panel, _log_cross_reference,
+    _owned_log_sum, _owned_log_sum_compatible,
+    _log_error, _log_error_panel, _log_error_reference,
+    _stopped, _restore, _row_log_basis, _row_log_invariant,
+    _project_log_mu, _project_scaled_float64_mu,
+)
+
+
+def transform_mu(decomposition, selected, *, _basis_cache=None):
     """Preserve ordinary projection and correct qualified MU range failures."""
     basis = _standard_mu_basis(decomposition, selected)
     if basis is None:
+        if _basis_cache is not None:
+            _basis_cache.clear()
         return decomposition.transform(selected)
+    if _basis_cache is not None and (
+            type(selected) is not np.ndarray or type(basis) is not np.ndarray
+            or selected.dtype != np.float64 or len(basis) <= 1
+            or type(decomposition.max_iter) is not int
+            or type(decomposition.tol) not in (int, float)
+            or not all(actual is original for actual, original in zip(
+                (_standard_mu_basis, _centered_logs, _logs, _log_sum,
+                 _log_cross, _log_cross_panel, _log_cross_reference,
+                 _owned_log_sum, _owned_log_sum_compatible,
+                 _log_error, _log_error_panel, _log_error_reference,
+                 _stopped, _restore, _row_log_basis, _row_log_invariant,
+                 _project_log_mu, _project_scaled_float64_mu),
+                _SUFFIX_CACHE_FUNCTIONS))):
+        _basis_cache.clear()
+        _basis_cache = None
     if not np.any(selected):
         return np.zeros((len(selected), basis.shape[0]), dtype=selected.dtype)
     threshold = math.sqrt(float(np.finfo(selected.dtype).tiny))
     small_input = np.any((selected > 0) & (selected < threshold))
     small_basis = np.any((basis > 0) & (basis < threshold))
     if not small_input and not small_basis:
+        if _basis_cache is not None:
+            _basis_cache.clear()
         try:
             with np.errstate(invalid="raise", divide="raise", over="raise", under="raise"):
                 return decomposition.transform(selected)
@@ -391,7 +972,20 @@ def transform_mu(decomposition, selected):
             pass
     if selected.dtype == np.float64 and small_basis and not small_input:
         try:
+            if _basis_cache is not None:
+                return _project_scaled_float64_mu(
+                    decomposition, selected, basis, _basis_cache=_basis_cache)
             return _project_scaled_float64_mu(decomposition, selected, basis)
         except FloatingPointError:
             pass
+    if _basis_cache is not None:
+        return _project_log_mu(
+            selected, basis, decomposition.max_iter, decomposition.tol,
+            _basis_cache=_basis_cache)
     return _project_log_mu(selected, basis, decomposition.max_iter, decomposition.tol)
+
+
+_SUFFIX_SETUP_FUNCTIONS = (
+    _project_log_mu_rows, _try_log_row_recovery,
+    _log_row_errors, _handoff_log_setup, _SuffixSetup,
+)

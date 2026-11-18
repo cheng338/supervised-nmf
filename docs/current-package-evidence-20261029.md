@@ -14,9 +14,7 @@ classification evidence. A favorable result was not a completion criterion.
 The scientific outcomes are complete; the execution history retains an unknown
 duration and missing final controller observations for an earlier Smiling/PCA
 interruption. Accordingly, the report records `scientific_results_complete=true`
-and `complete=false`. The study was conducted during a release pause. Chang Cheng
-subsequently authorized the 0.4.1 GitHub release on October 29, 2026; that decision
-does not change this evidence qualification or the package defaults.
+and `complete=false`. Release remains paused, and no package default is changed.
 
 ## Data and scope
 
@@ -186,13 +184,11 @@ unavailable. Diagnostic runs and helper tests are not charged as tuning attempts
 
 ## Evidence and interpretation
 
-This document is the portable public summary. The separately retained
-`current-package-evidence-aocl-padding-20261029` archive contains the full
-`report/report.txt` and machine-readable `report/report.json`; the original
-`current-package-evidence-20261029` archive remains unchanged. Those records bind
-the exact metrics, selections, failures, costs and input hashes. Raw study
-archives are not included in package distributions; their identifying hashes
-are recorded below.
+The immutable continuation records are under
+`output/current-package-evidence-aocl-padding-20261029/`; the original records
+remain under `output/current-package-evidence-20261029/`. The local files
+`report/report.txt` and `report/report.json` in the continuation directory
+bind the exact metrics, selections, failures, cost records and input hashes.
 
 Before the final configuration freeze, ten study-helper suites passed **263
 tests in each environment**, AOCL and MKL. The pre-query audit passed, and the

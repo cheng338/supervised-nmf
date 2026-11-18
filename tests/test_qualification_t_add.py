@@ -17,7 +17,6 @@ from supervised_nmf import _aocl, _nnls
 
 assert Path(_nnls.__file__).resolve() == ROOT / "src/supervised_nmf/_nnls.py"
 assert Path(_aocl.__file__).resolve() == ROOT / "src/supervised_nmf/_aocl.py"
-VARIANT = "T-ADD"
 
 assert _nnls.nnls_matmul is _aocl.nnls_matmul
 
@@ -114,7 +113,7 @@ def exercise(monkeypatch, design, targets, coefficients, expected):
     target_abs = [call for call in absolute_calls if call["input"] is targets]
     fitted_abs = [call for call in absolute_calls if call["input"] is fitted["result"]]
     assert len(fitted_abs) == 1
-    assert len(target_abs) == (1 if VARIANT == "T-ABS" else 2)
+    assert len(target_abs) == 2
     absolute_targets = target_abs[0]["result"]
     absolute_fitted = fitted_abs[0]["result"]
     assert cross_scale["right"] is absolute_targets
@@ -125,23 +124,14 @@ def exercise(monkeypatch, design, targets, coefficients, expected):
         assert call["result"].flags.owndata
         np.testing.assert_array_equal(call["result"], call["initial_value"])
         assert not np.signbit(call["result"]).any()
-    if VARIANT == "T-ABS":
-        assert roundoff_scale["right"] is not absolute_fitted
-        assert not np.shares_memory(roundoff_scale["right"], absolute_fitted)
-        assert not np.shares_memory(roundoff_scale["right"], absolute_targets)
-        np.testing.assert_array_equal(absolute_fitted, fitted_abs[0]["initial_value"])
-        expected_events = [
-            ("product", 0), ("product", 1), ("abs", "targets"),
-            ("product", 2), ("abs", "fitted"), ("product", 3), ("abs", "projected")]
-    else:
-        assert roundoff_scale["right"] is absolute_fitted
-        assert target_abs[0]["result"] is not target_abs[1]["result"]
-        assert not np.shares_memory(target_abs[0]["result"], target_abs[1]["result"])
-        np.testing.assert_array_equal(
-            absolute_fitted, fitted_abs[0]["initial_value"] + target_abs[1]["result"])
-        expected_events = [
-            ("product", 0), ("product", 1), ("abs", "targets"), ("product", 2),
-            ("abs", "fitted"), ("abs", "targets"), ("product", 3), ("abs", "projected")]
+    assert roundoff_scale["right"] is absolute_fitted
+    assert target_abs[0]["result"] is not target_abs[1]["result"]
+    assert not np.shares_memory(target_abs[0]["result"], target_abs[1]["result"])
+    np.testing.assert_array_equal(
+        absolute_fitted, fitted_abs[0]["initial_value"] + target_abs[1]["result"])
+    expected_events = [
+        ("product", 0), ("product", 1), ("abs", "targets"), ("product", 2),
+        ("abs", "fitted"), ("abs", "targets"), ("product", 3), ("abs", "projected")]
     assert events == expected_events
     # Later use of shared absolute targets must not overwrite earlier operands.
     for call in products:

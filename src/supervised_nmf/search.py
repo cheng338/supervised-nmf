@@ -17,14 +17,18 @@ from sklearn.pipeline import Pipeline
 from sklearn.utils.validation import check_X_y
 
 from .classifier import NMFClassifier
+from ._calibration import _validate_scoring
+from ._search_diagnostics import mark_inactive_refinement
 from .decomposition import FeatureSPA
 from .evaluation import _digest, _jsonable, _search_identity, refinement_diagnostics
+from ._identity import implementation_sources
+from ._labels import _validate_class_labels
 from .screening import BinaryScreening
 from .study import (
     _checkpoint_lock, _read_receipt, _runtime_identity, _write_receipt,
     calibration_knn_grid,
 )
-from .validation import build_cv_folds, validate_metadata
+from .validation import _validate_fixed_seed, _validate_threads, build_cv_folds, validate_metadata
 
 
 def _positive_integer(value, name, *, minimum=1):
@@ -59,7 +63,7 @@ def _rank_parameter(estimator, candidates, parameter):
 
 def _physical_limit(estimator, parameters, parameter, candidate, X, folds):
     """Use only dimensions observed in the winner's own training folds."""
-    configured = clone(estimator).set_params(**parameters)
+    configured = clone(estimator).set_params(**clone(parameters, safe=False))
     known_feature_bound = type(configured) is NMFClassifier
     factorizer = configured
     if type(configured) is Pipeline:
@@ -90,7 +94,7 @@ def _physical_limit(estimator, parameters, parameter, candidate, X, folds):
 def calibration_rank_search(estimator, param_grid, X, y, *, rank_parameter=None,
                             cv=5, seed=0, threads=1, checkpoint_dir,
                             max_expansions=2, max_rank=None, groups=None,
-                            folds=None, data_ids=None):
+                            folds=None, data_ids=None, scoring="accuracy"):
     """Extend an upper-boundary rank winner using frozen training folds only.
 
     First evaluate the explicit grid with :func:`calibration_knn_grid`. When
@@ -98,10 +102,20 @@ def calibration_rank_search(estimator, param_grid, X, y, *, rank_parameter=None,
     rank at that winner's *other unchanged parameters*. Clamp only new ranks
     to the fold dimensions and optional ``max_rank``. Strictly better complete
     CV scores replace the incumbent; ties retain the earlier candidate.
+    ``scoring`` is ``"accuracy"`` (the default) or ``"balanced_accuracy"``,
+    and the selected metric controls every initial and expanded stage.
+
+    ``threads`` accepts positive Python/NumPy integer scalars within the native
+    C-int range. ``seed`` follows shared-grid calibration's fixed integer domain
+    0..2**32-1, even with explicit folds. Boolean and temporal scalars are not
+    counts or fixed seeds. Both controls are normalized before fold generation,
+    runtime initialization or checkpoint creation.
 
     ``max_expansions`` counts additional one-candidate stages, not the initial
     grid. Explicit initial candidates are never silently removed or clamped.
     Every stage uses the same validated folds, groups and sample identifiers.
+    Class labels must not end in a NUL codepoint; groups and data IDs retain
+    their separate metadata validation rules.
     Immutable identities bind checkpoints to all data, settings, package code
     and numerical runtime. Resuming requires the identical invocation.
 
@@ -112,35 +126,42 @@ def calibration_rank_search(estimator, param_grid, X, y, *, rank_parameter=None,
     full-training fit or held-out prediction occurs. Only the KNN estimators
     supported by the shared-grid evaluator are accepted.
 
-    A pipeline containing FeatureSPA retains anchor-derived training
-    coordinates and fixed-basis NNLS query coordinates. This search evaluates
-    that procedure without changing its coordinate policy. For a common SPA
-    training/query map, use ``NMFClassifier(solver='spa')`` with
-    ``training_coordinates='auto'`` or ``'transform'``.
+    A pipeline containing FeatureSPA uses fixed-basis NNLS coordinates for
+    both training and validation observations. Each training fold fits its
+    own basis; neighbor choices reuse the coordinates actually supplied to
+    that fold's classifier.
     """
     start = time.perf_counter()
+    threads = _validate_threads(threads)
+    seed = _validate_fixed_seed(seed)
+    scoring = _validate_scoring(scoring)
     max_expansions = _positive_integer(max_expansions, "max_expansions", minimum=0)
-    threads = _positive_integer(threads, "threads")
     if max_rank is not None:
         max_rank = _positive_integer(max_rank, "max_rank")
-    estimator = clone(estimator)
     candidates = list(ParameterGrid(param_grid))
+    raw_y = y
+    X, y = check_X_y(X, y)
+    _validate_class_labels(raw_y, y)
+    # Validate before a custom clone can hide the original implementation.
+    implementation_sources(estimator, candidates)
+    estimator = clone(estimator)
     parameter = _rank_parameter(estimator, candidates, rank_parameter)
     initial_maximum = max(int(params[parameter]) for params in candidates)
     if max_rank is not None and initial_maximum > max_rank:
         raise ValueError("max_rank must not exclude any explicit initial candidate.")
-    X, y = check_X_y(X, y)
     X, y = np.array(X, copy=True), np.array(y, copy=True)
     X.setflags(write=False)
     y.setflags(write=False)
     groups = validate_metadata(groups, len(y), name="groups")
     data_ids = validate_metadata(data_ids, len(y), name="data_ids", unique=True)
     pairs = build_cv_folds(X, y, cv=cv, seed=seed, groups=groups, folds=folds)
-    runtime = _runtime_identity(estimator, threads)
+    runtime = _runtime_identity(estimator, threads, candidates)
     identity = _jsonable({
-        "schema_version": 1, "method": "bounded_coordinate_rank_expansion",
+        "schema_version": 2, "method": "bounded_coordinate_rank_expansion",
         "calibration": _search_identity(estimator, candidates, X, y, cv, seed, threads,
-                                         refit=False, groups=groups, folds=pairs, data_ids=data_ids),
+                                         refit=False, groups=groups, folds=pairs, data_ids=data_ids,
+                                         scoring=scoring),
+        "scoring": scoring,
         "runtime": runtime, "rank_parameter": parameter,
         "max_expansions": max_expansions, "max_rank": max_rank,
         "proposal": "double_incumbent_rank_with_other_parameters_fixed",
@@ -150,6 +171,10 @@ def calibration_rank_search(estimator, param_grid, X, y, *, rank_parameter=None,
     directory = Path(checkpoint_dir)
     directory.mkdir(parents=True, exist_ok=True)
     stages, all_candidates = [], []
+    # Reports contain JSON display values, including repr strings for estimator
+    # objects. Keep the caller's actual configurations separately for later
+    # stages; never reconstruct executable estimators from a saved report.
+    actual_parameters = {}
     incumbent = None
     rank_limit = None
     bounds = []
@@ -164,29 +189,33 @@ def calibration_rank_search(estimator, param_grid, X, y, *, rank_parameter=None,
         else:
             _write_receipt(manifest, identity)
         while True:
-            if _runtime_identity(estimator, threads) != runtime:
+            if _runtime_identity(estimator, threads, candidates) != runtime:
                 raise ValueError("Source or numerical runtime changed during rank search.")
+            stage_parameters = list(ParameterGrid(stage_grid))
             stage = calibration_knn_grid(
                 estimator, stage_grid, X, y, cv=cv, seed=seed, threads=threads,
                 checkpoint_dir=directory / f"stage-{len(stages):03d}",
-                groups=groups, folds=pairs, data_ids=data_ids,
+                groups=groups, folds=pairs, data_ids=data_ids, scoring=scoring,
             )
             stages.append(stage)
             new_valid = []
             for row in stage["candidates"]:
                 row = deepcopy(row)
-                row.update(index=len(all_candidates), stage=len(stages) - 1)
+                actual_parameters[len(all_candidates)] = stage_parameters[row["index"]]
+                row.update(stage_candidate_index=row["index"],
+                           index=len(all_candidates), stage=len(stages) - 1)
                 all_candidates.append(row)
                 if row["valid"]:
                     new_valid.append(row)
-                    if incumbent is None or row["mean_balanced_accuracy"] > incumbent["mean_balanced_accuracy"]:
+                    if incumbent is None or row["mean_score"] > incumbent["mean_score"]:
                         incumbent = row
             if incumbent is None:
                 reason, complete = "no_qualified_initial_candidate", False
                 break
-            rank_limit, bounds = _physical_limit(estimator, incumbent["parameters"], parameter,
+            incumbent_parameters = actual_parameters[incumbent["index"]]
+            rank_limit, bounds = _physical_limit(estimator, incumbent_parameters, parameter,
                                                  incumbent, X, pairs)
-            current_rank = int(incumbent["parameters"][parameter])
+            current_rank = int(incumbent_parameters[parameter])
             if not new_valid:
                 reason, complete = "no_qualified_expansion_candidate", False
                 break
@@ -208,24 +237,29 @@ def calibration_rank_search(estimator, param_grid, X, y, *, rank_parameter=None,
             proposed = min(current_rank * 2, rank_limit)
             if max_rank is not None:
                 proposed = min(proposed, max_rank)
-            parameters = dict(incumbent["parameters"], **{parameter: proposed})
+            parameters = dict(incumbent_parameters, **{parameter: proposed})
             stage_grid = {key: [value] for key, value in parameters.items()}
             highest_attempted = proposed
             expansions += 1
         report = _jsonable({
-            "schema_version": 1, "author": "Chang Cheng", "state": "cv_completed",
+            "schema_version": 2, "author": "Chang Cheng", "state": "cv_completed",
             "fingerprint": fingerprint, "identity": identity, "stages": stages,
+            "scoring": scoring,
             "candidates": all_candidates,
             "selected_parameters": incumbent["parameters"] if incumbent else None,
             "selected_candidate_index": incumbent["index"] if incumbent else None,
-            "selected_mean_balanced_accuracy": incumbent["mean_balanced_accuracy"] if incumbent else None,
+            "selected_mean_score": incumbent["mean_score"] if incumbent else None,
+            f"selected_mean_{scoring}": incumbent["mean_score"] if incumbent else None,
             "selection_role": "provisional_highest_complete_training_cv_score_among_evaluated_candidates",
             "rank_parameter": parameter, "expansions_performed": expansions,
             "largest_attempted_rank": highest_attempted, "physical_rank_limit": rank_limit,
             "physical_limit_evidence": bounds, "stop_reason": reason, "search_complete": complete,
             "unresolved_upper_rank_boundary": not complete,
-            "refinement": refinement_diagnostics([row["parameters"] for row in all_candidates],
-                                                  incumbent["parameters"] if incumbent else None),
+            "refinement": mark_inactive_refinement(
+                refinement_diagnostics([row["parameters"] for row in all_candidates],
+                                       incumbent["parameters"] if incumbent else None),
+                stages[incumbent["stage"]].get("screening_diagnostics") if incumbent else None,
+                incumbent["stage_candidate_index"] if incumbent else None),
             "search_scope": "initial_explicit_grid_then_one_rank_coordinate_with_other_parameters_fixed",
             "global_optimum_claimed": False, "tuning_complete": False, "defaults_frozen": False,
             "refit_performed": False, "final_fit_seconds": 0.0,

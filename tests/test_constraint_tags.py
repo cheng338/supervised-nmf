@@ -46,7 +46,7 @@ def estimator(kind):
                              random_state=17, max_iter=1500, tol=1e-3)
     if kind == "spa":
         return FeatureSPA(n_components=2, nnls_max_iter=1500)
-    return BinaryScreening(percentile=100.)
+    return BinaryScreening(screening="percentile", percentile=100.)
 
 
 @pytest.mark.parametrize("kind", ["classifier", "spa", "screen"])
@@ -216,6 +216,6 @@ def test_applicable_generic_checks_with_binary_target_fixtures(check):
     # These checks exercise the inherited screening implementation using valid
     # binary targets. They do not establish full check_estimator conformance
     # for the public transformer or alter sklearn's checks.
-    model = _BinaryCheckerScreen(percentile=100.)
+    model = _BinaryCheckerScreen(screening="percentile", percentile=100.)
     check(type(model).__name__, model)
     assert get_tags(BinaryScreening()).classifier_tags is None

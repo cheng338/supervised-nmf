@@ -104,8 +104,7 @@ def test_report_preserves_fitted_threshold_policy_and_metric_orientation(data, l
 
 
 @pytest.mark.parametrize("keep_constructor", [False, True])
-def test_legacy_absent_threshold_fields_do_not_use_constructor_fallback(fitted, data, keep_constructor):
-    baseline = evaluate_classifier(fitted, *data)
+def test_absent_threshold_fields_fail_without_constructor_substitution(fitted, data, keep_constructor):
     for name in ("decision_threshold_", "positive_label_", "positive_class_index_"):
         delattr(fitted, name)
     if keep_constructor:
@@ -115,12 +114,21 @@ def test_legacy_absent_threshold_fields_do_not_use_constructor_fallback(fitted, 
         del fitted.positive_label
     restored = pickle.loads(pickle.dumps(fitted))
     report = evaluate_classifier(restored, *data)
-    assert report["status"] == "valid"
-    assert report["predictions"] == baseline["predictions"]
-    assert report["metrics"] == baseline["metrics"]
+    assert report["status"] == "failed"
+    assert report["error_type"] == "AttributeError"
+    assert "decision_threshold_" in report["error"]
+    assert "predictions" not in report and "metrics" not in report
     assert all(name not in report["diagnostics"] for name in POLICY_FIELDS[:3])
     assert report["diagnostics"]["mu_projection"] is None
-    assert restored.decision_threshold == (.37 if keep_constructor else None)
+    assert report["diagnostics"]["last_transform_performed"] is True
+    assert report["diagnostics"]["last_transform_converged"] is True
+    assert report["diagnostics"]["last_transform_error"] is None
+    if keep_constructor:
+        assert restored.decision_threshold == .37
+        assert restored.positive_label == 0
+    else:
+        assert not hasattr(restored, "decision_threshold")
+        assert not hasattr(restored, "positive_label")
     assert all(not hasattr(restored, name + "_") for name in POLICY_FIELDS[:3])
 
 

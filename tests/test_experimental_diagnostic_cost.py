@@ -43,7 +43,6 @@ def inputs(m, k, n):
     return left, right, X
 
 
-@pytest.mark.skipif(not hasattr(experimental, '_diagnostic_residual'), reason='No fused diagnostic role selected')
 @pytest.mark.parametrize('m,k,n', [(16, 3, 17), (8, 1, 1), (9, 3, 17), (16, 3, 16)])
 def test_private_residual_matches_current_native_operands_and_owned_result(monkeypatch, m, k, n):
     left, right, X = inputs(m, k, n)
@@ -84,7 +83,6 @@ def test_private_residual_matches_current_native_operands_and_owned_result(monke
     assert tuple(state(value) for value in (left, right, X)) == before
 
 
-@pytest.mark.skipif(not hasattr(experimental, '_diagnostic_residual'), reason='No fused diagnostic role selected')
 def test_private_residual_respects_non_native_selected_callable():
     left, right, X = inputs(9, 3, 7)
     calls = []
@@ -99,7 +97,6 @@ def test_private_residual_respects_non_native_selected_callable():
     assert answer.flags.owndata and answer.flags.c_contiguous
 
 
-@pytest.mark.skipif(not hasattr(experimental, '_diagnostic_residual'), reason='No fused diagnostic role selected')
 def test_private_residual_drops_helper_workspaces_with_retained_traceback(monkeypatch):
     left, right, X = inputs(16, 3, 17)
     refs = []
@@ -139,7 +136,6 @@ def test_private_residual_drops_helper_workspaces_with_retained_traceback(monkey
     assert all(ref() is None for ref in refs)
 
 
-@pytest.mark.skipif(not hasattr(experimental, '_diagnostic_pg_values'), reason='No private PG guard selected')
 def test_diagnostic_private_gradient_helper_does_not_replace_solver_helper(monkeypatch):
     original = experimental._pg_values
     private = experimental._diagnostic_pg_values

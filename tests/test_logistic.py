@@ -45,8 +45,11 @@ class LogisticClassifierTests(unittest.TestCase):
         for solver in ("spa", "cd", "mu"):
             for coordinates in ("fit_transform", "transform"):
                 with self.subTest(solver=solver, coordinates=coordinates):
+                    # This explicit sklearn reference uses batch MU. The
+                    # omitted/default rowwise contract is tested separately.
                     model = self.model(solver=solver, training_coordinates=coordinates,
-                                       logistic_C=.3, logistic_class_weight="balanced").fit(self.X, labels)
+                                       mu_projection="batch", logistic_C=.3,
+                                       logistic_class_weight="balanced").fit(self.X, labels)
                     screen = BinaryScreening(screening="absolute", score_threshold=0)
                     selected = screen.fit_transform(self.X, labels)
                     representation = (FeatureSPA(n_components=2, nnls_max_iter=3000) if solver == "spa"
@@ -151,7 +154,7 @@ class LogisticClassifierTests(unittest.TestCase):
         failed, valid = search.report["candidates"]
         self.assertFalse(failed["valid"])
         self.assertEqual(failed["invalid_fold_count"], 3)
-        self.assertIsNone(failed["mean_balanced_accuracy"])
+        self.assertIsNone(failed["mean_score"])
         self.assertTrue(valid["valid"])
         self.assertFalse(search.report["is_fallback"])
         self.assertEqual(search.estimator.logistic_max_iter, 1000)

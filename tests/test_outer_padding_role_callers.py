@@ -23,6 +23,15 @@ def single_thread():
         yield
 
 
+@pytest.fixture(autouse=True)
+def exercise_outer_workspace_route(monkeypatch):
+    # This module must execute every outer workspace to check changing operands,
+    # failures and refit cleanup. Optional H-solve handoff is qualified separately
+    # by natural-fit science/lifecycle tests; a replaced factory is no optout API.
+    if hasattr(experimental, "_handoff_producer"):
+        monkeypatch.setattr(experimental, "_handoff_producer", lambda *args, **kwargs: False)
+
+
 def inputs(shape=(65, 33)):
     # Existing outer residual-consumption regression fixture.
     value = np.random.default_rng(4308).uniform(.05, 2., shape)

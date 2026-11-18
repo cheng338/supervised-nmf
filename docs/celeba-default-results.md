@@ -304,3 +304,42 @@ The helpers are `plan_celeba_default_study.py`,
 `select_celeba_default.py` and `evaluate_celeba_frozen_default.py` under `scripts/`.
 They preserve declared grids and compatible checkpoints. There is no automatic
 adaptive search policy inside estimator fitting.
+
+### Preparing and restarting caches
+
+The current `scripts/prepare_celeba_default_caches.py` prepares each cache in a
+private directory and verifies it before publishing the complete final cache.
+After an interruption, rerun the same command with the same inputs and output.
+Compatible completed caches are verified and reused without rewriting their
+arrays or manifests. A retry can also recover a verified complete private cache
+or the largest training array recorded by a completed recovery receipt. The
+latter avoids decoding the training images again after a later write fails.
+Sampling, preprocessing, labels and final array bytes are unchanged; these
+restart controls do not revise the historical study records above.
+
+By default, an existing final cache directory with a missing manifest or malformed
+manifest JSON/UTF-8 is rejected. Use **`--recover-incomplete`** when an interrupted
+run of the older preparer left such a directory: repeat the original preparation
+command with that flag added. The Python helper offers the equivalent keyword
+`recover_incomplete=True`; its default is `False`, and it requires a Python
+Boolean. This option preserves the exact old directory under a uniquely named
+sibling wrapper with an origin record, then recreates the cache at its original
+name. This can reuse separately verified completed work from a private attempt.
+Allow space for both the preserved output and the new cache. Failed private
+preparation attempts are also retained.
+
+The recovery option does not bypass integrity checks. A parseable committed
+manifest with an incompatible identity, changed checksums or invalid data remains
+an error, as does a committed training-recovery receipt or array that fails its
+checks. Compatibility still includes the existing source, input and runtime
+identity requirements; recovery does not make an incompatible historical cache
+eligible for reuse. A training array can be reused only after its completion
+receipt exists and passes verification. An unfinished image decode or training
+array write must be repeated.
+
+Only one preparer can own a given output at a time; competing preparation calls
+fail promptly, while separate output directories remain independent. Ownership
+is released when the process exits, including an abrupt exit. The persistent
+lock marker alone does not mean another process is still running. These controls
+support retry after process interruptions and ordinary write failures; they do
+not promise durability through power loss.

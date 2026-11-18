@@ -244,6 +244,74 @@ same settings. The four-to-eight-worker continuation above was a separately
 recorded execution transition, rather than an in-place configuration change.
 Keep output paths short enough for the host's filesystem limits.
 
+### Process startup for current runs
+
+`scripts/celeba_default_study.py` and `examples/celeba_parameter_study.py` use
+explicit process contexts. CV work in a new output directory uses `spawn`.
+The parameter-study example continues to select `spawn` whenever a process pool
+is needed; the default-study CLI has the Linux checkpoint-routing policy below.
+Neither launcher changes the global multiprocessing start method or forks its
+already initialized numerical parent. This policy does not establish that an
+earlier run suffered a deadlock.
+
+Existing worker and native-thread limits still apply. The default-study runner
+defaults to eight workers with one native thread each; the parameter-study
+example defaults to four workers and `--threads 1` per worker. Account for the
+product of workers and native threads within the machine's compute budget.
+
+On Linux, completed CV work can avoid process startup when there is one effective
+worker and one native numerical thread. A fresh thread validates the reusable
+results with the same source, runtime, data and checkpoint integrity requirements.
+This is automatic, with no additional option. Missing work or an ineligible
+runtime/configuration uses a process pool under the routing policy below.
+Runs with multiple
+effective workers retain their process parallelism; Windows and macOS retain
+the existing process route.
+
+The isolated WSL investigation saved about 1.16–1.77 seconds in the tested
+completed one-worker workflows, beyond the separate report-serialization
+optimization. Fresh-run and recovery costs were small and variable: one fresh
+workflow had a mean increase of 44 ms. These observations do not guarantee a
+speedup for every workload or change model fitting and prediction algorithms.
+
+For the default-study CLI only, Linux calls requesting more than one worker can
+use a `forkserver` process pool after the existing completed-work shortcut. Every
+submitted chunk must have both `identity.json` and `report.json` files; a missing
+file or an ordinary path-check failure selects `spawn`. This is a routing hint,
+not checkpoint acceptance. The original workers still validate source, runtime,
+data, identity and checksums. Missing fitted folds can therefore be recovered
+through the forkserver, while corrupt records remain errors. Process parallelism
+and worker budgets are preserved.
+
+The CLI sets an empty forkserver preload list before creating its pool. This
+policy is internal and adds no command-line option. Imported callers retain
+`spawn` by default when a pool is needed; all requested-one-worker and non-Linux
+routes keep their existing behavior. The policy does not qualify arbitrary
+startup hooks or reset a custom forkserver that was already running.
+
+A fixed local WSL comparison measured about 198 ms less parent elapsed time for
+completed real-image runs and 371 ms less for matched one-fold recovery. Fresh
+runs retained `spawn`: an earlier four-pair mean was 217 ms slower, while a later
+eight-pair comparison averaged 23 ms faster with mixed pair signs. These are
+bounded whole-CLI observations, not a guarantee of zero fresh overhead or a
+speedup for every workload. See the
+[development decision](development-protocol.md#linux-multiworker-celeba-checkpoint-startup).
+
+For the original explicit-spawn implementation on Robust with CPython 3.12.15/MKL,
+small synthetic direct-CLI comparisons added
+roughly three seconds per invocation versus the platform's `fork` default,
+including completed resumes. These checks used eight default-study workers and
+four or eight parameter-study workers, with only one or two comparable pairs
+per workflow and timing condition. Whole-CLI differences include startup, work
+and shutdown; these observations do not predict full-study costs. Windows
+already used `spawn`. Numerical outputs and committed resume artifacts matched
+in the bounded checks.
+
+The script change remains subject to strict source-identity checks. Start new
+runs with current source; continue historical source-bound runs with their
+archived implementation and matching settings. Historical identities and
+receipts are not rewritten to admit the new scripts.
+
 The specialized `celeba_parameter_study.py` runner remains KNN-only. For an
 optional logistic development comparison, use the general example with local
 data paths:

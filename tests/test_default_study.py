@@ -98,6 +98,21 @@ class DefaultStudyTests(unittest.TestCase):
                 runner.evaluate(self.output, config)
         self.assertFalse((self.output / "comparison.json").exists())
 
+    def test_failed_worker_releases_owned_mapping_while_traceback_is_retained(self):
+        config = self.initialize()
+        plan = config["plans"][0]
+        retained_traceback = None
+        with patch.object(runner, "calibration_knn_grid", side_effect=RuntimeError("worker fixture")):
+            try:
+                runner._worker((str(self.output), plan, plan["chunks"][0], config["sources"]))
+            except RuntimeError as error:
+                self.assertEqual(str(error), "worker fixture")
+                retained_traceback = error.__traceback__
+        self.assertIsNotNone(retained_traceback)
+        # A live traceback still owns the worker frame and its X reference.
+        # Windows permits this unlink only after its mapping has been closed.
+        (self.cache / "train-X.npy").unlink()
+
     def test_three_serial_profiles_reproduce_predictions_and_evaluation_resume(self):
         config = self.initialize()
         self.complete(config)
@@ -145,6 +160,35 @@ class DefaultStudyTests(unittest.TestCase):
         path.write_text(json.dumps(envelope))
         with self.assertRaisesRegex(ValueError, "integrity check"):
             runner.aggregate_cv(self.output, config)
+
+    def test_rechecksummed_identity_cannot_change_schema_scoring_or_configuration(self):
+        config = self.initialize()
+        self.complete(config)
+        path = self.output / "spa-pct" / "c0000" / "report.json"
+        original = _read_receipt(path)
+        self.assertEqual(original["scoring"], "balanced_accuracy")
+        for target, field, value in (
+                ("report", "scoring", "accuracy"),
+                ("identity", "scoring", "accuracy"),
+                ("calibration", "scoring", "accuracy"),
+                ("identity", "schema_version", 3),
+                ("calibration", "identity_schema", 1),
+                ("calibration", "structural_configuration", {}),
+                ("calibration", "implementation_source", {})):
+            with self.subTest(target=target, field=field):
+                report = deepcopy(original)
+                identity = report["identity"]
+                records = {"report": report, "identity": identity,
+                           "calibration": identity["calibration"]}
+                records[target][field] = value
+                report["fingerprint"] = _digest(identity)
+                _write_receipt(path.parent / "identity.json", identity)
+                _write_receipt(path, report)
+                with self.assertRaisesRegex(ValueError, "CV report identity differs"):
+                    runner.aggregate_cv(self.output, config)
+        _write_receipt(path.parent / "identity.json", original["identity"])
+        _write_receipt(path, original)
+        runner.aggregate_cv(self.output, config, require_complete=True)
 
     def test_infeasible_candidate_remains_failed_without_fallback(self):
         self.protocol["jobs"][0]["grid"] = [{"n_components": [5000], "percentile": [2], "n_neighbors": [1, 3]}]

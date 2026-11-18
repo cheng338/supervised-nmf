@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import numpy as np
+from threadpoolctl import threadpool_limits
 from supervised_nmf import NMFClassifier
 from supervised_nmf.evaluation import evaluate_classifier, format_evaluation_summary
 from supervised_nmf.search import calibration_rank_search
@@ -35,7 +36,8 @@ def main():
     if report["selected_parameters"] is None:
         raise RuntimeError("No numerically qualified training candidate.")
     # This is a small API example, not a confirmatory performance study.
-    estimator.set_params(**report["selected_parameters"]).fit(X[training], y[training])
+    with threadpool_limits(limits=1):
+        estimator.set_params(**report["selected_parameters"]).fit(X[training], y[training])
     if not estimator.converged_:
         raise RuntimeError("The selected final fit did not converge.")
     result = evaluate_classifier(

@@ -143,22 +143,31 @@ class DecisionThresholdTests(unittest.TestCase):
                 model.fit(self.X, self.y)
         self.assertFalse(any(name.endswith("_") for name in vars(model)))
 
-    def test_legacy_state_missing_new_attributes_keeps_ordinary_prediction(self):
+    def test_loading_does_not_fill_missing_threshold_fields(self):
         model = self.model(classifier="logistic").fit(self.X, self.y)
-        expected = model.predict(self.query)
-        for name in ("decision_threshold", "positive_label", "decision_threshold_", "positive_label_",
-                     "positive_class_index_", "projection_solver", "projection_workers",
-                     "projection_batch_size", "projection_native_threads"):
+        missing = ("decision_threshold", "positive_label", "decision_threshold_", "positive_label_",
+                   "positive_class_index_")
+        for name in missing:
             delattr(model, name)
         restored = pickle.loads(pickle.dumps(model))
-        np.testing.assert_array_equal(restored.predict(self.query), expected)
-        labels, _ = restored.predict_with_probabilities(self.query)
-        np.testing.assert_array_equal(labels, expected)
-        self.assertEqual(restored.get_params()["projection_solver"], "scipy")
-        self.assertEqual(clone(restored).get_params(), restored.get_params())
-        restored.fit(self.X, self.y)
-        self.assertIsNone(restored.decision_threshold_)
-        self.assertEqual(restored.decomposition_.projection_solver, "scipy")
+        for method in ("predict", "predict_with_probabilities"):
+            with self.subTest(method=method):
+                with self.assertRaisesRegex(AttributeError, "decision_threshold_"):
+                    getattr(restored, method)(self.query)
+        self.assertTrue(all(name not in vars(restored) for name in missing))
+
+    def test_loading_does_not_supply_missing_projection_controls(self):
+        model = self.model(classifier="logistic").fit(self.X, self.y)
+        missing = ("projection_solver", "projection_workers",
+                   "projection_batch_size", "projection_native_threads")
+        for name in missing:
+            delattr(model, name)
+        restored = pickle.loads(pickle.dumps(model))
+        for method in ("predict", "predict_with_probabilities"):
+            with self.subTest(method=method):
+                with self.assertRaisesRegex(AttributeError, "projection_solver"):
+                    getattr(restored, method)(self.query)
+        self.assertTrue(all(name not in vars(restored) for name in missing))
 
     def test_spa_projection_controls_forwarded_and_validated_for_all_solvers(self):
         model = self.model(projection_solver="batched", projection_batch_size=16).fit(self.X, self.y)
@@ -203,9 +212,9 @@ class DecisionThresholdTests(unittest.TestCase):
                                               checkpoint_dir=Path(directory) / "checkpoint")
             for reference, actual in zip(ordinary["candidates"], shared["candidates"]):
                 self.assertTrue(reference["valid"] and actual["valid"])
-                self.assertEqual(reference["mean_balanced_accuracy"], actual["mean_balanced_accuracy"])
-                self.assertEqual([fold["balanced_accuracy"] for fold in reference["folds"]],
-                                 [fold["balanced_accuracy"] for fold in actual["folds"]])
+                self.assertEqual(reference["mean_score"], actual["mean_score"])
+                self.assertEqual([fold["score"] for fold in reference["folds"]],
+                                 [fold["score"] for fold in actual["folds"]])
         for parameter, values in (("decision_threshold", [.3, .7]), ("positive_label", ["present", "absent"])):
             with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(ValueError, "Only n_neighbors"):
                 calibration_knn_grid(self.model(), {parameter: values}, self.X, self.y,

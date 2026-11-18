@@ -47,7 +47,7 @@ class GroupValidationTests(unittest.TestCase):
         dictionaries = [{"training_indices": a.tolist(), "validation_indices": b.tolist()} for a, b in self.folds]
         base = KNeighborsClassifier(n_neighbors=3)
         result = calibration_search(base, {}, self.X, self.y, groups=self.groups,
-                                    data_ids=self.ids, folds=dictionaries)
+                                    data_ids=self.ids, folds=dictionaries, scoring="balanced_accuracy")
         actual = result.report["candidates"][0]["folds"]
         for index, (train, valid) in enumerate(self.folds):
             direct = clone(base).fit(self.X[train], self.y[train])

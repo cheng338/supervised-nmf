@@ -20,6 +20,7 @@ from pathlib import Path
 import random
 import re
 import statistics
+import sys
 
 import numpy as np
 from sklearn.metrics import (
@@ -182,18 +183,41 @@ def check_cv_summary(summary, plan, configuration, inputs, directory):
         calibration = report["identity"]["calibration"]
         job = plan["job"]
         train = configuration["caches"][job["cache"]]["manifest"]["splits"]["train"]
-        require(calibration["candidates"] == expected and calibration["cv"] == 5
-                and calibration["seed"] == job["seed"] and calibration["threads"] == 1
-                and calibration["refit"] is False
-                and calibration["data_sha256"] == train["attributes"][job["attribute"]]["data_sha256"]
-                and calibration["source_sha256"] == configuration["sources"]["package_source_sha256"],
-                "CV chunk calibration is not bound to the declared data, folds or source.")
-        parameters = calibration["parameters"]
-        require(parameters["max_iter"] == job["max_iter"] and parameters["tol"] == job["tol"]
-                and parameters["random_state"] == job["seed"]
-                and parameters["solver"] == ("cd" if "_cd_" in job["method"] else "spa")
-                and parameters["screening"] == ("percentile" if job["method"].endswith("percentile") else "absolute"),
-                "CV estimator numerical/method settings differ from the job.")
+        structural = ("identity_schema" in calibration or "structural_configuration" in calibration
+                      or report.get("schema_version") == 4 or report["identity"].get("schema_version") == 4)
+        if structural:
+            # Current-schema audits require matching implementation sources;
+            # historical receipts below do not import/reconstruct current models.
+            if str(ROOT / "scripts") not in sys.path:
+                sys.path.insert(0, str(ROOT / "scripts"))
+            from _audit_identity import (verify_configuration_identity, verify_implementation_sources,
+                                         verify_shared_knn_cv_receipt)
+            verify_shared_knn_cv_receipt(report)
+            from celeba_default_study import _estimator
+            from supervised_nmf._identity import configuration_identity, implementation_sources
+            estimator = _estimator(job)
+            verify_configuration_identity(calibration.get("structural_configuration"),
+                configuration_identity({"estimator": estimator, "candidates": expected}))
+            verify_implementation_sources(calibration.get("implementation_source"),
+                                          implementation_sources(estimator, expected))
+            require(calibration["cv"] == 5 and calibration["seed"] == job["seed"]
+                    and calibration["threads"] == 1 and calibration["refit"] is False
+                    and calibration["data_sha256"] == train["attributes"][job["attribute"]]["data_sha256"]
+                    and calibration["source_sha256"] == configuration["sources"]["package_source_sha256"],
+                    "CV chunk calibration is not bound to the declared data, folds or source.")
+        else:
+            require(calibration["candidates"] == expected and calibration["cv"] == 5
+                    and calibration["seed"] == job["seed"] and calibration["threads"] == 1
+                    and calibration["refit"] is False
+                    and calibration["data_sha256"] == train["attributes"][job["attribute"]]["data_sha256"]
+                    and calibration["source_sha256"] == configuration["sources"]["package_source_sha256"],
+                    "CV chunk calibration is not bound to the declared data, folds or source.")
+            parameters = calibration["parameters"]
+            require(parameters["max_iter"] == job["max_iter"] and parameters["tol"] == job["tol"]
+                    and parameters["random_state"] == job["seed"]
+                    and parameters["solver"] == ("cd" if "_cd_" in job["method"] else "spa")
+                    and parameters["screening"] == ("percentile" if job["method"].endswith("percentile") else "absolute"),
+                    "CV estimator numerical/method settings differ from the job.")
         require([row["parameters"] for row in report["candidates"]] == expected, "Chunk does not cover its grid.")
         require([plan["candidates"][index] for index in chunk["candidate_indices"]] == expected,
                 "Chunk canonical candidate indices differ.")

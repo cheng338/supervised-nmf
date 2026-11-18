@@ -34,6 +34,7 @@ from numbers import Integral
 import math
 
 import numpy as np
+import scipy
 from scipy import linalg
 from scipy.optimize import nnls
 
@@ -54,6 +55,152 @@ _FACTOR_CACHE_LIMIT = 128
 _MIN_EXPONENT = -450
 _MAX_EXPONENT = 450
 _MAX_SCALED_DIMENSION = 2**32
+
+
+_QR_ORIGINAL_QR = linalg.qr
+_QR_ORIGINAL_COND = np.linalg.cond
+
+
+def _discard_qr_preparation():
+    return None
+
+
+class _QRPrepared(tuple):
+    """Immutable process-local preparation; serialization deliberately drops it."""
+
+    __slots__ = ()
+
+    def __new__(cls, design, q, r, context):
+        if (type(design) is not np.ndarray or type(q) is not np.ndarray
+                or type(r) is not np.ndarray or design.dtype != np.float64
+                or q.dtype != np.float64 or r.dtype != np.float64
+                or not design.flags.c_contiguous or not r.flags.c_contiguous
+                or not (q.flags.f_contiguous or q.flags.c_contiguous)
+                or q.shape != design.shape or r.shape != (design.shape[1],) * 2):
+            raise ValueError("Unsupported prepared QR storage.")
+        if q.strides == (q.shape[1] * 8, 8):
+            order = "C"
+        elif q.strides == (8, q.shape[0] * 8):
+            order = "F"
+        else:
+            raise ValueError("Unsupported prepared Q strides.")
+        return tuple.__new__(cls, (design.shape, design.tobytes(order="C"),
+            q.tobytes(order=order), r.tobytes(order="C"), order, context))
+
+    def matches(self, design, context):
+        if design.shape != self[0] or context != self[5]:
+            return False
+        saved = np.frombuffer(self[1], dtype=np.uint64).reshape(self[0])
+        return np.array_equal(design.view(np.uint64), saved)
+
+    def factors(self):
+        shape, _, q, r, order, _ = self
+        return (np.frombuffer(q, dtype=np.float64).reshape(shape, order=order),
+                np.frombuffer(r, dtype=np.float64).reshape((shape[1], shape[1])))
+
+    def _transport_payload(self):
+        """Export immutable factors for the existing call-scoped transport."""
+        shape, basis, q, r, order, context = self
+        # Keep already immutable small buffers immutable through pickle.
+        # Larger buffers retain the existing Joblib read-only mapping.
+        buffers = tuple(value if len(value) <= 1048576 else
+                        np.frombuffer(value, dtype=np.uint8) for value in (basis, q, r))
+        return (shape,) + buffers + (order, context[2])
+
+    @staticmethod
+    def _from_checked_transport(shape, basis, q, r, order, context):
+        """Build from fields already checked by the process admission path."""
+        return tuple.__new__(_QRPrepared, (shape, basis, q, r, order, context))
+
+    def __reduce__(self):
+        return _discard_qr_preparation, ()
+
+
+class _QRFitCapture:
+    __slots__ = ("entry",)
+
+    def __init__(self):
+        self.entry = None
+
+
+def _qr_context():
+    # This bounded implementation was checked for silent successful preparation.
+    # Future runtimes and replaced entry callables retain current QR behavior.
+    if (np.__version__ != "2.5.4" or scipy.__version__ != "1.18.1"
+            or linalg.qr is not _QR_ORIGINAL_QR
+            or np.linalg.cond is not _QR_ORIGINAL_COND
+            or np.geterr() != {"divide": "warn", "over": "warn",
+                               "under": "ignore", "invalid": "warn"}
+            or np.geterrcall() is not None):
+        return None
+    from ._projection import _qr_native_context
+    return _qr_native_context()
+
+
+def _qr_lookup(design, prepared, capture, owned):
+    """Bind the exact snapshot checked and used by this one solve."""
+    if type(prepared) is not _QRPrepared and type(capture) is not _QRFitCapture:
+        return design, None, None
+    original = design
+    try:
+        context = _qr_context()
+        if context is None or type(design) is not np.ndarray:
+            return original, None, None
+        if owned is not True:
+            design = np.array(design, dtype=np.float64, order="C", copy=True)
+        if type(prepared) is _QRPrepared and prepared.matches(design, context):
+            return design, prepared.factors(), context
+        return design, None, context
+    except Exception:
+        # Only new optional context/snapshot/storage work is covered here.
+        # The required original QR and reference solve are outside this catch.
+        return original, None, None
+
+
+def _qr_capture_positive(capture, design, q, r, context):
+    if context is not None and type(capture) is _QRFitCapture:
+        try:
+            capture.entry = _QRPrepared(design, q, r, context)
+        except Exception:
+            capture.entry = None
+
+
+def _prepare_qr_entry(design, *, _prepared=None, _owned=False, _allow_prepare=True):
+    """Prepare or reuse parent factors without replacing a required projection."""
+    try:
+        context = _qr_context()
+        if context is None or type(design) is not np.ndarray:
+            return None
+        if (_owned is True and type(_prepared) is _QRPrepared
+                and design.dtype == np.float64 and design.flags.c_contiguous
+                and design.flags.owndata and _prepared.matches(design, context)):
+            return _prepared
+        if _allow_prepare is False:
+            return None
+        if not (_owned is True and design.dtype == np.float64
+                and design.flags.c_contiguous and design.flags.owndata):
+            design = np.array(design, dtype=np.float64, order="C", copy=True)
+        if (design.ndim != 2 or min(design.shape) < 1
+                or design.shape[0] < 2 * design.shape[1]
+                or max(design.shape) > _MAX_SCALED_DIMENSION
+                or not np.isfinite(design).all() or np.any(design < 0)
+                or not _within_range(_magnitude_bounds(design))):
+            return None
+        with np.errstate(over="raise", invalid="raise", divide="raise"):
+            q, r = linalg.qr(design, mode="economic", pivoting=False,
+                             overwrite_a=False, check_finite=False)
+            r = np.ascontiguousarray(r)
+            if not np.isfinite(q).all() or not np.isfinite(r).all():
+                return None
+            condition = float(np.linalg.cond(r))
+        if not np.isfinite(condition) or condition > _QR_CONDITION_LIMIT:
+            return None
+        return _QRPrepared(design, q, r, context)
+    except Exception:
+        # Parent preparation is optional. Failure leaves required projection
+        # to the original worker route and does not cache a negative result.
+        return None
+
 
 
 def _positive_integer(value, name):
@@ -130,15 +277,20 @@ def _batched_block(design, targets, gram, maxiter, *, matmul=np.matmul):
         pending = np.flatnonzero(counts)
         if not pending.size or iteration == maxiter:
             break
-        for column in pending:
-            if counts[column] < best_count[column]:
-                best_count[column], retries[column] = counts[column], 3
-                passive[violations[:, column], column] ^= True
-            elif retries[column] > 0:
-                retries[column] -= 1
-                passive[violations[:, column], column] ^= True
-            else:
-                passive[np.flatnonzero(violations[:, column])[-1], column] ^= True
+        if iteration == 0:
+            # Every pending column improves on its initial best count, rank + 1.
+            best_count[pending] = counts[pending]
+            passive[:] = violations
+        else:
+            for column in pending:
+                if counts[column] < best_count[column]:
+                    best_count[column], retries[column] = counts[column], 3
+                    passive[violations[:, column], column] ^= True
+                elif retries[column] > 0:
+                    retries[column] -= 1
+                    passive[violations[:, column], column] ^= True
+                else:
+                    passive[np.flatnonzero(violations[:, column])[-1], column] ^= True
         solved = _passive_solve(gram, cross[:, pending], passive[:, pending], factors)
         coefficients[:, pending] = solved
         gradient[:, pending] = matmul(gram, solved) - cross[:, pending]
@@ -179,7 +331,8 @@ def _qualified_rows(design, targets, coefficients, *, matmul=np.matmul, cross_sc
     return feasible & finite & kkt & representable
 
 
-def project_nnls(design, rows, *, solver="auto", maxiter=None, batch_size=256):
+def project_nnls(design, rows, *, solver="auto", maxiter=None, batch_size=256,
+                 _qr_prepared=None, _qr_capture=None, _qr_owned=False):
     """Solve ``min_{z>=0} ||design @ z - row||`` for each input row.
 
     ``auto`` batches at least 32 rows. ``batched`` requests batching even for
@@ -190,8 +343,9 @@ def project_nnls(design, rows, *, solver="auto", maxiter=None, batch_size=256):
     Failed block solves or row-level KKT checks fall back to public SciPy with
     the original maxiter; reference failures always propagate.
 
-    ``qr`` attempts a call-local economy QR for at least 32 rows and a
+    ``qr`` attempts an economy QR for at least 32 rows and a
     nonnegative design with height >= 2 * rank and condition(R) <= 1e6.
+    Private prepared factors require fresh basis and context checks.
     Reduced systems use public SciPy NNLS and original-space qualification.
     Ineligible calls or failed blocks use the existing ``auto`` path with
     the original iteration cap. A short failed tail can therefore use SciPy
@@ -229,7 +383,12 @@ def project_nnls(design, rows, *, solver="auto", maxiter=None, batch_size=256):
     bounds = _combine_bounds(design_bounds, _magnitude_bounds(rows))
     matmul = nnls_matmul() if solver != "scipy" else np.matmul
     if _within_range(bounds):
-        result = _project_unscaled(design, rows, solver, maxiter, batch_size, matmul=matmul)
+        if _qr_prepared is not None or _qr_capture is not None:
+            result = _project_unscaled(design, rows, solver, maxiter, batch_size,
+                matmul=matmul, _qr_prepared=_qr_prepared,
+                _qr_capture=_qr_capture, _qr_owned=_qr_owned)
+        else:
+            result = _project_unscaled(design, rows, solver, maxiter, batch_size, matmul=matmul)
     else:
         prepared = _prepare_scale_groups(design, rows, design_bounds)
         result = np.empty((len(rows), design.shape[1]), dtype=np.float64)
@@ -305,9 +464,13 @@ def _prepare_scale_groups(design, rows, design_bounds):
     return prepared
 
 
-def _project_unscaled(design, rows, solver, maxiter, batch_size, *, matmul=np.matmul):
+def _project_unscaled(design, rows, solver, maxiter, batch_size, *, matmul=np.matmul,
+                      _qr_prepared=None, _qr_capture=None, _qr_owned=False):
     """Existing guarded solver on validated, ordinary-scale arrays."""
     if solver == "qr":
+        if _qr_prepared is not None or _qr_capture is not None:
+            return _project_qr(design, rows, maxiter, batch_size, matmul=matmul,
+                _qr_prepared=_qr_prepared, _qr_capture=_qr_capture, _qr_owned=_qr_owned)
         return _project_qr(design, rows, maxiter, batch_size, matmul=matmul)
     rank = design.shape[1]
     if (solver == "scipy" or not len(rows)
@@ -346,32 +509,45 @@ def _project_unscaled(design, rows, solver, maxiter, batch_size, *, matmul=np.ma
     return answer
 
 
-def _project_qr(design, rows, maxiter, batch_size, *, matmul=np.matmul):
+def _project_qr(design, rows, maxiter, batch_size, *, matmul=np.matmul,
+                _qr_prepared=None, _qr_capture=None, _qr_owned=False):
     """Try orthogonal reduction; retain the current solver as block fallback.
 
     For A = QR, ||Az-b||^2 = ||Rz-Q.T b||^2 + ||(I-Q Q.T)b||^2.
     Variables and their nonnegativity constraint are unchanged. R and Q.T b
     can be signed, so the reduced problem uses public SciPy, never BPP.
-    Factors live only for this validated scale-group call.
+    Prepared factors require fresh basis and context checks before reuse.
     """
     rank = design.shape[1]
     if (len(rows) < _AUTO_MIN_ROWS or design.shape[0] < 2 * rank
             or (maxiter is not None and maxiter < 3 * rank)
             or np.any(design < 0)):
         return _project_unscaled(design, rows, "auto", maxiter, batch_size, matmul=matmul)
+    cached = context = None
+    if _qr_prepared is not None or _qr_capture is not None:
+        design, cached, context = _qr_lookup(
+            design, _qr_prepared, _qr_capture, _qr_owned)
     failures = (np.linalg.LinAlgError, FloatingPointError, RuntimeError)
-    try:
-        with np.errstate(over="raise", invalid="raise", divide="raise"):
-            q, r = linalg.qr(design, mode="economic", pivoting=False,
-                             overwrite_a=False, check_finite=False)
-            r = np.ascontiguousarray(r)
-            if not np.isfinite(q).all() or not np.isfinite(r).all():
-                raise FloatingPointError("NNLS QR factors are nonfinite.")
-            condition = float(np.linalg.cond(r))
-    except failures:
-        return _project_unscaled(design, rows, "auto", maxiter, batch_size, matmul=matmul)
-    if not np.isfinite(condition) or condition > _QR_CONDITION_LIMIT:
-        return _project_unscaled(design, rows, "auto", maxiter, batch_size, matmul=matmul)
+    if cached is None:
+        try:
+            with np.errstate(over="raise", invalid="raise", divide="raise"):
+                q, r = linalg.qr(design, mode="economic", pivoting=False,
+                                 overwrite_a=False, check_finite=False)
+                r = np.ascontiguousarray(r)
+                if not np.isfinite(q).all() or not np.isfinite(r).all():
+                    raise FloatingPointError("NNLS QR factors are nonfinite.")
+                condition = float(np.linalg.cond(r))
+        except failures:
+            return _project_unscaled(design, rows, "auto", maxiter, batch_size, matmul=matmul)
+        if not np.isfinite(condition) or condition > _QR_CONDITION_LIMIT:
+            return _project_unscaled(design, rows, "auto", maxiter, batch_size, matmul=matmul)
+    else:
+        q, r = cached
+    if type(_qr_capture) is _QRFitCapture:
+        if cached is not None and type(_qr_prepared) is _QRPrepared:
+            _qr_capture.entry = _qr_prepared
+        else:
+            _qr_capture_positive(_qr_capture, design, q, r, context)
 
     answer = np.empty((len(rows), rank), dtype=np.float64)
     for start in range(0, len(rows), batch_size):

@@ -91,26 +91,15 @@ def assert_two_product_contract(result, calls, allocations, left, right):
     mc, nc = m // 8 * 8, n // 8 * 8
     assert m >= 8 and n >= 8 and m % 8 and n % 8
     assert len(calls) == len(allocations) == 2
-    if 'column' == 'column':
-        assert [(c['left'].shape, c['right'].shape) for c in calls] == [((mp,k),(k,nc)),((mp,k),(k,8))]
-        full, fringe, core = calls[0]['left'], calls[1]['right'], calls[0]['right']
-        assert calls[1]['left'] is full
-        assert allocations[0]['array'] is full and allocations[1]['array'] is fringe
-        assert np.shares_memory(core, right)
-        np.testing.assert_array_equal(core, right[:, :nc])
-        np.testing.assert_array_equal(full[:m], left)
-        np.testing.assert_array_equal(fringe[:, :n-nc], right[:, nc:])
-        assert not np.count_nonzero(full[m:]) and not np.count_nonzero(fringe[:, n-nc:])
-    else:
-        assert [(c['left'].shape, c['right'].shape) for c in calls] == [((mc,k),(k,npad)),((8,k),(k,npad))]
-        full, fringe, core = calls[0]['right'], calls[1]['left'], calls[0]['left']
-        assert calls[1]['right'] is full
-        assert allocations[0]['array'] is fringe and allocations[1]['array'] is full
-        assert np.shares_memory(core, left)
-        np.testing.assert_array_equal(core, left[:mc])
-        np.testing.assert_array_equal(full[:, :n], right)
-        np.testing.assert_array_equal(fringe[:m-mc], left[mc:])
-        assert not np.count_nonzero(full[:, n:]) and not np.count_nonzero(fringe[m-mc:])
+    assert [(c['left'].shape, c['right'].shape) for c in calls] == [((mp,k),(k,nc)),((mp,k),(k,8))]
+    full, fringe, core = calls[0]['left'], calls[1]['right'], calls[0]['right']
+    assert calls[1]['left'] is full
+    assert allocations[0]['array'] is full and allocations[1]['array'] is fringe
+    assert np.shares_memory(core, right)
+    np.testing.assert_array_equal(core, right[:, :nc])
+    np.testing.assert_array_equal(full[:m], left)
+    np.testing.assert_array_equal(fringe[:, :n-nc], right[:, nc:])
+    assert not np.count_nonzero(full[m:]) and not np.count_nonzero(fringe[:, n-nc:])
     for value in (full, fringe):
         assert value.dtype == np.float64 and value.flags.c_contiguous and value.flags.aligned
     assert result.shape == (m,n) and result.dtype == np.float64

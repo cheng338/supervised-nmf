@@ -179,5 +179,6 @@ def test_spa_inverse_transform_retains_nonnegative_input_explanation(data):
 def test_affected_generic_checks_with_applicable_target_fixtures(kind, check):
     # Binary screening requires binary fixtures. Multiclass rejection itself is
     # tested above using nonnegative X, independently of generic checker data.
-    model = _BinaryScreeningForChecks(percentile=100.) if kind == "screen" else estimator(kind)
+    model = (_BinaryScreeningForChecks(screening="percentile", percentile=100.)
+             if kind == "screen" else estimator(kind))
     check(type(model).__name__, model)

@@ -241,16 +241,24 @@ class RefinementCalibrationTests(unittest.TestCase):
         self.y = np.arange(30) % 2
 
     def test_none_metadata_records_declared_alternative_even_when_every_fold_fails(self):
+        for scoring in ("accuracy", "balanced_accuracy"):
+            with self.subTest(scoring=scoring):
+                self._check_none_metadata_for_scoring(scoring)
+
+    def _check_none_metadata_for_scoring(self, scoring):
         result = calibration_search(
             DeclaredNoneFailsClassifier(), {"cutoff": [None, 1, 2]},
             self.X, self.y, cv=3, seed=9, threads=1, refit=False,
+            scoring=scoring,
         )
         report = result.report
         none_candidate = report["candidates"][0]
         self.assertEqual(none_candidate["parameters"], {"cutoff": None})
         self.assertFalse(none_candidate["valid"])
         self.assertEqual(none_candidate["invalid_fold_count"], 3)
-        self.assertIsNone(none_candidate["mean_balanced_accuracy"])
+        self.assertEqual(report["scoring"], scoring)
+        self.assertIsNone(none_candidate["mean_score"])
+        self.assertIsNone(none_candidate["mean_" + scoring])
         self.assertEqual([fold["status"] for fold in none_candidate["folds"]], ["failed"] * 3)
         self.assertTrue(all(candidate["valid"] for candidate in report["candidates"][1:]))
         self.assertEqual(report["selected_parameters"], {"cutoff": 1})

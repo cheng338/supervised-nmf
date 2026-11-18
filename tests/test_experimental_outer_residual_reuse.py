@@ -52,10 +52,10 @@ def capture_native(monkeypatch,before=None,after=None):
     selected=experimental.nnls_matmul()
     norm=experimental.linalg.norm
     records=dict(products=[],norms=[])
-    def multiply(left,right):
+    def multiply(left,right,**kwargs):
         frame=inspect.currentframe().f_back
         if before is not None: before(frame,left,right)
-        output=selected(left,right)
+        output=selected(left,right,**kwargs)
         assert type(output) is np.ndarray and output.dtype==np.float64
         assert output.flags.owndata and output.flags.writeable and output.flags.c_contiguous
         assert not np.shares_memory(output,left) and not np.shares_memory(output,right)

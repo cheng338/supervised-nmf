@@ -23,6 +23,7 @@ from threadpoolctl import threadpool_info, threadpool_limits
 
 from supervised_nmf import FeatureSPA, NMFClassifier
 from supervised_nmf import _projection
+from supervised_nmf.classifier import _capture_projection
 
 
 PROJECTION_PARAMETERS = {
@@ -109,17 +110,65 @@ class ProjectionExecutionTests(unittest.TestCase):
         with self.assertRaises(NotFittedError):
             copied.transform(self.query)
 
-    def test_old_pickle_without_execution_controls_retains_scipy(self):
+    def test_missing_execution_controls_are_not_repaired_by_loading(self):
         model = FeatureSPA(4, projection_solver="scipy").fit(self.train)
-        expected = _reference(model, self.query)
         for name in PROJECTION_PARAMETERS:
             delattr(model, name)
         restored = pickle.loads(pickle.dumps(model))
-        # Exact equality distinguishes the unchanged row-wise reference from
-        # numerically close grouped normal-equation solves on this fixture.
-        np.testing.assert_array_equal(restored.transform(self.query), expected)
-        self.assertEqual(restored.get_params()["projection_solver"], "scipy")
-        self.assertEqual(clone(restored).projection_solver, "scipy")
+        with self.assertRaisesRegex(AttributeError, "projection_solver"):
+            restored.transform(self.query)
+        self.assertTrue(all(name not in vars(restored) for name in PROJECTION_PARAMETERS))
+
+    def test_missing_individual_controls_fail_and_failed_refit_clears_state(self):
+        for kind in ("spa", "classifier"):
+            base = (FeatureSPA(4) if kind == "spa" else NMFClassifier(
+                n_components=4, screening="none", n_neighbors=3, random_state=17))
+            base.fit(self.train, self.labels)
+            for name in PROJECTION_PARAMETERS:
+                with self.subTest(kind=kind, missing=name):
+                    model = pickle.loads(pickle.dumps(base))
+                    delattr(model, name)
+                    basis = model.components_.copy()
+                    with _capture_projection(model) as record:
+                        with self.assertRaisesRegex(AttributeError, name):
+                            model.transform(self.query)
+                    np.testing.assert_array_equal(model.components_, basis)
+                    self.assertNotIn(name, vars(model))
+                    self.assertFalse(any(key.startswith("last_transform_") for key in vars(model)))
+                    if kind == "classifier":
+                        self.assertTrue(record["last_transform_performed"])
+                        self.assertFalse(record["last_transform_converged"])
+                        self.assertEqual(record["last_transform_warnings"], ())
+                        self.assertIn("AttributeError", record["last_transform_error"])
+                        self.assertIn(name, record["last_transform_error"])
+                        self.assertGreaterEqual(record["last_transform_seconds"], 0)
+                    with self.assertRaisesRegex(AttributeError, name):
+                        model.fit(self.train, self.labels)
+                    self.assertFalse(any(key.endswith("_") for key in vars(model)))
+                    self.assertNotIn(name, vars(model))
+                    with self.assertRaises(NotFittedError):
+                        model.transform(self.query)
+
+    def test_missing_control_keeps_existing_input_error_precedence(self):
+        for kind in ("spa", "classifier"):
+            model = (FeatureSPA(4) if kind == "spa" else NMFClassifier(
+                n_components=4, screening="none", n_neighbors=3, random_state=17))
+            model.fit(self.train, self.labels)
+            del model.projection_workers
+            # SPA validates X first; the classifier validates its controls first.
+            for query, message in ((self.query[:, :-1], "expecting"),
+                                   (-self.query, "Negative values")):
+                with self.subTest(kind=kind, invalid_input=message):
+                    error_type = ValueError if kind == "spa" else AttributeError
+                    error_text = message if kind == "spa" else "projection_workers"
+                    with self.assertRaisesRegex(error_type, error_text):
+                        model.transform(query)
+            # Fit validates controls before data and removes the previous fit.
+            with self.assertRaisesRegex(AttributeError, "projection_workers"):
+                model.fit(np.full_like(self.train, np.nan), self.labels)
+            self.assertFalse(any(key.endswith("_") for key in vars(model)))
+            with self.assertRaises(NotFittedError):
+                model.transform(self.query[:, :-1])
 
     def test_native_library_discovery_is_reused_between_queries(self):
         model = FeatureSPA(4).fit(self.train)

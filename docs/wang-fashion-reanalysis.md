@@ -38,4 +38,10 @@ Pointwise percentile intervals for paired class-stratified resampling of validat
 
 Negative differences favor the comparator. Across the matched three-task average, the historical SPA sNMF procedure trails screened PCA, screening alone and raw KNN. This evidence should be retained rather than selecting a new dataset to conceal it.
 
-Reproduce: `python scripts/reanalyze_wang_fashion.py`. Machine-readable results and individual source hashes are in `runs/wang-fashion-reanalysis-20261006/report.json`.
+Historical command in the retained local study workspace:
+`python scripts/reanalyze_wang_fashion.py` (script retained locally). It requires
+the saved `runs/four-solvers-20261004-repair/report/report.json` and its 21
+Fashion-MNIST evaluation receipts. A public source checkout or package
+installation alone does not supply these study inputs. Machine-readable results
+and individual source hashes are in
+`runs/wang-fashion-reanalysis-20261006/report.json`.

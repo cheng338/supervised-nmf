@@ -69,6 +69,7 @@ def record_solve(monkeypatch, A, B, *, init=None, cap=None, prepared=False, role
             return getattr(np, name)
 
         def matmul(self, left, right):
+            assert left.shape[0] % 8 == right.shape[1] % 8 == 0, "Unprotected native outer dimensions"
             # Snapshots precede the real call: mutation cannot hide in a later copy.
             left_state, right_state = bits(left), bits(right)
             left_before, right_before = left.copy(), right.copy()
@@ -140,6 +141,7 @@ def capture_native(monkeypatch,before=None,after=None):
             return getattr(np, name)
 
         def matmul(self, left, right):
+            assert left.shape[0] % 8 == right.shape[1] % 8 == 0, "Unprotected native outer dimensions"
             # Snapshots precede the real call: mutation cannot hide in a later copy.
             left_state, right_state = bits(left), bits(right)
             left_before, right_before = left.copy(), right.copy()
@@ -152,12 +154,12 @@ def capture_native(monkeypatch,before=None,after=None):
             return output
 
 
-    def multiply(left,right):
+    def multiply(left,right,**kwargs):
         frame=inspect.currentframe().f_back
         if before is not None: before(frame,left,right)
         left_before, right_before = left.copy(), right.copy()
         start = len(native_calls)
-        output=selected(left,right)
+        output=selected(left,right,**kwargs)
         assert bits(left) == bits(left_before) and bits(right) == bits(right_before)
         assert type(output) is np.ndarray and output.dtype==np.float64
         assert output.flags.owndata and output.flags.writeable and output.flags.c_contiguous
@@ -261,6 +263,10 @@ def check_outer_lifetimes(records, X, model, coordinates):
         next_event = records["products"][index + 1]
         if (event["caller"] == next_event["caller"] == "_nnls_block_pivot"
                 and next_event["right"] is event["output"]):
+            # Replaced selector/native observers decline quiet admission, so
+            # these original residual/gradient products must be inline core calls.
+            assert event["caller_parent"] == next_event["caller_parent"]
+            assert event["caller_parent"] in ("solve", "nnls_block_pivot")
             # E1 executes in the same fit, distinct from the outer E2 objects.
             assert bits(next_event["right_before"]) == bits(event["output"])
             assert bits(event["output"]) != bits(event["original"])

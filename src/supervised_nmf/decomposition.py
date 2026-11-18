@@ -45,7 +45,7 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
     more structure but require more anchor-selection and NNLS work; the data
     must supply enough independent anchors. Choose ``normalize=False`` when
     selection by original feature magnitudes is intended: large-scale columns
-    can then dominate. Neither setting rescales returned anchor coordinates
+    can then dominate. Neither setting rescales the saved anchor coordinates
     or incoming observations. The unnormalized recovery assumptions still apply.
 
     ``condition_limit=1e12`` rejects poorly conditioned selected anchors
@@ -64,19 +64,18 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
     Changes to rank, normalization or condition admission require a new fit;
     they do not modify or requalify the existing basis.
 
-    The selected original-scale columns form training coordinates W. We solve
-    NNLS for every column to learn H such that X approximately equals W H.
+    The selected original-scale columns form the anchor matrix A. We solve
+    NNLS for every column to learn H such that X approximately equals A H.
     ``transform`` solves NNLS against this fixed H, without selecting anchors
-    or refitting on new observations. ``fit_transform`` returns the anchor
-    coordinates W; ``transform(X_train)`` may differ on noisy data.
+    or refitting on new observations. ``fit_transform`` fits this basis and
+    applies the same NNLS transformation to the training observations.
 
-    A generic sklearn Pipeline therefore trains its next step on anchor
-    coordinates and predicts using projected coordinates. For a common SPA
-    classification map, use ``NMFClassifier(solver='spa')`` with
-    ``training_coordinates='auto'`` or ``'transform'``, or explicitly call
-    ``fit`` then ``transform`` on the training data before fitting a separate
-    classifier. Refit all learned
-    steps inside each training fold when performing cross-validation.
+    A generic sklearn Pipeline therefore uses one fixed-basis coordinate map
+    for training and prediction. ``fit_coordinates_`` retains the original
+    anchor matrix A, which can differ from projected training coordinates on
+    noisy data. ``reconstruction_err_`` measures the anchor-factorization
+    residual ||X - A H||, not the residual after training projection. Refit all
+    learned steps inside each training fold when performing cross-validation.
 
     This is a separate estimator from coordinate-descent NMF. Its recovery
     theory requires feature separability, a full-rank anchor matrix and noise
@@ -133,22 +132,11 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
         tags.input_tags.positive_only = True
         return tags
 
-    def __setstate__(self, state):
-        # Make get_params/clone work for models serialized before these
-        # execution controls existed, retaining their original projection solver.
-        state = dict(state)
-        state.setdefault("projection_solver", "scipy")
-        state.setdefault("projection_workers", 1)
-        state.setdefault("projection_batch_size", 256)
-        state.setdefault("projection_native_threads", 1)
-        super().__setstate__(state)
-
     def _projection_options(self):
-        # Older serialized estimators retain their historical projection path.
-        options = dict(solver=getattr(self, "projection_solver", "scipy"),
-                       workers=getattr(self, "projection_workers", 1),
-                       batch_size=getattr(self, "projection_batch_size", 256),
-                       native_threads=getattr(self, "projection_native_threads", 1))
+        options = dict(solver=self.projection_solver,
+                       workers=self.projection_workers,
+                       batch_size=self.projection_batch_size,
+                       native_threads=self.projection_native_threads)
         validate_projection_parameters(*options.values())
         return options
 
@@ -216,30 +204,33 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
         basis_condition = float(np.linalg.cond(components))
         if not np.isfinite(basis_condition) or basis_condition > self.condition_limit:
             raise ValueError("Fitted SPA basis is rank deficient or exceeds condition_limit.")
-        self.n_features_in_ = X.shape[1]
-        self.n_samples_seen_ = X.shape[0]
-        self.n_components_ = int(self.n_components)
-        self.anchor_indices_ = anchors
-        self.column_scales_ = scales
-        self.anchor_condition_ = anchor_condition
-        self.original_anchor_condition_ = original_anchor_condition
-        self.basis_condition_ = basis_condition
-        self.components_ = components
-        self.fit_coordinates_ = coordinates
-        self.reconstruction_err_ = reconstruction_error(X, coordinates, components)
-        self.n_iter_ = self.n_components_
+        try:
+            self.n_features_in_ = X.shape[1]
+            self.n_samples_seen_ = X.shape[0]
+            self.n_components_ = int(self.n_components)
+            self.anchor_indices_ = anchors
+            self.column_scales_ = scales
+            self.anchor_condition_ = anchor_condition
+            self.original_anchor_condition_ = original_anchor_condition
+            self.basis_condition_ = basis_condition
+            self.components_ = components
+            self.fit_coordinates_ = coordinates
+            self.reconstruction_err_ = reconstruction_error(X, coordinates, components)
+            self.n_iter_ = self.n_components_
+        except Exception:
+            _clear_fitted_attributes(self)
+            raise
         return self
 
     def fit_transform(self, X, y=None, **fit_params):
-        """Fit the anchor factorization and return a copy of its anchor columns.
+        """Fit the basis, then project training observations by fixed-basis NNLS.
 
-        This returns ``fit_coordinates_``, not a fixed-basis NNLS projection.
-        It can differ from ``fit(X, y).transform(X)`` on noisy data. A generic
-        pipeline passes these anchor coordinates to its next step during fit.
+        This is the same operation as ``fit(X, y).transform(X)``. The anchor
+        coordinates remain separately available as ``fit_coordinates_``.
         """
         if fit_params:
             raise TypeError(f"Unsupported fit parameters: {', '.join(fit_params)}")
-        return self.fit(X, y).fit_coordinates_.copy()
+        return self.fit(X, y).transform(X)
 
     def transform(self, X):
         """Project observations by NNLS against the fitted basis.
@@ -260,6 +251,10 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
         # Never overwrite the fitted basis. The guarded batched path falls
         # back to the public solver when numerical qualification fails.
         design = np.ascontiguousarray(self.components_.T)
+        if type(self) is FeatureSPA and type(self.projection_solver) is str and self.projection_solver == "qr" and type(self.components_) is np.ndarray:
+            return project_rows(design, X, maxiter=self.nnls_max_iter,
+                _qr_owner=self.components_, _qr_owned=design.flags.owndata,
+                **self._projection_options())
         return project_rows(design, X, maxiter=self.nnls_max_iter,
                             **self._projection_options())
 

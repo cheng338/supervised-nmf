@@ -1,21 +1,27 @@
 """Print the active numerical environment without changing it."""
 
-import importlib.metadata
-import json
-import os
-import platform
-import sys
-from threadpoolctl import threadpool_info
-import numpy  # noqa: F401 -- Load numerical runtimes before querying thread pools.
-import scipy  # noqa: F401 -- Load numerical runtimes before querying thread pools.
-import sklearn  # noqa: F401 -- Load numerical runtimes before querying thread pools.
 
-print(json.dumps({
-    "python": sys.version,
-    "executable": sys.executable,
-    "platform": platform.platform(),
-    "cpu_count": os.cpu_count(),
-    "versions": {name: importlib.metadata.version(name) for name in
-                 ["numpy", "scipy", "scikit-learn", "joblib", "threadpoolctl"]},
-    "thread_pools": threadpool_info(),
-}, indent=2))
+def main():
+    import importlib.metadata
+    import json
+    import os
+    import platform
+    import sys
+    from threadpoolctl import threadpool_info
+    import numpy  # noqa: F401 -- Load numerical runtimes before querying thread pools.
+    import scipy  # noqa: F401 -- Load numerical runtimes before querying thread pools.
+    import sklearn  # noqa: F401 -- Load numerical runtimes before querying thread pools.
+
+    print(json.dumps({
+        "python": sys.version,
+        "executable": sys.executable,
+        "platform": platform.platform(),
+        "cpu_count": os.cpu_count(),
+        "versions": {name: importlib.metadata.version(name) for name in
+                     ["numpy", "scipy", "scikit-learn", "joblib", "threadpoolctl"]},
+        "thread_pools": threadpool_info(),
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    main()

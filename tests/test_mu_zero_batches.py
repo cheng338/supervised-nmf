@@ -37,7 +37,7 @@ def data(request):
             np.column_stack((query, np.zeros((35, 2), dtype=dtype))))
 
 
-def fit_model(data, *, head="knn", screening="absolute"):
+def fit_model(data, *, head="knn", screening="absolute", mu_projection="auto"):
     x, y, _ = data
     return NMFClassifier(
         solver="mu", screening=screening, score_threshold=2,
@@ -45,13 +45,19 @@ def fit_model(data, *, head="knn", screening="absolute"):
         knn_normalization="sd" if head == "knn_sd" else "none",
         n_components=2, n_neighbors=3, weights="distance",
         max_iter=2000, tol=1e-4, random_state=10,
-        projection_native_threads=1,
+        projection_native_threads=1, mu_projection=mu_projection,
     ).fit(x, y)
 
 
 @pytest.fixture(scope="module")
 def fitted(data):
     return fit_model(data)
+
+
+@pytest.fixture(scope="module")
+def fitted_batch(data):
+    # Delegation assertions below concern the explicit shared-batch policy.
+    return fit_model(data, mu_projection="batch")
 
 
 def forbid_iteration(monkeypatch, model):
@@ -179,8 +185,8 @@ def test_zero_success_has_fresh_diagnostics_without_rewriting_old_model_fields(d
 
 
 @pytest.mark.parametrize("kind", ["positive", "mixed"])
-def test_nonzero_selected_batches_keep_sklearn_path(data, fitted, kind, monkeypatch):
-    model = deepcopy(fitted)
+def test_nonzero_selected_batches_keep_sklearn_path(data, fitted_batch, kind, monkeypatch):
+    model = deepcopy(fitted_batch)
     query = data[2].copy()
     if kind == "mixed":
         query[::2] = 0
@@ -213,8 +219,8 @@ def test_full_query_validation_precedes_zero_shortcut(data, fitted, kind):
 
 
 @pytest.mark.parametrize("kind", ["zero", "negative", "nan", "inf", "wrong_width", "matrix"])
-def test_invalid_basis_keeps_upstream_behavior(data, fitted, kind, monkeypatch):
-    model = deepcopy(fitted)
+def test_invalid_basis_keeps_upstream_behavior(data, fitted_batch, kind, monkeypatch):
+    model = deepcopy(fitted_batch)
     basis = model.decomposition_.components_.copy()
     if kind == "zero":
         basis[:] = 0
@@ -262,8 +268,8 @@ def test_projection_settings_still_validate_for_mu(data, fitted):
 
 
 @pytest.mark.parametrize("kind", ["nndsvd", "feature_names"])
-def test_unrelated_warnings_are_not_hidden(data, fitted, kind, monkeypatch):
-    model = deepcopy(fitted)
+def test_unrelated_warnings_are_not_hidden(data, fitted_batch, kind, monkeypatch):
+    model = deepcopy(fitted_batch)
     if kind == "nndsvd":
         model.decomposition_.init = "nndsvd"
     else:
@@ -340,8 +346,8 @@ def test_zero_prediction_retains_reversed_positive_label_and_threshold(data, fit
     np.testing.assert_array_equal(actual_labels, expected_labels)
 
 
-def test_custom_instance_transform_is_preserved(data, fitted, monkeypatch):
-    model = deepcopy(fitted)
+def test_custom_instance_transform_is_preserved(data, fitted_batch, monkeypatch):
+    model = deepcopy(fitted_batch)
     calls = []
 
     def custom_transform(selected):

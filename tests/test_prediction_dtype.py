@@ -10,6 +10,7 @@ from sklearn.exceptions import ConvergenceWarning
 from threadpoolctl import threadpool_limits
 
 from supervised_nmf import NMFClassifier
+from supervised_nmf._mu_rowwise import transform_mu_rowwise
 from supervised_nmf.classifier import _capture_projection
 from supervised_nmf.evaluation import evaluate_classifier
 
@@ -30,11 +31,18 @@ def dtype(request):
     return request.param
 
 
+@pytest.fixture(scope="module", params=[("cd", "auto"), ("mu", "auto"), ("mu", "batch")],
+                ids=["cd-auto", "mu-auto", "mu-batch"])
+def prediction_policy(request):
+    return request.param
+
+
 @pytest.fixture(scope="module", params=[
     ("knn", "none"), ("knn", "absolute"), ("knn", "percentile"),
     ("knn_sd", "absolute"), ("logistic", "absolute"), ("linear_svm", "none"),
 ], ids=lambda choice: "-".join(choice))
-def fitted(solver, dtype, request):
+def fitted(prediction_policy, dtype, request):
+    solver, mu_projection = prediction_policy
     head, screening = request.param
     rng = np.random.default_rng(729)
     latent = rng.uniform(.3, 2, (80, 2))
@@ -49,17 +57,20 @@ def fitted(solver, dtype, request):
         classifier="knn" if head == "knn_sd" else head,
         knn_normalization="sd" if head == "knn_sd" else "none",
         n_components=2, n_neighbors=3, weights="distance", max_iter=3000,
-        tol=1e-4, random_state=10,
+        tol=1e-4, random_state=10, mu_projection=mu_projection,
     ).fit(x, y)
     return model, query
 
 
 def reference_coordinates(model, query):
-    # Public sklearn on the actual stored basis is independent of the package's
-    # query adapter. Double precision exactly contains both supported dtypes.
+    # Call the fitted policy directly, independently of public dtype adaptation.
+    # Shared-batch/CD retain sklearn's oracle; rowwise has distinct stopping.
+    # Double precision exactly contains both supported input dtypes.
     reference = deepcopy(model.decomposition_)
     reference.components_ = reference.components_.astype(np.float64)
     selected = np.asarray(query, dtype=np.float64)[:, model.selected_features_]
+    if model.mu_projection_ == "rowwise":
+        return transform_mu_rowwise(reference, selected)
     return reference.transform(selected)
 
 

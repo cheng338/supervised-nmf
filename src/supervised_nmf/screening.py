@@ -9,8 +9,11 @@ from copy import deepcopy
 
 import numpy as np
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn import get_config
 from sklearn.utils.multiclass import check_classification_targets
 from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
+
+from ._labels import _validate_class_labels
 
 
 def _clear_fitted_attributes(estimator):
@@ -28,11 +31,13 @@ def _nonnegative_array(X):
 
 
 def _binary_data(X, y):
+    raw_y = y
     X, y = check_X_y(X, y, accept_sparse=False, dtype=[np.float64, np.float32])
     if np.any(X < 0):
         raise ValueError("Negative values in data. X must contain nonnegative values.")
     check_classification_targets(y)
     classes, counts = np.unique(y, return_counts=True)
+    _validate_class_labels(raw_y, y, classes=classes)
     if classes.size != 2:
         raise ValueError(
             "Only binary classification is supported. Binary classification requires exactly two classes; "
@@ -62,12 +67,173 @@ def _percentile_support(scores, eligible, percentile):
     return mask & eligible
 
 
+def _screening_canonical_f(X):
+    return (type(X) is np.ndarray and X.ndim == 2
+            and X.shape[0] > 1 and X.shape[1] > 1
+            and X.dtype.type in (np.float32, np.float64) and X.dtype.isnative
+            and X.flags.aligned and X.flags.f_contiguous
+            and not X.flags.c_contiguous
+            and X.strides == (X.itemsize, X.shape[0] * X.itemsize))
+
+
+def _screening_block_statistics(translated, y, classes, counts):
+    # The caller has already completed the original full subtraction snapshot.
+    # Capture class membership once; later blocks never reread caller labels.
+    masks = [y == label for label in classes]
+    p = translated.shape[1]
+    scales = np.empty(p, dtype=np.float64)
+    pooled = np.empty(p, dtype=np.float64)
+    difference = np.empty(p, dtype=np.float64)
+    standard_error = np.empty(p, dtype=np.float64)
+    t_scores = np.zeros(p, dtype=np.float64)
+    group_constant = [np.empty(p, dtype=bool) for _ in classes]
+    begin = 0
+    while begin < p:
+        end = min(begin + 128, p)
+        # Never create a one-column group: that changes NumPy's sum geometry.
+        if p - end == 1:
+            end -= 1
+        columns = slice(begin, end)
+        block = translated[:, columns]
+        block_scales = block.max(axis=0)
+        scaled = np.divide(block, block_scales, out=np.zeros_like(block),
+                           where=block_scales > 0)
+        groups = [scaled[mask] for mask in masks]
+        fixed_groups = [np.all(group == group[0], axis=0) for group in groups]
+        try:
+            with np.errstate(over="raise", invalid="raise", divide="raise"):
+                means = [group.mean(axis=0) for group in groups]
+                variances = [group.var(axis=0, ddof=1) for group in groups]
+                for group, mean, variance, fixed in zip(groups, means, variances, fixed_groups):
+                    mean[fixed] = group[0, fixed]
+                    variance[fixed] = 0.0
+                block_pooled = ((counts[0] - 1) * variances[0] + (counts[1] - 1) * variances[1]) / (counts.sum() - 2)
+                block_difference = means[1] - means[0]
+                block_error = np.sqrt(block_pooled * (1 / counts[0] + 1 / counts[1]))
+                np.divide(block_difference, block_error, out=t_scores[columns], where=block_error > 0)
+        except FloatingPointError as exc:
+            raise ValueError("Screening statistics exceeded float64 range; rescale X consistently before fitting.") from exc
+        scales[columns] = block_scales
+        pooled[columns] = block_pooled
+        difference[columns] = block_difference
+        standard_error[columns] = block_error
+        for destination, fixed in zip(group_constant, fixed_groups):
+            destination[columns] = fixed
+        begin = end
+    return scales, group_constant, pooled, difference, standard_error, t_scores
+
+
+def _screening_capture_reuse(policy):
+    """Capture direct numerical bindings for C-layout statistics reuse.
+
+    Decline if captured operations are replaced or their code/defaults change.
+    These checks cover direct dependencies, not arbitrary library changes.
+    """
+    numpy = np
+    array_type = np.ndarray
+    watched = []
+    enabled = False
+
+    def token(value):
+        keywords = getattr(value, "__kwdefaults__", None)
+        return (value, getattr(value, "__code__", None),
+                getattr(value, "__defaults__", None), keywords,
+                tuple(keywords.items()) if type(keywords) is dict else None)
+
+    def watch(mapping, names):
+        for name in names:
+            watched.append((mapping, name, token(mapping[name])))
+
+    def unchanged(value, saved):
+        if (value is not saved[0] or getattr(value, "__code__", None) is not saved[1]
+                or getattr(value, "__defaults__", None) is not saved[2]):
+            return False
+        keywords = getattr(value, "__kwdefaults__", None)
+        if keywords is not saved[3]:
+            return False
+        return (saved[4] is None
+                or (type(keywords) is dict and len(keywords) == len(saved[4])
+                    and all(key in keywords and keywords[key] is item
+                            for key, item in saved[4])))
+
+    try:
+        watch(globals(), ("np", "get_config"))
+        watch(vars(np), ("ndarray", "float32", "float64", "geterr",
+                         "zeros_like", "divide", "__version__"))
+        if policy == "mean":
+            # mean= is the public np.var API added in NumPy 2.0. It is not
+            # assumed to exist on every earlier ndarray.var method.
+            enabled = np.lib.NumpyVersion(np.__version__) >= "2.0.0"
+            if enabled:
+                import importlib
+                methods = importlib.import_module("numpy._core._methods")
+                watch(vars(np), ("var", "_NoValue"))
+                watch(vars(np.ndarray), ("mean", "var"))
+                watch(vars(np.var), ("__wrapped__",))
+                watch(np.var.__wrapped__.__globals__, ("_methods", "mu", "np"))
+                watch(vars(methods), ("_mean", "_var", "umr_sum",
+                                     "_count_reduce_items", "asanyarray", "um"))
+                watch(vars(methods.um), ("true_divide", "subtract", "square",
+                                        "maximum"))
+        elif policy == "normalize":
+            watch(vars(np), ("any",))
+            watch(vars(np.zeros_like), ("__wrapped__",))
+            original = np.zeros_like.__wrapped__
+            watch(original.__globals__, ("empty_like", "zeros", "multiarray"))
+            watch(vars(original.__globals__["multiarray"]), ("copyto",))
+            enabled = True
+        else:
+            raise ValueError("Unknown screening experiment")
+    except (ImportError, AttributeError, KeyError, TypeError, ValueError):
+        # Missing optional implementation details preserve the original path.
+        enabled = False
+
+    def ready(X, scratch):
+        # Leave existing F and noncanonical input routes alone. The inline
+        # caller supplies the original subtraction/normalization result.
+        if type(X) is not array_type or X.ndim != 2 or not X.flags.c_contiguous:
+            return False
+        # Skip small C-layout statistics, except tall two-feature means.
+        # Keep the per-phase binding and numerical-policy checks below.
+        if X.size < 131072 and not (
+            policy == "mean" and X.shape[1] == 2 and X.shape[0] >= 8192
+        ):
+            return False
+        if not enabled:
+            return False
+        try:
+            if not all(unchanged(mapping[name], saved)
+                       for mapping, name, saved in watched):
+                return False
+        except (KeyError, AttributeError):
+            return False
+        return (np is numpy and X.dtype.type in (np.float32, np.float64)
+                and X.dtype.isnative
+                and type(scratch) is array_type and scratch.ndim == 2
+                and scratch.shape == X.shape and scratch.dtype.type is np.float64
+                and scratch.dtype.isnative and scratch.flags.c_contiguous
+                and scratch.flags.owndata and scratch.flags.writeable
+                and scratch.base is None
+                and np.geterr()["under"] == "ignore"
+                and get_config()["assume_finite"] is False)
+
+    # Descriptive only; changing these attributes cannot enable the closure.
+    ready.policy = policy
+    ready.supports_policy = enabled
+    ready.binding_count = len(watched)
+    return ready
+
+
+_SCREENING_MEAN_READY = _screening_capture_reuse("mean")
+_SCREENING_NORMALIZE_READY = _screening_capture_reuse("normalize")
+
+
 class BinaryScreening(TransformerMixin, BaseEstimator):
     """Fit a binary ANOVA/pooled-t feature screen on training observations.
 
-    This standalone transformer defaults to ``screening="percentile"`` with
-    ``percentile=10.0``. NMFClassifier defaults to absolute screening instead.
-    Set ``screening`` explicitly when choosing or tuning either policy:
+    This transformer and NMFClassifier default to ``screening="absolute"``
+    with ``score_threshold=2.0``. Set ``screening="percentile"`` explicitly
+    to use percentile selection. When choosing or tuning either policy,
     ``percentile`` controls percentile mode and ``score_threshold`` controls
     absolute mode. Changing either parameter does not switch the mode.
 
@@ -97,9 +263,11 @@ class BinaryScreening(TransformerMixin, BaseEstimator):
     directly and ``n_f_overflow_`` records this distinct numerical event.
     Both modes raise when no features survive, making invalid search candidates
     visible rather than silently changing the requested screen.
+    Class labels must not end in a NUL codepoint (``\\x00``). Encode such
+    categories as distinct integers before converting them to NumPy strings.
     """
 
-    def __init__(self, screening="percentile", percentile=10.0, score_threshold=2.0):
+    def __init__(self, screening="absolute", percentile=10.0, score_threshold=2.0):
         self.screening = screening
         self.percentile = percentile
         self.score_threshold = score_threshold
@@ -145,15 +313,20 @@ class BinaryScreening(TransformerMixin, BaseEstimator):
         if type(reference) is not BinaryScreening:
             raise TypeError("reference must be a fitted BinaryScreening instance.")
         check_is_fitted(reference, "support_")
+        _validate_class_labels(reference.classes_)
         constant = np.zeros(reference.n_features_in_, dtype=bool)
         constant[reference.constant_features_] = True
         support = self._support_from_statistics(reference.t_scores_, constant)
-        for name, value in vars(reference).items():
-            if name.endswith("_") and not name.startswith("__"):
-                setattr(self, name, deepcopy(value))
-        self.support_ = support
-        self.selected_features_ = np.flatnonzero(support)
-        self.n_features_selected_ = int(support.sum())
+        try:
+            for name, value in vars(reference).items():
+                if name.endswith("_") and not name.startswith("__"):
+                    setattr(self, name, deepcopy(value))
+            self.support_ = support
+            self.selected_features_ = np.flatnonzero(support)
+            self.n_features_selected_ = int(support.sum())
+        except Exception:
+            _clear_fitted_attributes(self)
+            raise
         return self
 
     def _fit_statistics(self, X, y, classes, counts):
@@ -162,27 +335,60 @@ class BinaryScreening(TransformerMixin, BaseEstimator):
         # a small spread that is still represented in the supplied input.
         # Nonnegative finite X makes this subtraction overflow-safe; a minimum
         # reference is independent of row order. Exact pooled t/F is invariant.
-        X_statistics = X.astype(np.float64, copy=False)
+        if (_screening_canonical_f(X) and X.dtype.type is np.float32
+                and X.shape[1] > 128 and 8 * X.size <= 1_048_576):
+            X_statistics = X.astype(np.float64, order="C", copy=False)
+        else:
+            X_statistics = X.astype(np.float64, copy=False)
         offsets = X_statistics.min(axis=0)
         X_statistics = X_statistics - offsets
-        scales = X_statistics.max(axis=0)
-        scaled = np.divide(X_statistics, scales, out=np.zeros_like(X_statistics), where=scales > 0)
-        groups = [scaled[y == label] for label in classes]
-        group_constant = [np.all(group == group[0], axis=0) for group in groups]
-        try:
-            with np.errstate(over="raise", invalid="raise", divide="raise"):
-                means = [group.mean(axis=0) for group in groups]
-                variances = [group.var(axis=0, ddof=1) for group in groups]
-                for group, mean, variance, fixed in zip(groups, means, variances, group_constant):
-                    mean[fixed] = group[0, fixed]
-                    variance[fixed] = 0.0
-                pooled = ((counts[0] - 1) * variances[0] + (counts[1] - 1) * variances[1]) / (counts.sum() - 2)
-                difference = means[1] - means[0]
-                standard_error = np.sqrt(pooled * (1 / counts[0] + 1 / counts[1]))
-                t_scores = np.zeros(X.shape[1], dtype=np.float64)
-                np.divide(difference, standard_error, out=t_scores, where=standard_error > 0)
-        except FloatingPointError as exc:
-            raise ValueError("Screening statistics exceeded float64 range; rescale X consistently before fitting.") from exc
+        if (_screening_canonical_f(X) and X.shape[1] > 128
+                and X_statistics.nbytes > 1_048_576
+                and np.geterr()["under"] == "ignore"
+                and get_config()["assume_finite"] is False):
+            scales, group_constant, pooled, difference, standard_error, t_scores = _screening_block_statistics(X_statistics, y, classes, counts)
+        else:
+            scales = X_statistics.max(axis=0)
+            reuse_normalization = _SCREENING_NORMALIZE_READY(X, X_statistics)
+            if reuse_normalization:
+                # X_statistics is this call's unchanged full subtraction
+                # result. Caller X and the fitted state never alias it.
+                zero_columns = scales == 0
+                if np.any(zero_columns):
+                    # Match zeros_like's positive zeros in masked columns.
+                    X_statistics[:, zero_columns] = 0.0
+                scaled = np.divide(X_statistics, scales, out=X_statistics,
+                                   where=scales > 0)
+            else:
+                scaled = np.divide(X_statistics, scales, out=np.zeros_like(X_statistics), where=scales > 0)
+            groups = [scaled[y == label] for label in classes]
+            group_constant = [np.all(group == group[0], axis=0) for group in groups]
+            try:
+                with np.errstate(over="raise", invalid="raise", divide="raise"):
+                    means = [group.mean(axis=0) for group in groups]
+                    reuse_mean = (_SCREENING_MEAN_READY(X, scaled)
+                                  and all(type(group) is np.ndarray
+                                          and group.dtype.type is np.float64
+                                          and group.dtype.isnative
+                                          and group.flags.c_contiguous
+                                          and group.shape[0] >= 2
+                                          for group in groups))
+                    if reuse_mean:
+                        # Use the original means before constant-column repair.
+                        variances = [np.var(group, axis=0, ddof=1, mean=mean[None, :])
+                                     for group, mean in zip(groups, means)]
+                    else:
+                        variances = [group.var(axis=0, ddof=1) for group in groups]
+                    for group, mean, variance, fixed in zip(groups, means, variances, group_constant):
+                        mean[fixed] = group[0, fixed]
+                        variance[fixed] = 0.0
+                    pooled = ((counts[0] - 1) * variances[0] + (counts[1] - 1) * variances[1]) / (counts.sum() - 2)
+                    difference = means[1] - means[0]
+                    standard_error = np.sqrt(pooled * (1 / counts[0] + 1 / counts[1]))
+                    t_scores = np.zeros(X.shape[1], dtype=np.float64)
+                    np.divide(difference, standard_error, out=t_scores, where=standard_error > 0)
+            except FloatingPointError as exc:
+                raise ValueError("Screening statistics exceeded float64 range; rescale X consistently before fitting.") from exc
         constant = np.all(X == X[0], axis=0)
         classwise_constant = group_constant[0] & group_constant[1] & ~constant
         if np.any((standard_error == 0) & ~constant & ~classwise_constant):
@@ -192,25 +398,29 @@ class BinaryScreening(TransformerMixin, BaseEstimator):
         with np.errstate(over="ignore"):
             scores = np.square(t_scores)
         support = self._support_from_statistics(t_scores, constant)
-        self.n_features_in_ = X.shape[1]
-        self.n_samples_seen_ = X.shape[0]
-        self.classes_ = classes
-        self.class_counts_ = counts
-        self.scores_ = scores
-        self.t_scores_ = t_scores
-        self.statistic_offsets_ = offsets
-        self.statistic_scales_ = scales
-        self.scaled_pooled_variances_ = pooled
-        self.scaled_standard_errors_ = standard_error
-        self.support_ = support
-        self.selected_features_ = np.flatnonzero(support)
-        self.n_features_selected_ = int(support.sum())
-        self.constant_features_ = np.flatnonzero(constant)
-        self.n_constant_features_ = int(constant.sum())
-        self.n_infinite_scores_ = int(np.isinf(scores).sum())
-        self.n_infinite_t_scores_ = int(np.isinf(t_scores).sum())
-        self.n_f_overflow_ = int((np.isfinite(t_scores) & np.isinf(scores)).sum())
-        self.n_classwise_constant_features_ = int(classwise_constant.sum())
+        try:
+            self.n_features_in_ = X.shape[1]
+            self.n_samples_seen_ = X.shape[0]
+            self.classes_ = classes
+            self.class_counts_ = counts
+            self.scores_ = scores
+            self.t_scores_ = t_scores
+            self.statistic_offsets_ = offsets
+            self.statistic_scales_ = scales
+            self.scaled_pooled_variances_ = pooled
+            self.scaled_standard_errors_ = standard_error
+            self.support_ = support
+            self.selected_features_ = np.flatnonzero(support)
+            self.n_features_selected_ = int(support.sum())
+            self.constant_features_ = np.flatnonzero(constant)
+            self.n_constant_features_ = int(constant.sum())
+            self.n_infinite_scores_ = int(np.isinf(scores).sum())
+            self.n_infinite_t_scores_ = int(np.isinf(t_scores).sum())
+            self.n_f_overflow_ = int((np.isfinite(t_scores) & np.isinf(scores)).sum())
+            self.n_classwise_constant_features_ = int(classwise_constant.sum())
+        except Exception:
+            _clear_fitted_attributes(self)
+            raise
         return self
 
     def transform(self, X):
@@ -221,14 +431,17 @@ class BinaryScreening(TransformerMixin, BaseEstimator):
                 f"X has {X.shape[1]} features, but {type(self).__name__} is expecting "
                 f"{self.n_features_in_} features as input."
             )
+        _validate_class_labels(self.classes_)
         return X[:, self.support_]
 
     def get_support(self, indices=False):
         check_is_fitted(self, "support_")
+        _validate_class_labels(self.classes_)
         return self.selected_features_.copy() if indices else self.support_.copy()
 
     def get_feature_names_out(self, input_features=None):
         check_is_fitted(self, "support_")
+        _validate_class_labels(self.classes_)
         if input_features is None:
             input_features = [f"x{i}" for i in range(self.n_features_in_)]
         names = np.asarray(input_features, dtype=object)

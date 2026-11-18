@@ -44,6 +44,37 @@ class BatchedNNLSTests(unittest.TestCase):
         scale = np.maximum(np.max(np.abs(rows @ design), axis=1), np.finfo(float).tiny)
         self.assertTrue((np.max(np.abs(projected), axis=1) / scale < 1e-9).all())
 
+    def test_first_pivot_preserves_per_column_retries_and_single_pivot(self):
+        design = np.eye(3)
+        targets = np.array([[0., 1., 2., 3.],
+                            [0., 1., 2., 0.],
+                            [0., 1., 0., 0.]])
+        rounds = []
+
+        def scripted_solve(gram, cross, passive, factors):
+            # The first entry identifies each target through pending-column selection.
+            rounds.append((cross[0].tolist(), [tuple(np.flatnonzero(col)) for col in passive.T]))
+            # With identity Gram, a negative coefficient keeps each positive
+            # target coordinate in violation whether it is passive or inactive.
+            result = np.where(cross > 0, -1., 0.)
+            finished = cross[0] == 3
+            result[:, finished] = cross[:, finished]
+            return result
+
+        with patch.object(_nnls, "_passive_solve", scripted_solve):
+            _, converged, _ = _nnls._batched_block(design, targets, design, maxiter=5)
+
+        full = [(0, 1, 2), (0, 1)]
+        empty = [(), ()]
+        self.assertEqual(rounds, [
+            ([1, 2, 3], full + [(0,)]),  # First pivot
+            ([1, 2], empty),             # Full-set retry 1
+            ([1, 2], full),              # Full-set retry 2
+            ([1, 2], empty),             # Full-set retry 3
+            ([1, 2], [(2,), (1,)]),      # Highest violating coordinate per column
+        ])
+        np.testing.assert_array_equal(converged, [True, False, False, True])
+
     def test_batched_agrees_across_nonnegative_active_sets_and_shapes(self):
         for seed in range(12):
             rng = np.random.default_rng(seed)

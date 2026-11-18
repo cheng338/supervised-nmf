@@ -139,7 +139,7 @@ def calibration_rank_search(estimator, param_grid, X, y, *, rank_parameter=None,
         max_rank = _positive_integer(max_rank, "max_rank")
     candidates = list(ParameterGrid(param_grid))
     raw_y = y
-    X, y = _check_labeled_data(X, y)
+    X, _, y = _check_labeled_data(X, y)
     _validate_class_labels(raw_y, y)
     # Validate before a custom clone can hide the original implementation.
     implementation_sources(estimator, candidates)

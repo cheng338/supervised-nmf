@@ -4,7 +4,7 @@ import math
 
 from sklearn.metrics import accuracy_score, balanced_accuracy_score
 
-from ._labels import _sklearn_labels, _validate_class_labels
+from ._labels import _label_values, _validate_class_labels
 
 
 _SCORERS = {"accuracy": accuracy_score, "balanced_accuracy": balanced_accuracy_score}
@@ -22,7 +22,7 @@ def _score_predictions(scoring, y_true, y_pred):
     # Public calibration callers already validate y_true before making folds.
     # An external estimator can still return unsupported prediction labels.
     y_pred = _validate_class_labels(y_pred)
-    score = float(_SCORERS[scoring](_sklearn_labels(y_true), _sklearn_labels(y_pred)))
+    score = float(_SCORERS[scoring](_label_values(y_true), _label_values(y_pred)))
     if not math.isfinite(score):
         raise ValueError("Nonfinite calibration score.")
     return score

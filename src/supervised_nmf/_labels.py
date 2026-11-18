@@ -1,6 +1,5 @@
 """Keep class-label validation ahead of lossy string conversions."""
 
-from functools import cache
 from itertools import repeat
 
 import numpy as np
@@ -13,32 +12,22 @@ _TERMINAL_NUL_MESSAGE = (
 )
 
 
-@cache
-def _string_dtype_needs_boxing():
-    # Some NumPy versions reject StringDType in the floating-type query
-    # used by scikit-learn's finite-value checks.
-    try:
-        np.isdtype(np.dtypes.StringDType(), ("real floating", "complex floating"))
-    except TypeError:
-        return True
-    return False
-
-
-def _sklearn_labels(y):
-    if (issubclass(type(y), np.ndarray) and y.dtype.kind == "T"
-            and _string_dtype_needs_boxing()):
+def _label_values(y):
+    # Object strings compare their full contents on NumPy versions whose
+    # StringDType comparisons stop at NUL. They also support sklearn metrics
+    # that attach metadata to the target dtype.
+    if issubclass(type(y), np.ndarray) and y.dtype.kind == "T":
         return np.asarray(y).astype(object)
     return y
 
 
 def _check_labeled_data(X, y, **options):
-    target = _sklearn_labels(y)
+    """Return validated X, working labels, and labels in the input dtype."""
+    target = _label_values(y)
     X, checked = check_X_y(X, target, **options)
-    if target is not y:
-        # Keep the accepted shape and the caller's dtype for fitted classes
-        # and checkpoint identity. Object boxing is only for scikit-learn.
-        checked = np.asarray(y).reshape(checked.shape)
-    return X, checked
+    if target is y:
+        return X, _label_values(checked), checked
+    return X, checked, np.asarray(y).reshape(checked.shape)
 
 
 def _validate_class_label(value):

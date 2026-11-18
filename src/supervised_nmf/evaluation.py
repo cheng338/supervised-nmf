@@ -45,7 +45,7 @@ from .classifier import (NMFClassifier, _capture_projection, _record_warnings, _
                          _knn_probabilities_preserve_labels)
 from ._calibration import _score_fields, _score_predictions, _validate_scoring
 from ._identity import configuration_identity, implementation_sources
-from ._labels import _check_labeled_data, _sklearn_labels, _validate_class_label, _validate_class_labels
+from ._labels import _check_labeled_data, _label_values, _validate_class_label, _validate_class_labels
 from ._search_diagnostics import mark_inactive_refinement, screening_grid_diagnostics
 from .screening import _clear_fitted_attributes
 from .validation import (
@@ -524,7 +524,7 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
     refit = _validate_refit(refit)
     scoring = _validate_scoring(scoring)
     raw_y = y
-    X, y = _check_labeled_data(X, y)
+    X, y, original_y = _check_labeled_data(X, y)
     classes, counts = np.unique(y, return_counts=True)
     _validate_class_labels(raw_y, y, classes=classes)
     groups = validate_metadata(groups, len(y), name="groups")
@@ -534,10 +534,10 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
     candidates = list(ParameterGrid(param_grid))
     if not candidates:
         raise ValueError("At least one parameter candidate is required.")
-    identity = _search_identity(estimator, candidates, X, y, cv, seed, threads, refit=refit,
+    identity = _search_identity(estimator, candidates, X, original_y, cv, seed, threads, refit=refit,
                                 groups=groups, folds=folds, data_ids=data_ids, scoring=scoring)
-    if type(estimator) is not NMFClassifier:
-        y = _sklearn_labels(y)
+    if type(estimator) is NMFClassifier:
+        y = original_y
     # Identity must validate custom cloning before diagnostics clone anything.
     screening_diagnostics = screening_grid_diagnostics(estimator, candidates)
     fingerprint = _digest(identity)
@@ -668,7 +668,7 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
                     break
             if fitted is None:
                 fallback_start = time.perf_counter()
-                fitted = DummyClassifier(strategy="most_frequent").fit(X, _sklearn_labels(y))
+                fitted = DummyClassifier(strategy="most_frequent").fit(X, _label_values(y))
                 seconds = time.perf_counter() - fallback_start
                 report["final_fit_seconds"] += seconds
                 report["final_fit_attempts"].append({"status": "fallback", "seconds": seconds,
@@ -715,6 +715,7 @@ def _evaluation_metadata(y, classes, *, sample_ids, groups, train_sample_ids,
         if train_y.ndim != 1 or not len(train_y):
             raise ValueError("train_y must contain both fitted binary classes in a one-dimensional array.")
         _validate_class_labels(raw_train_y, train_y)
+        train_y = _label_values(train_y)
         if not np.all(np.isin(train_y, classes)) or len(np.unique(train_y)) != 2:
             raise ValueError("train_y must contain both fitted binary classes in a one-dimensional array.")
         train_count = len(train_y)
@@ -969,11 +970,12 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
     """
     threads = _validate_threads(threads)
     raw_y = y
-    X, y = _check_labeled_data(X, y)
+    X, y, original_y = _check_labeled_data(X, y)
     _validate_class_labels(raw_y, y)
     raw_classes = estimator.classes_
     classes = np.asarray(raw_classes)
     _validate_class_labels(raw_classes, classes)
+    classes = _label_values(classes)
     _validate_class_label(getattr(estimator, "positive_label_", None))
     if len(classes) != 2 or not np.all(np.isin(y, classes)):
         raise ValueError("Evaluation labels must belong to the fitted binary classes.")
@@ -1046,18 +1048,15 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
                 margin = np.asarray(margin)
                 if margin.shape != (len(y),) or not np.all(np.isfinite(margin)):
                     raise ValueError("Decision margins must be a finite one-dimensional binary score.")
-            predicted = _validate_class_labels(predicted)
+            predicted = _label_values(_validate_class_labels(predicted))
         except Exception as error:
             return {"status": "failed", "error_type": type(error).__name__, "error": str(error),
                     "prediction_seconds": time.perf_counter() - start,
                     "warnings": _warning_records(caught), "diagnostics": _diagnostics(estimator, projection),
                     "support_diagnostics": support_diagnostics, "training_majority_reference": majority_reference,
-                    "data_sha256": data_fingerprint(X, y)}
+                    "data_sha256": data_fingerprint(X, original_y)}
     elapsed = time.perf_counter() - start
-    metric_y = _sklearn_labels(y)
-    predicted = _sklearn_labels(predicted)
-    classes = _sklearn_labels(classes)
-    precision, recall, f1, support = precision_recall_fscore_support(metric_y, predicted, labels=classes,
+    precision, recall, f1, support = precision_recall_fscore_support(y, predicted, labels=classes,
                                                                      zero_division=0)
     both_classes = len(np.unique(y)) == 2
     auc = ap = None
@@ -1067,12 +1066,12 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
         if both_classes:
             auc = float(roc_auc_score(y == positive, ranking_score))
             ap = float(average_precision_score(y == positive, ranking_score))
-    metrics = {"accuracy": float(accuracy_score(metric_y, predicted)),
-               "balanced_accuracy": float(balanced_accuracy_score(metric_y, predicted)) if both_classes else None,
+    metrics = {"accuracy": float(accuracy_score(y, predicted)),
+               "balanced_accuracy": float(balanced_accuracy_score(y, predicted)) if both_classes else None,
                "roc_auc": auc, "average_precision": ap,
                "precision": float(precision[1]), "recall": float(recall[1]), "f1": float(f1[1]),
                "positive_class": _jsonable(positive),
-               "confusion_matrix": confusion_matrix(metric_y, predicted, labels=classes).tolist(),
+               "confusion_matrix": confusion_matrix(y, predicted, labels=classes).tolist(),
                "confusion_matrix_labels": _jsonable(classes),
                "per_class": [{"label": _jsonable(label), "precision": float(precision[i]),
                               "recall": float(recall[i]), "f1": float(f1[i]), "support": int(support[i])}
@@ -1083,7 +1082,7 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
             "metrics": metrics, "prediction_seconds": elapsed, "prediction_operation": prediction_operation,
             "ranking_score_type": score_type,
             "warnings": _warning_records(caught),
-            "diagnostics": _diagnostics(estimator, projection), "data_sha256": data_fingerprint(X, y),
+            "diagnostics": _diagnostics(estimator, projection), "data_sha256": data_fingerprint(X, original_y),
             "support_diagnostics": support_diagnostics, "training_majority_reference": majority_reference,
             "evaluation_groups": _jsonable(groups),
             "predictions": {"sample_ids": _jsonable(np.arange(len(y)) if sample_ids is None else sample_ids),

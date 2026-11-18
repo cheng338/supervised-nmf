@@ -13,7 +13,7 @@ from sklearn import get_config
 from sklearn.utils.multiclass import check_classification_targets
 from sklearn.utils.validation import check_array, check_is_fitted
 
-from ._labels import _check_labeled_data, _sklearn_labels, _validate_class_labels
+from ._labels import _check_labeled_data, _label_values, _validate_class_labels
 
 
 def _clear_fitted_attributes(estimator):
@@ -32,10 +32,10 @@ def _nonnegative_array(X):
 
 def _binary_data(X, y):
     raw_y = y
-    X, y = _check_labeled_data(X, y, accept_sparse=False, dtype=[np.float64, np.float32])
+    X, y, original_y = _check_labeled_data(X, y, accept_sparse=False, dtype=[np.float64, np.float32])
     if np.any(X < 0):
         raise ValueError("Negative values in data. X must contain nonnegative values.")
-    check_classification_targets(_sklearn_labels(y))
+    check_classification_targets(y)
     classes, counts = np.unique(y, return_counts=True)
     _validate_class_labels(raw_y, y, classes=classes)
     if classes.size != 2:
@@ -45,7 +45,9 @@ def _binary_data(X, y):
         )
     if np.any(counts < 2):
         raise ValueError("At least two training observations per class are required.")
-    return X, y, classes, counts
+    if y is not original_y:
+        classes = classes.astype(original_y.dtype)
+    return X, original_y, classes, counts
 
 
 def _percentile_support(scores, eligible, percentile):
@@ -282,7 +284,7 @@ class BinaryScreening(TransformerMixin, BaseEstimator):
         _clear_fitted_attributes(self)
         self._validate_settings()
         X, y, classes, counts = _binary_data(X, y)
-        return self._fit_statistics(X, y, classes, counts)
+        return self._fit_statistics(X, _label_values(y), classes, counts)
 
     def _validate_settings(self):
         if self.screening not in {"percentile", "absolute"}:

@@ -11,6 +11,9 @@ from numbers import Integral
 import numpy as np
 from sklearn.neighbors import KNeighborsClassifier, KDTree, BallTree
 from sklearn import __version__ as _SKLEARN_VERSION
+
+from ._labels import _label_values
+
 try:
     from sklearn.metrics._dist_metrics import EuclideanDistance64 as _FULL_MEMBERSHIP_EUCLIDEAN
 except ImportError:
@@ -230,7 +233,7 @@ class _KNNQueryReuse:
         return (left._fit_X is right._fit_X
                 and left._fit_method == right._fit_method
                 and left.weights == right.weights
-                and np.array_equal(left.classes_, right.classes_)
+                and np.array_equal(_label_values(left.classes_), _label_values(right.classes_))
                 and np.array_equal(left._y, right._y))
 
     def _query(self, group):

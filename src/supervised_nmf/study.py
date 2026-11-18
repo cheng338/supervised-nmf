@@ -31,7 +31,7 @@ from .classifier import NMFClassifier, _capture_projection
 _STUDY_LABEL_CONVERSION = NMFClassifier._labels_from_probabilities
 from ._calibration import _validate_scoring, _score_predictions, _score_fields
 from ._identity import configuration_identity, implementation_sources
-from ._labels import _check_labeled_data, _sklearn_labels, _validate_class_labels
+from ._labels import _check_labeled_data, _label_values, _validate_class_labels
 from ._neighbors import _KNNQueryReuse
 from ._search_diagnostics import screening_grid_diagnostics, mark_inactive_refinement
 from .screening import BinaryScreening
@@ -681,7 +681,7 @@ def _calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=
         raise ValueError("cv must be an integer >= 2.")
     cv = int(cv)
     raw_y = y
-    X, y = _check_labeled_data(X, y)
+    X, y, original_y = _check_labeled_data(X, y)
     classes, counts = np.unique(y, return_counts=True)
     _validate_class_labels(raw_y, y, classes=classes)
     if len(classes) != 2 or counts.min() < cv:
@@ -726,15 +726,17 @@ def _calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=
             order["fallback_reason"] = "unsupported_configuration"
         else:
             order["resolved"] = "fold"
-    X, y = np.array(X, copy=True), np.array(y, copy=True)
+    X, original_y = np.array(X, copy=True), np.array(original_y, copy=True)
     X.setflags(write=False)
+    original_y.setflags(write=False)
+    y = _label_values(original_y)
     y.setflags(write=False)
     groups = validate_metadata(groups, len(y), name="groups")
     data_ids = validate_metadata(data_ids, len(y), name="data_ids", unique=True)
     folds = build_cv_folds(X, y, cv=cv, seed=seed, groups=groups, folds=folds)
     runtime = _runtime_identity(estimator, threads, candidates, _environment=_reuse_environment)
     identity = _jsonable({"schema_version": 4, "method": "explicit_grid_shared_knn_representation",
-                         "calibration": _search_identity(estimator, candidates, X, y, cv, seed, threads,
+                         "calibration": _search_identity(estimator, candidates, X, original_y, cv, seed, threads,
                                                          refit=False, groups=groups, folds=folds, data_ids=data_ids,
                                                          scoring=scoring, _environment=_reuse_environment),
                          "scoring": scoring,
@@ -744,7 +746,6 @@ def _calibration_knn_grid(estimator, param_grid, X, y, *, cv=5, seed=0, threads=
     if _screening_statistics_recovery == "early":
         identity["screening_statistics_recovery"] = {"requested": "early", "schema": 1}
     fingerprint = _digest(identity)
-    y = _sklearn_labels(y)
     directory = Path(checkpoint_dir)
     directory.mkdir(parents=True, exist_ok=True)
     receipts = []

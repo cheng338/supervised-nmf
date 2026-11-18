@@ -180,7 +180,7 @@ class TerminalNULSearchTests(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(np.dtypes, "StringDType"), "requires NumPy StringDType")
     def test_variable_width_grouped_search_preserves_checkpoint_dtype_at_every_stage(self):
-        labels = np.array(["\0absent", "pré\0sent"] * 12, dtype=object)
+        labels = np.array(["\0absent", "\0présent"] * 12, dtype=object)
         strings = labels.astype(np.dtypes.StringDType())
         digest = data_fingerprint(self.X, strings)
         self.assertNotEqual(digest, data_fingerprint(self.X, labels))
@@ -189,7 +189,9 @@ class TerminalNULSearchTests(unittest.TestCase):
                 directory = self.directory / kind
                 reference = self.call(kind, labels, self.directory / f"{kind}-object", folds=None)
                 actual = self.call(kind, strings, directory, folds=None)
-                self.assertTrue(all(row["valid"] for row in actual["candidates"]))
+                for row in actual["candidates"]:
+                    for fold in row["folds"]:
+                        self.assertEqual(fold["status"], "valid", fold.get("error"))
                 self.assertEqual([row["mean_score"] for row in actual["candidates"]],
                                  [row["mean_score"] for row in reference["candidates"]])
                 self.assertEqual(actual["selected_parameters"], reference["selected_parameters"])

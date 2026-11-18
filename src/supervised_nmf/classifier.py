@@ -20,7 +20,7 @@ from sklearn.utils.metaestimators import available_if
 from sklearn.utils.validation import check_consistent_length, check_is_fitted
 
 from .decomposition import FeatureSPA
-from ._labels import _sklearn_labels, _validate_class_label, _validate_class_labels
+from ._labels import _label_values, _validate_class_label, _validate_class_labels
 from ._mu import transform_mu
 from ._mu_rowwise import transform_mu_rowwise
 from ._projection import validate_projection_parameters
@@ -485,7 +485,7 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
                 if (selector.screening != self.screening or selector.percentile != self.percentile
                         or selector.score_threshold != self.score_threshold
                         or selector.n_samples_seen_ != len(y)
-                        or not np.array_equal(selector.classes_, classes)
+                        or not np.array_equal(_label_values(selector.classes_), _label_values(classes))
                         or not np.array_equal(selector.class_counts_, counts)):
                     raise ValueError("Prepared screening does not match this training fold or estimator.")
                 X_selected = selector.transform(X)
@@ -518,7 +518,7 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
             W, projection_warnings = _record_warnings(lambda: projection_transform(decomposition, X_selected))
         training_projection_seconds = time.perf_counter() - stage
         stage = time.perf_counter()
-        y = _sklearn_labels(y)
+        y = _label_values(y)
         if self.classifier == "knn":
             classifier = KNeighborsClassifier(n_neighbors=self.n_neighbors, weights=self.weights)
             if self.knn_normalization == "sd":
@@ -671,7 +671,7 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
         predicted = self.predict(X)
         check_consistent_length(y, predicted, sample_weight)
         y = _validate_class_labels(y)
-        return accuracy_score(_sklearn_labels(y), _sklearn_labels(predicted), sample_weight=sample_weight)
+        return accuracy_score(_label_values(y), _label_values(predicted), sample_weight=sample_weight)
 
     def _prediction_coordinates(self, X):
         coordinates = self.transform(X)

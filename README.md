@@ -29,38 +29,6 @@ implements Chapter 7 of:
 
 See [CITATION.cff](CITATION.cff) for citation details and
 [source provenance](provenance/README.md) for the original scripts.
-Version **0.3.0** adds a common SPA training/prediction coordinate map,
-optional SD-scaled KNN and linear SVM, and numerical and execution safeguards.
-See the [0.3.0 release notes](docs/release-0.3.0.md) for migration and validation limits.
-Version **0.3.3** adds numerical recovery for MU projection, guarded SPA basis
-fitting, optional QR projection and clearer evaluation reports. Classifier
-choices and defaults are unchanged. See the
-[0.3.3 release notes](docs/release-0.3.3.md) for details and verification scope.
-Version **0.4.0** fixes mixed-dtype prediction, improves qualified float64 MU
-recovery, adds optional rowwise MU projection, and moves prediction diagnostics
-into evaluation results. See the [0.4.0 release notes](docs/release-0.4.0.md)
-for migration details and the comparison with 0.3.3.
-
-Version **0.4.2** fixes evaluation and reporting edge cases, reduces repeated
-numerical work, and adds exact-repeat stopping to experimental ANLS-BPP.
-Public solver defaults are unchanged. See the [0.4.2 release notes](docs/release-0.4.2.md)
-for changes, compatibility details and validation limits.
-
-Version **0.4.3** corrects sample/group identifier handling, preserves NumPy
-extended-precision scalars in reports and checkpoints, and stabilizes
-calibration checkpoint identities when native libraries load lazily. See
-the [0.4.3 release notes](docs/release-0.4.3.md) for compatibility and
-validation scope.
-
-Version **0.5.0** aligns standalone SPA training and query coordinates, ranks
-calibration candidates by ordinary accuracy by default, and uses per-observation
-projection for newly fitted MU classifiers. Standalone screening now defaults
-to the absolute pooled-t cutoff. See the [upgrade guide](docs/release-0.5.0.md)
-for explicit alternatives and the [changelog](CHANGELOG.md) for the release history.
-
-Version **0.5.1** strengthens checkpoint recovery tests and documents the Linux
-startup settings for reusing completed study results in the same process.
-See the [0.5.1 release notes](docs/release-0.5.1.md).
 
 **Copyright (c) 2026 Chang Cheng. All Rights Reserved.** A distribution license
 has not yet been selected. Public availability of this repository does not
@@ -69,8 +37,7 @@ applicable [third-party notices](THIRD_PARTY_NOTICES).
 
 # Installation
 
-Python 3.11 or later is required for version 0.5.1. Python 3.10 support
-ended on October 20, 2026. Dependencies are NumPy, SciPy, scikit-learn
+Python 3.11 or later is required. Dependencies are NumPy, SciPy, scikit-learn
 1.6 or later (below 2.0), threadpoolctl, and joblib 1.3 or later.
 Download the wheel from the [GitHub releases](https://github.com/cheng338/supervised-nmf/releases)
 and install it:
@@ -146,10 +113,10 @@ string labels must not end in a NUL codepoint (`\x00`). See the
 [class-label domain](docs/api.md#class-label-domain) for safe encoding and input
 conversion limits. Probability columns follow `model.classes_`. Screening and factorization are
 fitted on training data. Prediction reuses the fitted feature mask and basis.
-Version 0.4.0 records prediction diagnostics in evaluation results instead of
-updating the fitted model's `last_transform_*` attributes. See
+Evaluation results include prediction diagnostics. See
 [prediction state and diagnostics](docs/api.md#prediction-state-and-diagnostics)
-for migration from version 0.3.3 and concurrency limits.
+for concurrency limits and migration guidance, and
+[model persistence](docs/api.md#model-persistence) for loading a saved model.
 
 This example demonstrates the API with illustrative parameters. SPA selects
 anchors geometrically after screening. Surviving background features with high
@@ -176,8 +143,7 @@ See [input preparation and CV usage conditions](docs/api.md#input-preparation-an
 for subject groups, independent evaluation and custom-component requirements.
 
 The helper can evaluate an explicit grid without a full-training refit or
-final-test prediction. In 0.5.0, it ranks candidates by
-mean ordinary accuracy by default. Every required fold must qualify numerically:
+final-test prediction. By default, it ranks candidates by mean ordinary accuracy. Every required fold must qualify numerically:
 
 ```python
 from supervised_nmf.evaluation import calibration_search
@@ -210,9 +176,7 @@ switch objectives automatically when it detects imbalance. CV scores are the
 equal-weight mean of the fold scores, rather than a pooled out-of-fold score.
 The selected CV score is separate from accuracy measured on reserved data.
 
-**November 3 update:** calibration now defaults to ordinary accuracy; choose
-`scoring="balanced_accuracy"` explicitly when intended. Use a new checkpoint
-after changing the objective or source. Historical study results remain unchanged.
+Use a new checkpoint after changing the scoring objective or source.
 
 Once that training-only review is complete, freeze the chosen configuration,
 fit it on all training data, check numerical qualification, and evaluate it on
@@ -303,9 +267,9 @@ joint-fit training coordinates by default; `training_coordinates="transform"`
 separately requests a common training/query projection policy. See
 [MU prediction policies and measured costs](docs/api.md#prediction-batches).
 
-Since version 0.3.0, the default `training_coordinates="auto"` trains the
-SPA classifier on fixed-basis NNLS coordinates, using the same fitted basis
-and projection map for training and prediction. Version 0.5.0 also makes standalone `FeatureSPA.fit_transform` use that map. For newly
+With the default `training_coordinates="auto"`, the SPA classifier uses
+fixed-basis NNLS coordinates for training and prediction. Standalone
+`FeatureSPA.fit_transform` uses the same map. For newly
 fitted SPA classifiers, all accepted `training_coordinates` settings resolve
 to `"transform"`, including explicit `"fit_transform"`. The classifier projects
 training observations once during `fit`, without duplicating the standalone
@@ -323,7 +287,7 @@ historical results retain their recorded behavior; loading an older fitted
 model does not retrain its classifier or rewrite its coordinate metadata.
 
 SPA uses direct BLAS updates and reuses the fixed NNLS matrix layout during
-projection. Version 0.3.3 also uses guarded batched NNLS to fit the basis
+projection. Guarded batched NNLS fits the basis
 from the selected anchors, with public SciPy fallback. This preserves the
 fixed-anchor objective; see [basis fitting](docs/api.md#spa-basis-fitting)
 for conditioning, numerical-range and iteration-limit behavior.
@@ -388,8 +352,7 @@ next prediction. Standalone SPA has additional
 Both `NMFClassifier()` and standalone `BinaryScreening()` default to absolute
 pooled-t screening with `score_threshold=2.0`. Choose
 `screening="percentile"` explicitly to use `percentile`; changing a selection
-parameter does not switch the mode. The November 3 update changes standalone
-`BinaryScreening` from its previous percentile default.
+parameter does not switch the mode.
 Calibration reports identify the active screening mode and parameter, and warn
 once per calibration grid call when an explicitly gridded, known screening
 parameter is inactive for a candidate. Rank-search stages are separate grid
@@ -413,8 +376,8 @@ corrections preserve the fitted basis and returned dtype; they do not change
 joint factorization. See [MU projection](docs/api.md#fit-diagnostics) for
 numerical limits, warnings and possible additional cost.
 
-Version 0.3.3 also supports a bounded, one-thread AOCL path for reporting
-reconstruction norms, alongside the existing MKL path. It affects diagnostics
+Reconstruction-norm reporting supports a bounded, one-thread AOCL path
+alongside the MKL path. It affects diagnostics
 only, not optimization, stopping, or predictions. See the
 [runtime and array requirements](docs/api.md#reconstruction-diagnostics).
 
@@ -431,51 +394,6 @@ SPA's factor-recovery results require additional separability and noise
 assumptions; classification accuracy does not establish
 those assumptions. See [solver comparisons](docs/nmf-solver-comparison.md),
 [methodology](docs/methodology.md), and [theoretical scope](docs/theory-implementation.md).
-
-# Release changes
-
-Version 0.4.0 supports mixed float32/float64 queries for CD and MU, adds guarded
-float64 MU scaling recovery and the explicit `mu_projection="rowwise"` option,
-and keeps prediction diagnostics separate from fitted estimator state.
-It also adds the standard transformer interface and corrects estimator tags,
-validation messages and historical-study reporting. Existing defaults remain
-unchanged. See the [0.4.0 release notes](docs/release-0.4.0.md).
-
-Version 0.3.3 adds MU projection recovery, guarded batched SPA basis fitting and
-the explicit `projection_solver="qr"` option. Evaluation summaries show class
-balance and distinguish overlapping timing totals. Source tests run under
-pytest. The default remains SPA with absolute screening and unscaled KNN;
-the new projection option does not change factorization or classifier defaults.
-See the [0.3.3 release notes](docs/release-0.3.3.md).
-
-Version 0.3.0 changes SPA classifier training to the common fixed-basis map
-described above, adds optional SD KNN and linear SVM, stabilizes screening for
-large offsets, and guards extreme-range NNLS and factor-recovery calculations.
-Compatible KNN grids reuse neighbor queries; a narrowly guarded one-thread MKL
-path accelerates report-only reconstruction norms. These changes do not imply
-a uniform speed or memory improvement. Controlled memory probes found peaks
-about 27–72% higher in particular screening and projection cases, relative to
-the earliest recoverable source. See the [release notes](docs/release-0.3.0.md)
-for the measured scope, mixed timing results and unresolved tuning boundaries.
-
-Version 0.1.0a2 added subject-aware training folds, bounded rank exploration,
-reused fold-local screening statistics, and evaluation summaries with class
-support and numerical-stage diagnostics. Solver, screening, and rank defaults
-were unchanged in that release. Version 0.2.0 additionally provided guarded
-batched projection and saved decision thresholds. In that release, older
-serialized models retained their SciPy projection path. Current loading no longer
-fills missing legacy fields; see the [model-persistence contract](docs/api.md#model-persistence).
-See the [0.2.0 release record](docs/release-0.2.0.md),
-[tuning improvements](docs/tuning-improvements.md), and the [API guide](docs/api.md).
-
-From the source checkout or unpacked source archive, run
-`python examples/grouped_tuning.py --output runs/grouped-example` for a
-small subject-separated example. Search budgets and failed upper-rank
-candidates remain explicit; a completed grid does not establish a global
-optimum or complete statistical validation.
-Calibration, final fitting and evaluation each use one native numerical thread.
-The final-fit context restores the caller's previous thread limits on return or
-error.
 
 # Parameter tuning
 
@@ -533,6 +451,15 @@ precision and records them separately from probabilities. The completed
 integration checks do not establish a universal accuracy advantage.
 
 # Examples and diagnostics
+
+From the source checkout or unpacked source archive, run
+`python examples/grouped_tuning.py --output runs/grouped-example` for a
+small subject-separated example. Search budgets and failed upper-rank
+candidates remain explicit; a completed grid does not establish a global
+optimum or complete statistical validation.
+Calibration, final fitting and evaluation each use one native numerical thread.
+The final-fit context restores the caller's previous thread limits on return or
+error.
 
 Run the example scripts from the source checkout or source archive:
 
@@ -740,3 +667,7 @@ The build produces `dist/supervised_nmf-0.5.1-py3-none-any.whl` and a source
 archive. The wheel check verifies
 imports, authorship metadata, SPA/MU/CD fitting and prediction, and archive
 contents. It does not publish a release.
+
+# Release changes
+
+See the [changelog](CHANGELOG.md) for changes in each release.

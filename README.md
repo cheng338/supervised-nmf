@@ -17,7 +17,7 @@ Cheng’s original research scripts accompanying his dissertation.
 - **Baseline comparisons** evaluate screened PCA, screening alone, raw features
   and unscreened coordinate-descent NMF with the selected classifier.
 
-Cheng describes the supervised NMF method in Chapter 7 of his dissertation.
+The supervised NMF method is described in Chapter 7 of:
 
 > Cheng, Chang (2026). *Ensemble Kernel Distance-Weighted Discrimination and
 > Supervised Nonnegative Matrix Factorization for Classification*. Doctoral

@@ -15,4 +15,17 @@ abstract: >-
   dissertation, Ensemble Kernel Distance-Weighted Discrimination and Supervised
   Nonnegative Matrix Factorization for Classification, from the original
   simulation and CelebA experiment scripts.
+references:
+  - type: thesis
+    thesis-type: Doctoral dissertation
+    authors:
+      - family-names: Cheng
+        given-names: Chang
+    title: >-
+      Ensemble Kernel Distance-Weighted Discrimination and Supervised
+      Nonnegative Matrix Factorization for Classification
+    year: 2026
+    institution:
+      name: Purdue University Graduate School
+    doi: 10.25394/PGS.34548831.v1
 

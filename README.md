@@ -21,7 +21,8 @@ The supervised NMF method is described in Chapter 7 of:
 
 > Cheng, Chang (2026). *Ensemble Kernel Distance-Weighted Discrimination and
 > Supervised Nonnegative Matrix Factorization for Classification*. Doctoral
-> dissertation manuscript, Purdue University, Department of Statistics.
+> dissertation, Purdue University Graduate School.
+> [DOI 10.25394/PGS.34548831.v1](https://doi.org/10.25394/PGS.34548831.v1)
 
 See [CITATION.cff](CITATION.cff) for the software citation and
 [source provenance](provenance/README.md) for the original scripts.

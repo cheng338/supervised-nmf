@@ -24,8 +24,10 @@ the default. CD, MU, logistic regression and linear SVM remain available.
   To use the same projection policy for training coordinates, explicitly set
   `training_coordinates="transform"`.
 
-See [MU prediction policies](api.md#prediction-batches) for numerical limits and
-selection guidance. Old serialized models retain the batch policy when loaded.
+Version 0.4.0 retained the batch policy when loading older serialized models.
+For 0.5.0, use the originating package and dependency versions to load a saved
+model, or refit from its training data after upgrading.
+[Model persistence](api.md#model-persistence) and [MU prediction policies](api.md#prediction-batches)
 
 ## Prediction diagnostics and migration
 
@@ -90,16 +92,20 @@ These checks reuse development cohorts and do not constitute a new held-out
 study. Python 3.11 or later is required. Chang Cheng's original work remains
 All Rights Reserved, with the separate third-party notices preserved.
 
-The separate [October 29 current-package comparison](current-package-evidence-20261029.md)
-qualified 34 final evaluations with the AOCL-specific workaround. Its primary
+The separate October 29 CelebA comparison qualified 34 final evaluations with
+the AOCL-specific workaround. Its primary
 Smiling SPA-minus-PCA balanced-accuracy difference was +1.24 percentage points
 (95% interval −1.00 to +3.47), with mixed outcomes on the secondary task and poor
-untuned-constructor results. Calibration preserved completed pre-fix evidence;
-all final fits used current source. The scientific comparison is available,
-while one historical controller observation remains incomplete. This dated
-evidence does not reattribute the earlier test counts to the later workaround,
-provide fresh independent confirmation, or change defaults. **Release remains
-paused.**
+untuned-constructor results. Calibration reused completed pre-fix work and all
+final fits used the frozen post-fix source. The cohort had been evaluated
+previously. All scientific outcomes were available, although one controller
+interruption lacked a recorded duration and final process observations.
+[October 29 comparison](current-package-evidence-20261029.md)
+
+The release pause recorded during that study ended on October 29, 2026.
+Version 0.4.1 shipped the workaround and retained the existing defaults. The
+0.4.0 verification counts above describe the earlier source.
+[0.4.1 release notes](release-0.4.1.md)
 
 ```shell
 python -m pip install --upgrade supervised_nmf-0.4.0-py3-none-any.whl

@@ -7,7 +7,10 @@ No dataset, dissertation PDF, or committee review is bundled with the package.
 
 Do not run these snapshots as package examples: they preserve the historical
 behavior, including warning suppression, infeasible grid combinations, and
-fixed output filenames. New implementation and audit tools live under `src/`
+fixed output filenames. The `--dir` default in `original/snmf_am.py` points to
+the original workstation's CelebA image directory. The [public CelebA example](../examples/celeba_classification.py)
+requires an explicit image directory, attributes file and partitions file.
+New implementation and audit tools live under `src/`
 and `examples/`. Their existence does not establish reproduction of any published
 numerical result. The historical software environment and complete run records
 were not available at initial development.

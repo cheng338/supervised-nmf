@@ -94,7 +94,7 @@ took 0.284 seconds for total fit, including 0.034 seconds for decomposition, and
 selected ranks and masks prevent interpreting these as an isolated solver
 speed comparison. All methods' stage times are in the local report.
 
-The host has 39.23 GiB total physical RAM, shared with other applications.
+The October 3 host had 39.23 GiB total physical RAM, shared with other applications.
 Sampled worker memory records are retained; a whole-process-tree peak was not
 measured.
 
@@ -117,10 +117,13 @@ saved before inspection of the full validation tables. The final version retaine
 the same parameter grids and clarified attempt budgets; both hashes are recorded.
 Follow-up grids were fixed independently of the reported validation outcomes.
 
-The repeated paired default comparison has since completed. Uncertainty analysis,
-the identity-overlap audit and final-test evaluation remain open. The official
-test partition was not loaded by this initial study. Original numerical failures
-are preserved; no fallback result is presented as a successful factorization.
+This initial study used one training sample and did not load the official test
+partition. The later [repeated default study](celeba-default-results.md)
+completed its development comparison. Its own final-test phase remains unfinished.
+Separate studies estimated [training-resample uncertainty](wang-real-data-validation.md#completed-independently-retuned-results),
+audited [identity overlap](celeba-identity-validation.md), and evaluated an
+[official test partition](validation.md#october-12-official-partition-evaluation).
+The original numerical failures remain recorded as failures.
 
 The ignored local run directory is
 `runs/celeba-parameter-study-20261003T091802Z-68d2aa40/`. It contains:

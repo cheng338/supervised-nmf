@@ -1,5 +1,5 @@
-# Matches the package's tested primary Python 3.12 numerical package versions.
-# Linux wheels use their own BLAS builds; these are not the Windows AOCL binaries.
+# Numerical package versions recorded for the October 2026 Python 3.12 studies.
+# Linux wheels use their own BLAS builds. See docs/compatibility.md for runtime details.
 numpy==2.5.2
 scipy==1.18.0
 scikit-learn==1.9.0

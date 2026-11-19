@@ -6,7 +6,41 @@ build-backend = "setuptools.build_meta"
 name = "supervised-nmf"
 version = "0.5.0"
 description = "Supervised nonnegative matrix factorization for binary classification"
-readme = "README.md"
+readme = {text = """
+Supervised NMF for binary classification combines training-only feature
+screening with a nonnegative representation and a KNN, logistic regression,
+or linear SVM classifier. The scikit-learn-style API supports fitting,
+prediction, and calibration within training folds.
+
+Install the downloaded wheel with Python 3.11 or later:
+
+```sh
+python -m pip install ./supervised_nmf-0.5.0-py3-none-any.whl
+```
+
+For finite, nonnegative feature matrices and two training classes:
+
+```python
+from supervised_nmf import NMFClassifier
+
+model = NMFClassifier().fit(X_train, y_train)
+predictions = model.predict(X_test)
+```
+
+Tune screening, rank and classifier settings within training folds before
+evaluating the fitted procedure on held-out observations. The constructor
+defaults are starting values.
+
+The [0.5.0 README](https://github.com/cheng338/supervised-nmf/blob/v0.5.0/README.md)
+and [API guide](https://github.com/cheng338/supervised-nmf/blob/v0.5.0/docs/api.md)
+give worked examples and tuning guidance. The matching source archive includes
+both documents for offline use. Other versions are available on the
+[releases page](https://github.com/cheng338/supervised-nmf/releases).
+
+Chang Cheng developed the method in Chapter 7 of his Purdue dissertation.
+His original work is All Rights Reserved. See the bundled LICENSE and
+THIRD_PARTY_NOTICES for the applicable terms.
+""", content-type = "text/markdown"}
 license = "LicenseRef-All-Rights-Reserved AND BSD-3-Clause"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES"]
 requires-python = ">=3.11"

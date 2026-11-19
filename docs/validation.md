@@ -5,6 +5,8 @@ Author: Chang Cheng.
 Historical study results and subsequent implementation checks are distinguished
 below. The projected-coordinate evidence summary was added on October 28, 2026
 from existing records; no study was rerun for that summary.
+Paths under `runs/`, `output/` and `tmp/` identify records retained in the
+original study workspace. The linked reports give the public results.
 
 The October 3–6 SPA classification studies below used anchor-derived training
 coordinates (`training_coordinates="fit_transform"`) and fixed-basis NNLS for
@@ -172,29 +174,29 @@ from the package distributions:
 
 ## October 29 current-package comparison
 
-The [current-package CelebA comparison](current-package-evidence-20261029.md)
+The [October 29 CelebA comparison](current-package-evidence-20261029.md)
 qualified all **34 prespecified final evaluations** across AOCL and MKL. On
-Smiling, tuned current SPA reached **81.35% balanced accuracy**, versus **80.10%**
+Smiling, tuned SPA reached **81.35% balanced accuracy**, versus **80.10%**
 for independently tuned screened PCA: **+1.24 percentage points**, with a paired
 95% interval of **−1.00 to +3.47**. The interval includes zero. On Wearing_Necktie,
 SPA reached **62.98%** versus PCA's **65.44%**; positive recalls were **31.58%**
 and **35.53%**. The literal constructor reached **54.41%** Smiling balanced
 accuracy and **50.44%** on Necktie, detecting only **1/76** Necktie positives.
 
-Only crashed calibration work was continued after the AOCL workaround. Seven
-completed selections and the completed Smiling/SPA stages and fold cells retain
-their original source identities; calibration therefore mixes pre-fix and
-post-fix evidence. Every final fit used frozen current source. All 17 arms had
-identical predicted labels across AOCL and MKL, although some internal arrays
-differed. This is retrospective evidence on archived features and an already
-exposed cohort, not fresh confirmation or entirely current-source calibration.
+After the AOCL workaround, the study resumed the interrupted Smiling/SPA
+calibration. It retained seven completed selections and the completed stages
+and fold cells for Smiling/SPA. Calibration therefore mixes pre-fix and
+post-fix evidence. Every final fit used the frozen October 29 post-fix source.
+All 17 arms had identical predicted labels across AOCL and MKL, although some
+internal arrays differed. The archived features and previously exposed cohort
+limit the study to a retrospective comparison.
 
-The scoped finding-4c scientific comparison is available regardless of whether
-SPA wins. Four historical native failures remain recorded, and one earlier
-Smiling/PCA controller interruption still has an unknown duration and missing
-final process observations. The report consequently distinguishes complete
-scientific outcomes from an incomplete execution history. Release remains
-paused; no default or general methodological claim is changed.
+Four historical native failures remain recorded. One earlier Smiling/PCA
+controller interruption still lacks its duration and final process observations.
+The study reports all scientific outcomes with that gap in its execution history.
+Release work was paused when the comparison was recorded. Version 0.4.1
+subsequently shipped the workaround on October 29 with the existing defaults.
+[0.4.1 release notes](release-0.4.1.md)
 
 ## October 6 implementation checks
 
@@ -291,11 +293,12 @@ paused; no default or general methodological claim is changed.
   checks verified the author metadata, Python requirement, original-source
   hashes, compatibility pins, documentation links and exclusion of local data.
 - After the public MU addition, `python scripts/check.py` passed **269 tests in
-  58.743 seconds**. The log is `tmp/mu-public-full-check.log`. The wheel and source
+  58.743 seconds**. The wheel and source
   archive built successfully. An isolated wheel check verified SPA, CD and MU
   fit/predict, constructor defaults, explicit overrides, author metadata and
-  archive contents; see `tmp/mu-public-wheel-check.log` and
-  `tmp/mu-public-build.log`.
+  archive contents. The study workspace retains the full-suite, wheel and
+  build logs as `tmp/mu-public-full-check.log`, `tmp/mu-public-wheel-check.log`
+  and `tmp/mu-public-build.log`.
 - A preceding full `python scripts/check.py` run passed **179 tests in 53.660
   seconds**. The log is `tmp/four-solver-full-check-final.log`. A subsequent
   matched-baseline reporting test brought the permanent test count to **180**;
@@ -505,7 +508,9 @@ The preliminary decode audit sampled filenames before partitions were available;
 it performed no fitting or evaluation. Detailed integrity reports and local
 paths are saved under ignored `runs/celeba-data-audit/` and
 `data/celeba-metadata/source.json`. Dataset files remain outside distribution
-archives. Identity annotations were not supplied; the identity audit remains open.
+archives. The original study lacked identity annotations. The later Smiling
+study verified identity separation for its own cohort.
+[Identity-disjoint validation](celeba-identity-validation.md)
 
 For each attribute, the real-data smoke uses seed 42, a uniform sample of 500
 official training images and 200 official validation images, 64 by 64 grayscale,
@@ -664,19 +669,23 @@ Nested component timings must not be added to total fit/prediction. Peak memory
 for the full process tree was not measured.
 
 All methods shared the same 4,000 validation images and overlapping training
-allocations. These are descriptive development comparisons, not independent
-datasets or proof of predictive equivalence. The theoretical review distinguishes
-solver-neutral conditional representation bounds from the stronger assumptions
-needed for screening retention, anchor recovery and sample-split KNN rates.
+allocations. The resulting descriptive comparisons cannot establish predictive
+equivalence. The October 1 dissertation draft treated KNN under a separate
+sample split. In the final dissertation, Theorem 7.4.4 allows uniform KNN and
+the representation to reuse training observations under stated conditions,
+including a common fitted map. The bound concerns ordinary classification
+risk. Screening retention and anchor recovery require additional assumptions.
+[Final theory and implementation](theory-implementation.md#what-training-sample-reuse-means)
 
 The original final-test attempt was stopped after eight development revalidations
 and after test loading began. The chronology audit recorded no persisted test
 cache, test prediction attempts, evaluations or comparison. Partial in-memory
 decoding is unknown. The original attempt remains preserved, and no test outcomes
-were inspected or used for the amendment. No new final-test run has started;
-final evaluation requires a completed evidence audit and a new protocol freeze.
-See [the results](celeba-default-results.md) and
-[theory/implementation limits](theory-implementation.md).
+were inspected or used for the amendment. The original CelebA default-selection
+protocol still requires an evidence audit and a new freeze before its final-test
+phase. A separate October 12 study evaluated projected SPA on an official test
+partition. [Original default study](celeba-default-results.md) and
+[October 12 results](#october-12-official-partition-evaluation)
 
 ## Four-solver repair and completion
 
@@ -686,8 +695,9 @@ The [numerical-repair record](numerical-repair-20261004.md) documents the retain
 original run, captured failing matrices, direct-DGELSD workaround, unchanged
 NMF objective/tolerances, and versioned checkpoint recovery. All 17 numerical
 tests and 12 recovery tests passed. The complete suite at that revision, including the
-existing portable-workflow tests, passed **266 tests in 61.417 seconds**;
-see `tmp/four-solver-repair-full-check.log`. The repaired path also passed the
+existing portable-workflow tests, passed **266 tests in 61.417 seconds**.
+The study workspace retains the log as `tmp/four-solver-repair-full-check.log`.
+The repaired path also passed the
 captured matrices and a two-sweep training-only integration with 5,035 direct
 least-squares calls and zero inner failures. That deliberately short integration
 is not a production-convergence claim. Crash dialogs are disabled only for test
@@ -748,8 +758,8 @@ Final source v4 narrows this branch to recognized MKL pools at one thread.
 Its three focused routing/arithmetic tests passed, along with actual 1/20-thread
 routing checks and paired diagnostic/common-map fits against v3. All other
 package source files were verified unchanged. AOCL/BLIS, OpenBLAS and mixed or
-unknown backends retain the existing path. The source changes remain unreleased;
-version 0.2.0 artifacts do not include them. Decisions, measured costs and
+unknown backends retain the existing path. These source changes postdated
+the 0.2.0 artifacts and were unreleased at the time of the tests. Decisions, measured costs and
 preserved receipts are recorded in the locally retained implementation report,
 `output/implementation-20261020/IMPLEMENTATION-REPORT.md`, which is not bundled
 with the public source.
@@ -768,12 +778,13 @@ the release scope and additional validation evidence.
 - Exact historical-environment reproduction remains unavailable; the completed
   original-size controlled reconstruction identifies an insufficient iteration
   cap as a sufficient cause of below-chance behavior in that reconstruction.
-- Broader independent real-data replication beyond the completed 900-draw
-  simulation study, conditional CelebA resamples and identity-disjoint Smiling
-  test. The latter completes an identity audit and frozen final-test comparison
-  for that task; other datasets, retraining uncertainty and population scope
-  remain open. Independently tuned PCA/screening-only and logistic development
-  comparisons are complete within the reported finite grids.
+- Uncertainty from retraining and recalibrating on independent real-world
+  cohorts remains open. The 900-draw simulation study, conditional CelebA
+  resamples and identity-disjoint Smiling test each cover their declared designs. The
+  five-dataset extension used one reserved split per dataset. Independently
+  tuned PCA, screening-only and logistic development comparisons are complete
+  within their reported finite grids. [Five-dataset results](multi-dataset-results.md)
+  and [matched CelebA results](wang-real-data-validation.md)
 - Full-study memory and broad scaling measurements. The completed BLAS benchmark
   includes native process peak-memory measurements; study figures and tables
   appear in the [Wang validation report](wang-validation-report.md).
@@ -791,9 +802,10 @@ claim an old runtime, or rewrite saved experiment records.
 
 The original research checkout also contains tests marked `archived_qualification`.
 Those checks require the frozen study sources and runtime and are skipped by default.
-For example, the following command runs in the original three-label study checkout.
+The following command requires the original three-label study checkout, which
+contains the archived test module.
 
-```shell
+```text
 python -X faulthandler -m pytest --run-archived-qualification tests/test_three_label_compute.py
 ```
 

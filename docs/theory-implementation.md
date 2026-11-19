@@ -2,12 +2,12 @@
 
 Author: Chang Cheng.
 
-Reviewed against the final dissertation on November 3, 2026. The source is
-Chang Cheng's supplied final PDF,
-`Chang-Cheng-dissertation-table-notes-corrected-2026-10-16.pdf`, Chapter 7,
-Section 7.4, and its matching `FinalDeposit/chapter-07.tex`. Page numbers below
-are the printed PDF pages. Source hashes and the documentation review are saved
-in `output/theory-documentation-20261103`.
+The theorem numbers and printed page references below follow Chapter 7,
+Section 7.4 of Chang Cheng's *Ensemble Kernel Distance-Weighted Discrimination
+and Supervised Nonnegative Matrix Factorization for Classification* (Purdue
+University, 2026). The November 3 review used the October 16 final PDF and
+matching chapter source. Their hashes and the review record are retained
+in the original study workspace. [Citation metadata](../CITATION.cff)
 
 **The final theory explicitly permits training-sample reuse.** The same
 training observations may select features, fit a representation and train KNN,
@@ -30,11 +30,14 @@ decomposition and coefficient-stability statements do not select a solver.
 The exactly separable consistency result specifies SPA/NNLS and a more
 restricted procedure.
 
-The completed [four-solver comparison](nmf-solver-comparison.md#development-results)
-selects SPA under its declared accuracy/time rule with absolute screening fixed;
-its status remains `selected_for_audit`. This is empirical support for the package
-default. It does not establish separability or supply a theoretical preference for
-SPA. Official test evaluation remains outstanding.
+The four-solver development comparison selected SPA under its accuracy/time rule
+with absolute screening fixed. Its recorded status is `selected_for_audit`.
+This empirical selection leaves separability unverified. [Four-solver results](nmf-solver-comparison.md#development-results)
+
+The official-test phase of the original CelebA default-selection protocol remains
+unfinished. A separate October 12 study evaluated projected SPA coordinates
+on an official test partition. [Original protocol status](celeba-default-results.md)
+and [October 12 results](validation.md#october-12-official-partition-evaluation)
 
 | Result | What it establishes | Application to the package |
 | --- | --- | --- |
@@ -316,8 +319,12 @@ and numerical conditions still need to be established in a particular use.
 For the rowwise MU policy at both stages, use `solver="mu"` with
 `training_coordinates="transform"`; `mu_projection="auto"` resolves to rowwise,
 or it can be requested explicitly. The default training-coordinate policy still
-uses joint-fit coefficients for MU/CD. Older fitted SPA models
-may retain their historical anchor-coordinate policy.
+uses joint-fit coefficients for MU/CD. The 0.2.0 SPA classifier defaulted to
+anchor-derived training coordinates. Version 0.3.0 changed the classifier
+default to projected coordinates. Standalone SPA and the classifier's explicit
+`training_coordinates="fit_transform"` option retained anchor-derived training
+coordinates until 0.5.0. Use the originating package and dependency versions
+to load those fitted models. [Model persistence](api.md#model-persistence)
 
 Current calibration defaults to ordinary accuracy, with balanced accuracy an
 explicit option. Theorem 7.4.4 allows arbitrary training-based selection, so
@@ -398,11 +405,16 @@ representation without attributing SPA recovery guarantees to another solver.
 CD and SPA have both
 been compared, together with MU and ANLS-BPP. R7's screened-PCA and
 screening-only comparisons remain separate evidence about NMF's contribution.
-Optional raw-feature logistic regression supplies a parametric baseline for R7,
-and logistic regression on NMF coordinates permits the comparison requested in
-R14. Implementation alone does not settle these comments: matched predictive
-and timing results, and a separate theoretical assessment of the classifier
-error term, are still needed.
+The October 6 CelebA study compared KNN with L2-logistic regression on raw
+features and fitted representations, including screened SPA. In that study
+SPA used anchor-derived training coordinates and NNLS projections for
+validation. The study recorded training and prediction costs. Over ten
+independently retuned training samples,
+screened SPA with logistic regression improved mean balanced accuracy over
+screened SPA with KNN on both attributes. Screening-only logistic regression
+scored higher still. These are comparisons of the complete tuned procedures.
+A classifier-specific bound for the logistic error term remains open.
+[Matched CelebA results](wang-real-data-validation.md#completed-independently-retuned-results)
 
 Absolute screening is therefore preferred for methodological/theoretical alignment
 when accuracy is close. General bounds can assess different solvers under

@@ -163,7 +163,7 @@ Necktie, the SPA-minus-PCA KNN difference is 0.92 points (-0.25 to 2.09), leavin
 its direction uncertain. Screened SPA logistic falls below screened PCA logistic
 by 1.46 points on Smiling (-1.75 to -1.18) and 2.13 points on Wearing Necktie
 (-3.69 to -0.57). Switching the screened SPA path from KNN to logistic raises BA
-by 3.39 points on Smiling (2.95 to 3.84) and 15.22 points on Wearing Necktie
+by 3.39 points on Smiling (2.95 to 3.84) and 15.21 points on Wearing Necktie
 (13.40 to 17.03), including the path's scaling and class-weight choices.
 
 These intervals measure Monte Carlo uncertainty in the mean paired difference

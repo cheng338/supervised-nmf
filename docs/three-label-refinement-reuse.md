@@ -1,11 +1,11 @@
 # Three-label refinement reuse contract
 
-The original study workspace retains the refinement bridge
-(`scripts/three_label/refinement.py`). It reuses
-recorded artifacts for the explicitly approved local-refinement amendment.
-It retains the study's exact data, fold, configuration, source and runtime
-checks. This contract does not qualify a historical run for a different
-environment or change its recorded search policy.
+The original study workspace holds the private refinement bridge
+(`scripts/three_label/refinement.py`) and three-label reporter described here.
+The bridge reuses recorded artifacts for the study's local-refinement amendment
+under its original search policy and exact data, fold, configuration, source
+and runtime checks. For subject-separated tuning, final fitting and held-out
+evaluation in the public source, see the [grouped example](../examples/grouped_tuning.py).
 
 ## Immutable original evidence
 
@@ -36,7 +36,7 @@ unchanged and use a separate output directory for changed computations.
 
 ## Declared reporting scope
 
-The current three-label reporter validates the declarations it consumes before
+The study's private reporter validates the declarations it consumes before
 writing report outputs. An explicit `planned_records` schedule determines the
 report's procedure scope, labels and planned repeat counts, including a smaller
 amended schedule than the original design. It does not infer a smaller plan

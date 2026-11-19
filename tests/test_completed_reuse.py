@@ -5,10 +5,13 @@ from contextvars import Context, ContextVar, copy_context
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import threading
 import warnings
+from xml.etree import ElementTree
 
 CONTEXT_SENTINEL = ContextVar("snmf_reuse_test_context", default="empty")
 
@@ -130,6 +133,26 @@ def test_actual_completed_science_guards_and_no_worker_setter(tmp_path, monkeypa
     assert participants[0] in guard_calls
     assert np.geterr() == state and sklearn.get_config() == config
     inactive_threads()
+
+
+def test_completed_reuse_two_thread_startup(tmp_path):
+    env = os.environ.copy()
+    for key in ("OMP_NUM_THREADS", "OMP_THREAD_LIMIT", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                "BLIS_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        env[key] = "2"
+    env.update(OMP_DYNAMIC="FALSE", MKL_DYNAMIC="FALSE")
+    env.pop("PYTEST_ADDOPTS", None)
+    report = tmp_path / "two-thread.xml"
+    name = "test_admission_matches_fresh_participant"
+    node = f"tests/_completed_reuse_width_control.py::{name}"
+    child = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--junitxml", str(report), node],
+        cwd=SOURCE, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120,
+    )
+    assert child.returncode == 0, child.stdout
+    # A skipped child also exits successfully. Require this specific case to have run.
+    cases = ElementTree.parse(report).findall(".//testcase")
+    assert len(cases) == 1 and cases[0].get("name") == name and cases[0].find("skipped") is None, child.stdout
 
 
 def test_provider_preserves_exact_search_and_runtime_identities(completed):
@@ -263,7 +286,7 @@ def test_warning_grid_uses_unmodified_authoritative_warning_path(tmp_path, monke
 
 @pytest.mark.parametrize("issue", ["missing_fold", "nonfinite_score", "tiny_score", "corrupt", "incompatible", "ownership"])
 def test_real_checkpoint_failures_preserve_authority(monkeypatch, completed, issue):
-    directories, _, describe, invoke, _, _ = completed
+    directories, _, describe, reuse_checkpoint, _, _ = completed
     target = sorted((directories[1] / "folds").glob("*.json"))[0]
     if issue == "missing_fold":
         target.unlink()
@@ -281,6 +304,10 @@ def test_real_checkpoint_failures_preserve_authority(monkeypatch, completed, iss
         study._write_receipt(target, record)
     before = [committed(d) for d in directories]
     monkeypatch.setattr(study, "_run_representation_fold", lambda *a, **k: pytest.fail("new fit"))
+    visited = []
+    def invoke(i, environment):
+        visited.append(i)
+        return reuse_checkpoint(i, environment)
     if issue == "ownership":
         with study._checkpoint_lock(directories[1]), pytest.raises(RuntimeError, match="Another process"):
             reuse._try_completed([0, 1], 1, describe=describe, invoke=invoke)
@@ -292,6 +319,7 @@ def test_real_checkpoint_failures_preserve_authority(monkeypatch, completed, iss
             warnings.simplefilter("error")
             assert reuse._try_completed([0, 1], 1, describe=describe, invoke=invoke) is None
             assert not caught
+    assert visited == ([] if issue == "missing_fold" else [0, 1])
     assert [committed(d) for d in directories] == before
     inactive_threads()
 

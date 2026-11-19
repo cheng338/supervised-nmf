@@ -4,17 +4,20 @@ Author: Chang Cheng.
 
 All **34 prespecified final evaluations qualified**: 17 task/configuration arms
 fitted separately in AOCL and MKL. The primary Smiling comparison gave tuned
-current SPA **81.35% balanced accuracy**, versus **80.10%** for independently
+SPA **81.35% balanced accuracy**, versus **80.10%** for independently
 tuned screened PCA. The difference was **+1.24 percentage points**, with a paired
 95% interval of **−1.00 to +3.47 points**. This interval includes zero and does
 not establish superiority or equivalence.
 
-These results address review finding 4c's scoped gap in current-package
-classification evidence. A favorable result was not a completion criterion.
-The scientific outcomes are complete; the execution history retains an unknown
-duration and missing final controller observations for an earlier Smiling/PCA
-interruption. Accordingly, the report records `scientific_results_complete=true`
-and `complete=false`. Release remains paused, and no package default is changed.
+The study asked how screened SPA with projected training coordinates compared
+with independently tuned screened PCA on a previously evaluated CelebA cohort,
+using the package source frozen on October 29, 2026. All prespecified outcomes
+were reported regardless of which method scored higher. An earlier Smiling/PCA
+interruption left its duration and final controller observations unknown, so
+the report records `scientific_results_complete=true` and `complete=false`.
+Release work was paused at the time of the report. Version 0.4.1 subsequently
+shipped the AOCL workaround that day and retained the existing defaults.
+[0.4.1 release notes](release-0.4.1.md)
 
 ## Data and scope
 
@@ -27,10 +30,10 @@ components. The two retained training rows sharing a component stayed together
 in cross-validation.
 
 Both partitions use the exact archived 64×64 grayscale float32/255 features
-produced with Pillow 11.1. Current Pillow 13 decoding did not reproduce those
-features; that unsuccessful check is preserved separately. This comparison
-qualifies current estimation on the archived features, not the Pillow 13 image
-preprocessing path.
+produced with Pillow 11.1. A decoding check with Pillow 13 produced different
+features. The study retained that check separately and evaluated the October 29
+estimators on the archived features. The Pillow 13 preprocessing path therefore
+falls outside this comparison.
 
 Smiling was the primary task; Wearing_Necktie was a prespecified secondary task
 for imbalance. Query class counts were 490/510 and 924/76, respectively, in
@@ -49,17 +52,16 @@ All eight selections qualified within this finite search; this does not establis
 global optimality over every possible interaction or configuration.
 
 The original study completed seven selections before native AOCL failures
-interrupted Smiling/SPA. Following the instruction to rerun only crashed work,
-the continuation preserved those seven selections, Smiling/SPA stages 0000–0007,
-and all **97 completed representation/fold cells** in stage 0008. It computed
+interrupted Smiling/SPA. Recovery preserved those seven selections, Smiling/SPA
+stages 0000–0007 and all **97 completed representation/fold cells** in stage 0008. It computed
 the **133 missing cells** and subsequent required stages with the
 [package-side AOCL workaround](aocl-nnls-workaround.md). Original receipt bytes,
 identities and source attribution remain unchanged. No AOCL library was modified.
 
-Thus calibration combines pre-fix evidence with post-fix recovery. It is not an
-entirely current-source calibration, and a full retuning with the new source is
-not proved to select the same parameters. **Every final fit and prediction used
-the frozen current package**, including the AOCL-specific NNLS workaround.
+Calibration therefore combines pre-fix evidence with post-fix recovery. A full
+search with the repaired source could select different parameters. **Every final
+fit and prediction used the frozen October 29 source**, including the AOCL-specific
+NNLS workaround.
 Final configurations and their selection origins were frozen and independently
 audited before new query evaluation. MKL refitted the identical frozen settings;
 it supplied a portability check, not another independent statistical replicate.
@@ -122,8 +124,8 @@ descriptive and are not multiplicity-adjusted confirmations.
 
 ## Fixed historical configurations
 
-The prespecified Smiling bridge refitted historical settings with current source
-on the cleaned 1,999-row training cohort. It is not an exact reproduction of the
+The prespecified Smiling bridge refitted historical settings with the October 29
+source on the cleaned 1,999-row training cohort. It is not an exact reproduction of the
 earlier 2,000-row experiment, and its settings were not chosen from these results.
 
 | Configuration | Accuracy % | Balanced accuracy % |
@@ -184,11 +186,12 @@ unavailable. Diagnostic runs and helper tests are not charged as tuning attempts
 
 ## Evidence and interpretation
 
-The immutable continuation records are under
-`output/current-package-evidence-aocl-padding-20261029/`; the original records
-remain under `output/current-package-evidence-20261029/`. The local files
-`report/report.txt` and `report/report.json` in the continuation directory
-bind the exact metrics, selections, failures, cost records and input hashes.
+The original study workspace retains the continuation records under
+`output/current-package-evidence-aocl-padding-20261029/` and the original records
+under `output/current-package-evidence-20261029/`. The local files
+`report/report.txt` and `report/report.json` bind the exact metrics, selections,
+failures, cost records and input hashes. The tables on this page summarize
+the public results and identify the archived records by SHA-256.
 
 Before the final configuration freeze, ten study-helper suites passed **263
 tests in each environment**, AOCL and MKL. The pre-query audit passed, and the
@@ -207,13 +210,11 @@ Key SHA-256 bindings:
 | Statistical results | `a8809388eec014de3d7867d357d1b9803ccfe42dd6bcacef14e91358a0e857b8` |
 | Final report JSON | `2f3da74c3e45402c16191e7588aafae21fb86dca2ee96aff4d174b907676f7e8` |
 | Preserved historical manifest | `23250adb2f84e547e633a4cb5fdf0a3673e191e42fe1fa6bf55f2eaa56a77625` |
-| Current `_nnls.py` | `823655ea1be23565e0e8f185a1d151a5adbee068587ed92b5102340fde590a4b` |
+| October 29 `_nnls.py` | `823655ea1be23565e0e8f185a1d151a5adbee068587ed92b5102340fde590a4b` |
 | Added `_aocl.py` | `40cdffdad759adbff6e75fda18cbf085148233b84196a6b152284bf4ce999294` |
 
-The finding-4c evidence gap is addressed within this declared retrospective
-comparison, with mixed calibration provenance and the remaining execution-history
-qualification explicit. These observations do not prove SPA's theoretical
-assumptions, establish general superiority over other solvers/classifiers,
-constitute fresh independent confirmation, or authorize a release or default
-change. Unfavorable and inconclusive results are retained without retuning on
-the query outcomes.
+The tuned SPA–PCA contrast favored SPA on Smiling and PCA on Wearing_Necktie.
+Both intervals included zero. The comparisons are conditional on these fitted
+models and the previously exposed cohort. They leave SPA's theoretical assumptions
+and its performance relative to other methods on new populations untested.
+The study retained every outcome and used training data alone for tuning.

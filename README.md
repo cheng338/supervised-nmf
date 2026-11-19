@@ -83,14 +83,16 @@ cd supervised-nmf
 python -m pip install .
 ```
 
-Image-loading examples require Pillow. Install the optional example or study
-dependencies as needed:
+Image-loading examples require Pillow. To install the optional example or
+study dependencies from the source directory:
 
 ```shell
 python -m pip install ".[examples]"
 python -m pip install ".[study]"
 ```
 
+For a downloaded wheel, append the extra to the local filename, for example
+`python -m pip install "supervised_nmf-0.5.0-py3-none-any.whl[examples]"`.
 The study extra also includes Matplotlib. Use `python -m pip install -e .`
 for an editable development installation. Tested environments and remaining
 compatibility checks are listed in [validation](docs/validation.md).
@@ -220,7 +222,7 @@ metadata, failures and final evaluation, and
 reuse fold-local representations across neighbor counts. The
 [grouped example](examples/grouped_tuning.py) demonstrates subject metadata and
 bounded rank exploration; its caps and subsequent demonstration fit do not
-certify completed tuning. The [current-package comparison](docs/current-package-evidence-20261029.md)
+certify completed tuning. The [October 29 CelebA comparison](docs/current-package-evidence-20261029.md)
 records how strongly untuned and tuned results can differ on the evaluated tasks.
 
 ## Other classifier and scaling options
@@ -462,7 +464,8 @@ fills missing legacy fields; see the [model-persistence contract](docs/api.md#mo
 See the [0.2.0 release record](docs/release-0.2.0.md),
 [tuning improvements](docs/tuning-improvements.md), and the [API guide](docs/api.md).
 
-Run `python examples/grouped_tuning.py --output runs/grouped-example` for a
+From the source checkout or unpacked source archive, run
+`python examples/grouped_tuning.py --output runs/grouped-example` for a
 small subject-separated example. Search budgets and failed upper-rank
 candidates remain explicit; a completed grid does not establish a global
 optimum or complete statistical validation.
@@ -688,6 +691,19 @@ tracebacks and Windows error handling:
 ```shell
 python scripts/check.py
 ```
+
+On Linux the launcher sets the OpenMP, MKL and OpenBLAS startup limits to one
+thread before loading pytest. Tests of in-process checkpoint reuse need a fresh
+worker thread to observe those limits. Use the same settings when running
+those tests directly. This command runs both recovery modules.
+
+```sh
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  python -m pytest tests/test_completed_reuse.py tests/test_completed_reuse_core.py
+```
+
+For an IDE test run, set these three environment variables to `1` in the
+test-run configuration before starting its interpreter.
 
 The public suite requires pytest 9 or later. It covers current package behavior
 and rejection of incompatible study requests. Qualifying an original frozen

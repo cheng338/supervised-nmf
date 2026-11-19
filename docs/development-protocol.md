@@ -2,6 +2,11 @@
 
 Author: Chang Cheng.
 
+This record follows development through version 0.5.0. Timing and validation
+results apply to the source, hosts and workloads described in each study. The
+study workspace retains the raw observations, source snapshots and test logs.
+See the [0.5.0 release notes](release-0.5.0.md) for the published behavior.
+
 ## Shared runtime identity observation
 
 CelebA study recovery shares the ordered lazy imports, native-library observation
@@ -315,9 +320,9 @@ compatibility recognizer. The selected provider restriction removes that
 recognizer, but exact private controller qualification, immutable ownership,
 lifetime and transport still require maintenance. The isolated three-file
 implementation added 600 lines and removed 21 before integration cleanup.
-Two independent reviewers supported this targeted capability; one favored the
-previous implementation because of maintenance cost. That dissent is a product
-judgment, not an outstanding correctness finding, and remains in the evidence.
+The implementation was adopted for the measured gains on eligible workloads.
+A dissenting assessment favored keeping the previous implementation because of
+the long-term maintenance cost. It raised no unresolved correctness issue.
 
 Final isolated checks passed 45 focused cases per host, comprising 31 structural
 guards and 27 actual operations across 14 caller cases, plus 83 existing parent
@@ -333,10 +338,9 @@ Earlier observer/readback corrections and real transport failures are retained,
 including a Windows long-path fixture failure. The earlier four-arm bridge panel
 lacked its specified standalone complete preflight; that sequencing deviation
 remains disclosed and is not repaired retroactively by the correctly ordered
-final panel. The separately authorized diagnostic receipt correction replaces
-collision-prone clock filenames with atomic unique-file creation; it changes no
-numerical calculations. No version bump, release action or accumulated-suite
-validation is implied by this decision.
+final panel. A diagnostic correction replaced collision-prone clock filenames
+with atomic unique-file creation, without changing numerical calculations.
+This panel assessed the isolated implementation.
 
 ### Native inventory, transport and classifier import refinement
 
@@ -391,9 +395,9 @@ and fuller MU-body deferral lacked consistent benefit; required positive
 proofs, existing geometry limits and eager numerical captures remain.
 The isolated composite passed 173 native/transport cases with 45 subtests and
 203 public regression cases per host. Arrays, numerical oracles and diagnostics
-passed; source/runtime pins, every fixed timing sample and failed prototypes
-remain under `tmp/item08-qr-cost-20261116`. This evidence supports the chosen
-change, without replacing integrated-source or release validation.
+passed. The study workspace retains the source and runtime versions, timing
+samples and failed prototypes. The [prepared QR contract](api.md#reusing-prepared-qr-factors)
+describes eligibility and costs in the released implementation.
 
 ## Uniform KNN full-training membership
 
@@ -468,13 +472,12 @@ added state and exclusions without consistent realized benefit across hosts,
 so it was not adopted. Validation-only and narrower alternatives offered less
 capability or insufficient incremental benefit for their maintenance cost.
 
-The chosen tradeoff accepts native-compatibility and operation-sequence
-maintenance for the demonstrated public endpoint benefit. A maintenance-first
-review favored retaining the previous implementation; that was a product-value
-judgment, not an outstanding correctness finding. All independent reviews
-preferred the selected final implementation within the endpoint family.
-The isolated qualification and timing are not release checks or an accumulated
-suite result. After integration, an exact copy of the live source passed all
+The public endpoint benefit justified maintaining compatibility with native
+neighbor behavior and operation order. A dissenting assessment favored the
+simpler previous implementation on maintenance grounds. Among alternatives
+that implemented the endpoint, the reviewers preferred the selected design.
+The isolated qualification and timing covered this workload only. After
+integration, an exact copy of the live source passed all
 319 focused regression cases and 95 additional subtests on each of Windows
 AOCL and physical Ubuntu MKL, with no skips or exclusions. The total includes
 68 new permanent cases for full-membership decisions, native callbacks and
@@ -487,7 +490,7 @@ they do not add a new performance comparison or release-validation claim.
 
 ## Early recovery of screening statistics
 
-The approved change adds the supported public option
+The public calibration grid provides the option
 `calibration_knn_grid(..., screening_statistics_recovery="off")`, accepting
 `"off"` or `"early"`. Eligible `early` runs preserve canonical training-fold
 screening statistics before the representation and its fold receipt finish.
@@ -567,13 +570,12 @@ metadata work shifted from later accounting. That full clock is not wholly
 incremental; filesystem caches may be warm. Do not add or subtract these
 component values from the earlier whole-history measurements.
 
-The original failed Windows collection guard and its unchanged continuation,
-and the archive handling of internal pytest links, remain recorded. The source,
-raw observations, tests, alternative dispositions and focused audit results are
-retained under `tmp/rejected-proposals-audit-20261108/item09-early-statistics/`,
-particularly `focused-resume-review/RESULTS.txt` and `SUMMARY.json`. No old
-checkpoint migration, generic model persistence, uncooperative-writer behavior
-or power-loss guarantee is introduced. Historical records below are unchanged.
+The study workspace retains the failed Windows collection check, its unchanged
+continuation and the handling of internal pytest links during archiving.
+The [recovery contract](api.md#early-recovery-of-screening-statistics) covers
+compatible checkpoints under a cooperating writer lock. Migration of old
+checkpoints, generic model persistence and power-loss durability are outside
+that contract.
 
 Integration validation passed on Windows AOCL and physical Ubuntu MKL. On
 each host, all 11 selected modules passed: 195 tests (98 new permanent cases
@@ -593,7 +595,7 @@ both hosts. The initial results and the correction are retained.
 
 ## CelebA finalization initialization and ownership
 
-The approved change reduces repeated work in the CelebA parameter study's
+The implementation reduces repeated work in the CelebA parameter study's
 finalization and optional fitted-outcome recovery. The first full numerical
 initialization remains inside an aggregation when it first needs final-fit
 recovery identity checks. The `off` and completed-only paths do not perform
@@ -713,11 +715,9 @@ The memo comparison passed 178/188. Exact scientific outputs, genuine committed
 outcome reuse, original fit metadata, completed records and source/runtime/state
 boundaries were checked. These are investigation results, not a claim that
 integration validation, the accumulated suite or release checks have passed.
-The finalized evidence and 20-item disposition ledger are retained under
-`tmp/rejected-proposals-audit-20261108/item08-recovery-initialization/`
-`focused-followup/evidence-review/`, particularly `ITEM08-FINAL-REPORT.txt` and
-`ALTERNATIVE-CLOSURE-LEDGER-FINAL.json`. Historical sections below and installed
-runtimes remain unchanged.
+The [recovery guide](celeba-parameter-study-recovery.md#measured-costs-and-limits)
+reports the measured costs and limits for users choosing a recovery mode.
+The detailed comparison of alternatives is retained locally.
 
 After integration, the focused permanent regressions passed 152 cases on
 Windows AOCL and 162 on physical Ubuntu MKL, including 79 and 89 new cases
@@ -730,7 +730,7 @@ new performance comparison, an accumulated test-suite run or release validation.
 
 ## Exact identifier evaluation and group bookkeeping
 
-The approved change reduces identifier work around evaluation, without changing
+The implementation reduces identifier work around evaluation, without changing
 model fitting, the NMF objective, projection, prediction algorithms or public
 options. Validation and returned scalar IDs use the same owned numeric capture.
 Sample uniqueness data and group partitions are reused for overlap and support
@@ -823,7 +823,7 @@ behavior and the historical section below for the earlier WSL work.
 
 ## Screening statistics for Fortran-order inputs
 
-The approved screening change combines bounded statistics blocks for large
+The screening implementation combines bounded statistics blocks for large
 canonical Fortran-order inputs with C-order output from the already-required
 float32 widening allocation for smaller eligible inputs. Both require more than
 128 columns; the translated float64 size separates the paths at 1 MiB, with
@@ -884,15 +884,14 @@ selected values, warnings/errors, predictions, probabilities or convergence in
 the declared semantic comparison. Fashion remained 1,567/2,000 correct with five
 SPA iterations. Earlier full raw CelebA checks qualify the unchanged large-block
 mechanism as inherited evidence, not a newly executed final-source workflow.
-The investigation is retained under
-`tmp/rejected-proposals-audit-20261108/item06-screening-layout/`, including
-`c7/FINAL-INDEPENDENT-RECOMMENDATION-v1.txt` and its source-bound evidence. These
-are isolated investigation results; they do not substitute for integration,
-accumulated or release validation. Historical records remain unchanged.
+The study workspace retains the raw comparison against the isolated source.
+The [screening layout guide](api.md#screening-execution-layouts) describes
+which input layouts use each calculation. Integrated-source and release
+validation are separate from these measurements.
 
 ## Experimental ANLS factor and report copying
 
-The approved change reduces buffer-copying work in the experimental ANLS-BPP
+The change reduces buffer-copying work in the experimental ANLS-BPP
 implementation. One bounded helper serves both publication of W and the final
 returned coordinates, preserving independent C-order arrays. On eligible
 Fortran-order float64 factors, an integer-view traversal copies the exact bits
@@ -941,17 +940,15 @@ CelebA converged after 70 iterations and classified 3,254 of 4,000 correctly.
 These correctness runs complement the admitted-copy and failure-boundary checks;
 their elapsed times are not extra benchmark samples.
 
-The investigation is retained under
-`tmp/rejected-proposals-audit-20261108/item04-arithmetic/`, including
-`review/ITEM04-FINAL-SCOPED-DECISION-v1.txt` and its source-bound evidence.
-Historical study outputs, identities, adverse observations and failed harness
-attempts remain unchanged. These isolated results qualify the selected source;
-integration checks bind the actual production files and permanent regressions.
-They do not substitute for the later accumulated checks or release validation.
+These results qualify the isolated source. The study workspace retains the
+source identities, adverse observations and failed harness attempts.
+Integration validation is tied to the production files and permanent regressions.
+The [ANLS copying contract](nmf-solver-comparison.md#experimental-anls-factor-and-report-copying)
+describes which copies are eligible.
 
 ## Experimental ANLS training-state reuse
 
-The approved change reuses a successful H solve's completed residual and, when
+The solver reuses a successful H solve's completed residual and, when
 its layout permits, H gradient in the same outer training step. It preserves
 native operation/layout guards, factor consistency checks, complete quiet
 finalization with caller-policy replay, and the original outer W-gradient
@@ -1014,18 +1011,14 @@ These results qualify the isolated investigated source, not a release or the
 subsequently integrated checkout. Integration validation is a separate batch
 bound to the actual source, permanent tests and documentation.
 
-The local evidence is retained under
-`tmp/rejected-proposals-audit-20261108/item03-handoff/`, including
-`ITEM03-ORDINARY-PROCESS-RECOMMENDATION.txt`, its evidence record and the
-`ordinary-process-analysis-v1/RAW-RECONCILIATION-v1.json` audit. These files are
-not distributed with the package. Earlier co-resident comparisons, failed
-attempts and historical source identities remain unchanged. WSL measurements
-remain historical evidence; physical Ubuntu is the current Linux target for
-this follow-up and does not causally explain the earlier WSL timing differences.
+The study workspace retains the reconciled arrays and timings, earlier
+co-resident comparisons, failed attempts and source identities. The follow-up
+ran on physical Ubuntu. Its timings do not explain the differences observed
+in the earlier WSL study. See the [ANLS training-state reuse contract](nmf-solver-comparison.md#experimental-anls-training-state-reuse).
 
 ## Exact rank-one repeat indexing
 
-The approved experimental ANLS-BPP implementation replaces the full-factor
+The experimental ANLS-BPP implementation replaces the full-factor
 BLAKE2b index with CRC32 for the existing rank-one, positive-tolerance repeat
 policy. Contiguous accepted W and H factors are scanned in order. Shape/dtype
 keys and complete bit equality still determine a repeat and its first matching
@@ -1057,7 +1050,7 @@ are described in the [experimental repeat policy](nmf-solver-comparison.md#exper
 
 This extends the earlier one-effective-worker startup decision below; that
 investigation's measurements and historical records remain unchanged.
-The approved change is confined to `scripts/celeba_default_study.py`. Its actual
+The change is confined to `scripts/celeba_default_study.py`. Its
 Linux command-line entry point may select `forkserver` when more than one worker
 is requested and every submitted chunk has identity and report files. The check
 runs after the existing completed-work shortcut and selects a process context
@@ -1087,16 +1080,13 @@ overhead or identify the exact cause of the earlier difference. A common-bootstr
 intervention had its own measurable cost and was not substituted for ordinary
 CLI evidence or subtracted as a calibration.
 
-Integration was separately approved. The investigation's qualified source and
-results remain distinct from validation of the integrated source, permanent
-tests and documentation. Preserve historical identities and receipts; changed
-source requires a new compatible run. Installed runtimes and deferred packaging
-work are unchanged. See the [startup guide](celeba-study.md#process-startup-for-current-runs)
-for the user-facing routing and cost scope.
+The timings above apply to the isolated source. Checkpoint reuse requires
+matching source identities. The [startup guide](celeba-study.md#process-startup-for-current-runs)
+describes the released routing behavior and the workloads covered by the timings.
 
 ## Implementation-source discovery for reusable searches
 
-The approved implementation reduces redundant source-file discovery in the
+The implementation reduces redundant source-file discovery in the
 private identity encoder used by calibration and checkpoint reuse. Within one
 eligible ordinary class-hierarchy traversal, it reuses resolution of the same
 literal filename. An existing plain Python source file can be located directly
@@ -1150,20 +1140,19 @@ with two platform skips and 12 subtests on Windows, and 136 tests with 12
 subtests on WSL. The Windows regression skips covered POSIX creation permissions
 and unavailable directory symlinks. Fresh, completed and recovery qualification
 preserved the declared scientific outputs, warnings and work. The runs used
-unchanged local Windows and WSL runtimes sequentially within the approved
-eight-thread budget. The final investigation audit found all 1,089 included
+the installed Windows and WSL runtimes sequentially, with a total budget of
+eight compute threads. The final investigation audit found all 1,089 included
 live files and their inventory unchanged; historical experiments were not
 rerun or requalified by this work.
 
-Integration was separately approved. The counts above qualify the isolated
-source, not the production combination with permanent tests and these
-documentation changes. Integration results are recorded separately under
-`output/source-lookup-integration-20261107`. This focused decision does not
-constitute full-suite, release or whole-package performance qualification.
+The counts above cover the isolated source. The study workspace retains
+separate integration results for the production code and permanent tests.
+The [0.5.0 release notes](release-0.5.0.md#performance-and-validation)
+summarize release-level validation.
 
 ## Guarded neighbor reuse in explicit grids
 
-The approved implementation reduces repeated finite-distance qualification,
+The implementation reduces repeated finite-distance qualification,
 boundary checks and vote work in `calibration_knn_grid`'s private Euclidean
 neighbor-query adapter. It qualifies the complete shared matrix once, constructs
 reusable votes only at requested clean-boundary endpoints, and reuses a boundary
@@ -1200,11 +1189,9 @@ reduce combined KNN or whole-call time. All costs, outliers and order effects
 remain in the evidence; no controls were subtracted or samples trimmed.
 
 These are bounded implementation observations, not new classification-accuracy
-evidence or a claim of the fastest possible KNN engine. The completed isolated
-investigation is distinct from integration validation, accumulated-suite checks
-and release qualification. Integration results must be recorded separately
-after the actual source and documentation combination is validated. Installed
-runtimes, historical study configurations and original results remain unchanged.
+evidence or a claim of the fastest possible KNN engine. The investigation
+qualified the isolated implementation. For the scope of the integrated
+checks, see [0.5.0 performance and validation](release-0.5.0.md#performance-and-validation).
 
 ## Completed-resume startup and exact identifiers
 
@@ -1214,7 +1201,7 @@ comparison and group refinements are described in
 [exact identifier evaluation](#exact-identifier-evaluation-and-group-bookkeeping).
 The completed-resume policy below is a separate change.
 
-The approved implementation preserves exact identifier comparisons while using
+The implementation preserves exact identifier comparisons while using
 owned numeric snapshots, reusing validated sets and deferring native-format
 discovery. Only proven exactly representable native values use Python-float
 keys; wider values retain exact rational keys, with original report values
@@ -1240,17 +1227,15 @@ establish universal timing neutrality. Public cost scope is recorded in the
 [startup guide](celeba-study.md#process-startup-for-current-runs) and
 [identifier guide](api.md#identifier-validation-costs).
 
-Integration combines the independently qualified edits, removes experimental
-activation/tracing and limits the newly added parameter-worker mapping cleanup
-to Linux. Focused checks must validate that actual combination, including
-ordinary fallback, context restoration, exact serialization, concurrency,
-own-source resume and rejection of incompatible source. Installed runtimes and
-original experiments remain unchanged. The accumulated suite and release checks
-are outside this focused batch.
+Integration combined the independently qualified edits, removed experimental
+activation and tracing, and limited the new parameter-worker mapping cleanup
+to Linux. The focused checks were designed to cover ordinary fallback, context
+restoration, exact serialization, concurrency, resume with matching source and
+rejection of incompatible source. The timings above apply to the investigation.
 
 ## MU projection default and recovery
 
-The approved current-source policy is `mu_projection="auto"`, resolved at fit
+The 0.5.0 default is `mu_projection="auto"`, resolved at fit
 time to rowwise for MU and no MU policy for SPA/CD. The fixed-basis unregularized
 Frobenius objective separates by observation; deliberately shared stopping can
 change a prediction when unrelated query observations change. The default is
@@ -1307,15 +1292,14 @@ error, and an observer comparison of
 discarded speculative traces. Additive corrections retain their originals and
 do not turn failed raw receipts into successful runs.
 
-The investigation report, source maps, retained failures and source-transfer
-and integration-validation receipts are archived under
-`output/c09-integration-20261106`. The investigation is not an accumulated full
-suite, build or release qualification. Public usage and cost guidance is in
-[MU prediction policies](api.md#prediction-batches).
+The study workspace retains the source maps, failures, source-transfer records
+and integration checks. The [MU prediction policies](api.md#prediction-batches)
+describe public usage and costs. The investigation measured the selected
+workloads.
 
 ### Interrupted MU recovery and panel refinement
 
-The approved refinement retains a qualified completed prefix, skips the final
+The refinement retains a qualified completed prefix, skips the final
 speculative updates that cannot produce an accepted result under admitted
 positive-tolerance controls, and reuses guarded basis setup inside the remaining
 scalar recovery. Reuse ends before warnings or unknown callbacks, even inside a
@@ -1377,11 +1361,10 @@ measurements do not isolate context-entry cost or establish a general speed
 claim. Whole-call times include the context overhead; printed fit times do not.
 The slower observations remain part of the decision record.
 
-Chang Cheng approved careful integration and selected the local PC for final
-checks, with unchanged installed runtimes and at most eight total compute
-threads. The example matches the reviewed candidate. Investigation receipts,
-initial harness failures, source snapshots and the integration record are
-retained in `output/grouped-thread-integration-20261104`.
+The integrated example matched the candidate examined on the Windows host.
+Its final-check configuration used the installed runtimes and a budget of
+eight total compute threads. The study workspace retains the initial harness
+failures alongside the source snapshots and integration record.
 
 ## Interrupted CelebA cache preparation — November 4, 2026
 
@@ -1429,11 +1412,10 @@ historical caches had completed successfully; this is not an interruption-rate
 estimate. The validation establishes local Windows process-interruption and
 ordinary I/O behavior, not power-loss durability or new Linux evidence.
 
-Chang Cheng approved integration and selected the local PC for its final checks,
-using unchanged installed runtimes and at most eight total compute threads.
-The implementation is byte-identical to the reviewed candidate. Investigation
-observations, source snapshots, test receipts and the final integration record
-are retained in `output/cache-restart-integration-20261104`.
+The integrated implementation matched the tested candidate byte for byte.
+Its final-check configuration on the Windows host used the installed runtimes
+and a budget of eight total compute threads. The study workspace retains the
+source snapshots and integration record.
 
 ## Impossible neighbor counts in shared grids — November 3, 2026
 
@@ -1468,9 +1450,8 @@ The integrated 18-file regression batch passed 243 tests and 252 subtests in
 each existing local environment, including 39 new cases. There were no skips;
 two warnings per environment were expected inactive-grid diagnostics. Tests
 cover both resolved execution schedules, checkpoint recovery and saved-report
-consumers. Installed runtimes remain unchanged. Before/current source,
-validation receipts and the investigation's raw observations are preserved in
-`output/neighbor-preflight-integration-20261103`.
+consumers. The study workspace retains the before-and-after source, validation
+logs and raw observations.
 
 ## Terminal-NUL class labels — November 3, 2026
 
@@ -1507,16 +1488,15 @@ to +4.5%, with retained timing variability. These bounded measurements do not
 claim universal zero overhead. The added work prevents demonstrated incorrect
 results; it is not a memory-saving tradeoff or a changed statistical objective.
 
-Installed runtimes remain unchanged. Validation/source receipts, retained test
-failure accounts, timing observations and changed-file snapshots are preserved
-under `output/nul-label-integration-20261103`. See the
-[class-label domain](api.md#class-label-domain) for input and serialization limits.
+The study workspace retains the test failures, timing observations and source
+snapshots. The [class-label domain](api.md#class-label-domain) describes input
+and serialization limits.
 
 ## Final-dissertation theory documentation — November 3, 2026
 
-The current theory guide was reviewed against the supplied October 16 final
-PDF and the matching FinalDeposit chapter source, replacing its obsolete
-October 1 draft mapping. Final Theorem 7.4.4 explicitly allows training-sample
+The [theory guide](theory-implementation.md) was checked against the October 16
+final dissertation PDF and matching Chapter 7 source, superseding the October 1
+draft mapping. Final Theorem 7.4.4 explicitly allows training-sample
 reuse across screening/selection, representation fitting and uniform KNN.
 The same observations can train the representation and classifier without an
 extra split between those stages; CV validation and final test observations
@@ -1527,19 +1507,17 @@ constant-feature convention, selected-cutoff/retained-count discussion,
 the reused-sample risk bound, its reference corollary and the exactly separable
 consistency result. It distinguishes these conditional results from general
 package options and from unconditional guarantees for fitted face models.
-Source hashes, previous documentation and the review are preserved in
-`output/theory-documentation-20261103`. This was source/document review,
-including inspection of rendered final-PDF pages, not a new numerical
-validation batch. Package code and historical study evidence were unchanged.
+The review compared the chapter source with the rendered pages. The study
+workspace retains the source hashes and earlier mapping. This correction
+concerned the documentation only.
 
 ## CV candidate isolation — November 3, 2026
 
-Chang Cheng authorized investigation, regression tests and verification of a
-minimal fix in both local Python 3.12 environments. Scalar-parameter sNMF CV
-already fitted screening, basis, optional scaling and classifier inside each
-training fold. The investigation found a separate general-search defect:
-estimator objects supplied in the parameter grid were inserted by reference
-after cloning the base estimator, allowing state to carry between folds.
+Scalar-parameter sNMF CV already fitted screening, basis, optional scaling and
+classifier inside each training fold. Tests in two Python 3.12 environments
+identified a separate general-search defect. Estimator objects supplied in the
+parameter grid were inserted by reference after cloning the base estimator,
+allowing state to carry between folds.
 
 The defect was reproduced using sklearn's warm-start random forest and an
 instrumented warm-start transformer. On deliberately small diagnostic data,
@@ -1562,8 +1540,8 @@ Both environments now reproduce the independent reference scores, preserve
 caller objects and pass 144 tests plus 93 subtests. Checks include replacement
 heads and transformers, previously fitted replacements, nested parameters,
 fresh state per fold/final refit, shared-KNN reuse, real PCA rank expansion,
-resume, groups, scalar grids and scoring. Initial failures, before/after
-fixtures, source hashes and logs are retained in `output/cv-isolation-20261103`.
+resume, groups, scalar grids and scoring. The study workspace retains the
+initial failures, before-and-after fixtures, source hashes and logs.
 No screening formula, NMF objective, default or historical study was changed.
 
 At the end of that batch, cloning still respected custom sklearn clone behavior;
@@ -1574,11 +1552,10 @@ addresses those concerns; the earlier batch records remain unchanged.
 
 ## Candidate and cached-source identity — November 3, 2026
 
-Chang Cheng separately authorized collision/stale-cache reproductions,
-regression tests and minimal fixes in both local Python 3.12 environments.
-Both concerns were reproduced. Different transformers with the same display
-text, including truncated NumPy-array parameters, were grouped together: a
-diagnostic candidate whose independent CV accuracy was 50% inherited another
+Tests in two Python 3.12 environments reproduced both defects. Different
+transformers with the same display text, including truncated NumPy-array
+parameters, were grouped together. A diagnostic candidate whose independent
+CV accuracy was 50% inherited another
 candidate's 100% score. Generic, shared-KNN and rank-search checkpoints also
 accepted changed replacement settings or source and reused stale scores.
 These are software probes, not accuracy evidence for a dataset or classifier.
@@ -1607,10 +1584,9 @@ objective. Constructor arrays are hashed when building identity; source-only
 guards skip numerical-array contents and hash each source file once per check.
 These checks add bookkeeping work for correctness, not for memory savings;
 no general runtime improvement or universal dependency-capture claim is made.
-Old checkpoints remain historical evidence and require fresh locations under
-the changed source/identity schema. Full receipts, negative reproductions and
-final-source regression evidence are retained in
-`output/cv-cache-identity-20261103`.
+Old checkpoints retain their historical identities. The changed source and
+identity schema require a fresh checkpoint location. The study workspace
+retains the reproductions of the defects and final-source regression results.
 
 Final validation passed 198 tests plus 93 subtests in each environment, including
 54 new identity tests and all earlier CV-isolation regressions in the selected
@@ -1624,19 +1600,14 @@ by these software tests.
 
 ## KNN weighting and decision policy — November 3, 2026
 
-Chang Cheng removed the dissertation-driven restriction to uniform KNN.
-For general package development, compare the existing `weights="uniform"`
-and `weights="distance"` options jointly with `n_neighbors` using training-only
-cross-validation on face data. Keep the binary majority-vote boundary at 0.5
-fixed during that comparison, with equality assigned to `classes_[0]` when
-the positive class is `classes_[1]`. Do not tune the cutoff in this comparison.
-Ordinary accuracy remains the default CV metric; any different objective must
-be explicitly declared. Both voting choices preserve the nonnegative NMF
-representation. After reviewing the completed comparison, Chang Cheng accepted
-retaining uniform as the package default, supporting training-only joint k/weight
-tuning, and keeping the native majority boundary fixed. Retain the validated
-weighted-tie and nonfinite-distance fixes described below. This decision requires
-no additional default change or validation run.
+The dissertation analyzes uniform KNN. The November 3 development study
+compared uniform and distance weighting jointly with `n_neighbors` using
+training-only cross-validation on face data. It selected by ordinary accuracy
+and fixed the majority-vote boundary at 0.5, with equality assigned to
+`classes_[0]` when the positive class was `classes_[1]`. Either voting rule
+uses the same nonnegative NMF representation. Chang Cheng retained uniform
+weighting as the package default and supported joint tuning of neighbor count
+and weighting on training data.
 
 A 0.5 boundary is standard binary majority voting, including normalized
 nonnegative weighted votes; it is not an assurance of optimal performance for
@@ -1645,13 +1616,8 @@ every cost-sensitive or imbalanced-data objective. The current constructor's
 thresholds use strict probability comparison. Preserve that distinction,
 especially for floating-point weighted ties and reversed positive labels.
 
-Chang Cheng authorized a bounded validation batch in both local Python 3.12
-environments. This batch does not change any package default. Preserve previous
-study configurations and evidence unchanged; new evidence is recorded under
-`output/knn-weighting-20261103`.
-
-The checks reproduced disagreement between probability-argmax and native
-distance-weighted voting at a floating-point tie in both environments. The
+Both Python 3.12 environments reproduced disagreement between probability-argmax
+and native distance-weighted voting at a floating-point tie. The
 combined prediction API now delegates ambiguous weighted votes to native
 prediction on the whole original coordinate batch; separated votes keep the
 shared probability calculation. Callable weights also use their native decision.
@@ -1664,8 +1630,8 @@ the shared-query boundary guard. The adapter now detects nonfinite distances
 and uses the public selected-k path before cached voting. The concrete fixture
 demonstrated invalid qualification and a warning, not a changed class label.
 This fallback preserves underlying estimator behavior; it does not repair
-distance overflow inside sklearn. Initial failures and numerical fixtures remain
-in the evidence directory.
+distance overflow inside sklearn. The study workspace retains the initial
+failures and numerical fixtures.
 
 The completed batch passed 291 tests and 155 subtests per environment, including
 the affected-file follow-up after correcting an existing test-helper collection
@@ -1678,14 +1644,14 @@ both k=25), and 91.675% versus 91.825% for Necktie (both k=15). Necktie positive
 recall was only 8.50% versus 10.26%; its majority reference accuracy was 91.475%.
 These are selected training-CV scores, not held-out confirmation or a fully
 tuned representation comparison. No winner reached the declared k boundary.
-Retain uniform as the current default and support joint k/weight tuning; these
-small, limited gains do not establish a generally preferable voting policy.
-Audited text tables and retained predictions are under
-`output/knn-weighting-20261103/tables`, with explanation in `RESULTS.txt`.
+The small gains on these two attributes leave the general choice of voting
+policy open. The study workspace retains the predictions used for this
+comparison. The [prediction policies](api.md#prediction-policies-during-evaluation)
+describe how evaluation handles weighted ties.
 
 ## SPA training-coordinate consistency — November 3, 2026
 
-Follow-up: standard SPA `NMFClassifier.fit_transform` now returns an independent
+Standard SPA `NMFClassifier.fit_transform` now returns an independent
 copy of the projected training coordinates already stored by `fit`, eliminating
 its previously inherited second projection. CD/MU, custom subclasses and
 overridden transform methods retain fit-then-transform delegation. The returned
@@ -1693,13 +1659,11 @@ SPA representation is mathematically the same; rerunning NNLS can differ at
 floating-point roundoff because fit/query data layouts can differ. Returning
 saved coordinates does not create a new public-transform diagnostic receipt;
 the training projection is recorded in the fitted training-phase attributes.
-Separate authorized validation and timing evidence is recorded under
-`output/spa-fit-transform-reuse-20261103`.
-That follow-up passed 277 tests and 161 subtests per local environment. In the
-fixed generated-data timing probe, public `fit_transform` took about 30–36%
-less time across the three classifier heads, while predictions and fitted
-coordinates stayed identical. This is bounded regression evidence, not a
-general speedup or accuracy claim; see the follow-up `RESULTS.txt`.
+The follow-up passed 277 tests and 161 subtests in each of the two Python
+environments. On the fixed generated data, public `fit_transform` took about
+30–36% less time across the three classifier heads, with identical predictions
+and fitted coordinates. The timing applies to that probe. See the
+[fit and transform contract](api.md#fitting-and-transforming-together).
 
 The development source makes standalone `FeatureSPA.fit_transform` fit the
 anchor-based basis and return the same fixed-basis NNLS representation as
@@ -1712,10 +1676,10 @@ For newly fitted SPA `NMFClassifier` models, all accepted
 `training_coordinates` settings resolve to `"transform"`, including explicit
 `"fit_transform"`. The classifier fits the basis directly and performs one
 training projection during `fit`, avoiding duplicate work. CD and MU coordinate
-policies are unchanged. Older fitted classifiers retain their learned state and
-coordinate metadata when loaded; the new policy applies on refit. Preserve
-archived releases, study configurations and historical evidence as records of
-the procedures actually run.
+policies are unchanged. The November 3 implementation applied its policy on
+refit and kept the learned state and coordinate metadata when loading a model.
+For version 0.5.0, load an older model in its originating environment or refit
+from the original training data. [Model persistence](api.md#model-persistence)
 
 The correction can change accuracy and adds projection work to standalone
 pipelines previously trained on anchors. The default SPA classifier already
@@ -1725,17 +1689,17 @@ rests on consistent methodology and public API behavior as well as numerical,
 accuracy and runtime evidence; record validation separately from these
 analytical statements.
 
-The authorized local Python 3.12 batch passed 258 unique tests and 161 subtests
-in each of `snmf_aocl` and `snmf_mkl`, including the affected-file rerun after
-correcting an overly strict floating-point assertion. A three-seed generated-data
+The Python 3.12 tests covered the AOCL and MKL environments used on November 3.
+Each passed 258 unique tests and 161 subtests, including the affected-file rerun
+after correcting an overly strict floating-point assertion. A three-seed generated-data
 probe preserved default-classifier coordinates and predictions exactly for KNN,
 logistic regression and linear SVM. Standalone SPA+KNN mean query accuracy changed
 from 95.78% to 94.44%; its median fit time increased from about 4 ms to about
 10 ms due to the added training projection. These small fixed-parameter probes
-establish neither general accuracy improvement nor scalability. Adopt the
-consistent map on methodological and API grounds, retaining that measured
-tradeoff. Full receipts, initial failures, code hashes and text tables are in
-`output/spa-coordinate-consistency-20261103/RESULTS.txt`.
+establish neither general accuracy improvement nor scalability. The common
+training and query map was adopted on methodological and API grounds despite
+the added fitting cost. The study workspace retains the failures, timings
+and source hashes.
 
 ## Public screening and calibration API — November 3, 2026
 
@@ -1760,11 +1724,11 @@ training/query coordinate maps, or prediction rules. Every learned stage remains
 inside the training fold. Classification score selection is distinct from
 defining the feature score and selecting its cutoff.
 
-The initial scoring interface supports accuracy and balanced accuracy only;
-other objectives can use an external sklearn search. This scope keeps the
-shared KNN implementation on its existing prediction path and binds the named
-metric unambiguously to saved evidence. Validation receipts for the authorized
-two-environment local batch are in `output/calibration-api-20261103`.
+The scoring interface supports accuracy and balanced accuracy. Other objectives
+can use an external sklearn search. The shared KNN implementation keeps its
+existing prediction path and records the chosen metric with the checkpoint.
+The study workspace retains validation logs from both environments.
+[Selection objective and report fields](api.md#selection-objective-and-report-fields)
 
 ## Retained image values — November 3, 2026
 
@@ -1796,13 +1760,13 @@ empirical observations: benchmark performance alone does not establish
 correctness or theoretical validity. Memory savings do not justify slower
 execution, including through an optional implementation.
 
-The validation host has 20 physical cores and 40 logical threads. The October 20 integration
-used a budget of 20 total compute threads across workers and native numerical
-threads. Historical configurations and results retain their recorded settings.
+The host used for the October 20 integration had 20 physical cores and 40
+logical threads. That run used a total budget of 20 compute threads across
+workers and native numerical libraries.
 
-Python 3.10 support ended on October 20, 2026. Current development requires
-Python 3.11 or later, with Python 3.12 and AOCL as the primary environment.
-Previous requirements, results, and released artifacts remain historical records.
+Python 3.10 support ended on October 20, 2026. The development environment
+used at the time was Python 3.12 with AOCL. Version 0.5.0 requires Python
+3.11 or later. [Runtime compatibility](compatibility.md#current-support-policy)
 
 ## Public source, rights and citation — October 20, 2026
 
@@ -1868,9 +1832,9 @@ transformations and explicit imbalance handling.
    and final-fitting cost separately. Save failures, seeds, source IDs, checkpoints,
    and compatible completed results.
 7. Training allocations are specified by each study; the earlier 20% rule was withdrawn.
-8. The primary study environment uses Python 3.12 with AOCL. Local CelebA images,
-   attribute annotations, and official partition metadata were available on October 3, 2026.
-   Preserve the published partitions in the training/validation examples.
+8. The October 3, 2026 CelebA study used Python 3.12 with AOCL and local copies
+   of the images, attribute annotations and official partition metadata.
+   Training and validation followed the published partitions.
 9. The additional adaptive workflow was withdrawn. Use the package's
    own explicit grids for NMF/PCA rank, screening and the final classifier. Record grid
    choices, boundary checks, and any expansions or refinements as study decisions.
@@ -1884,12 +1848,11 @@ transformations and explicit imbalance handling.
     MU retains the experimental comparison's unregularized Frobenius objective
     and NNDSVDa initialization. ANLS-BPP remains experimental. Record this API
     extension separately from the completed, frozen benchmark evidence.
-12. Logistic regression is an explicit extension of the dissertation's KNN
-    classification stage. Fit its coordinate scaler within training folds;
-    tune inverse L2 regularization strength independently for each representation.
-    Preserve the historical KNN comparisons and solver/screening decision.
-    Matched logistic comparisons and their theoretical assessment remain separate
-    work before reconsidering the final classifier default.
+12. Logistic regression extends the dissertation's KNN classification stage.
+    The October 6 [matched CelebA comparison](wang-real-data-validation.md)
+    fitted each coordinate scaler within the training fold and tuned inverse L2
+    regularization for each representation. Those development results are
+    available. A logistic-specific theoretical assessment remains open.
 13. On October 5, direct BLAS calls were investigated before
     the Wang validation resumed. SPA now uses public SciPy GEMV/GER updates
     and one fixed-basis layout conversion per transform. The
@@ -1943,16 +1906,19 @@ transformations and explicit imbalance handling.
 
 ## Stages and what constitutes evidence
 
-On October 9, training-only prototype tests supported integration of
-guarded batched SPA projection, optional reusable process workers,
-separate projection/native-thread controls, and a saved decision threshold.
-The implementation changes query execution while preserving basis fitting
-and the NNLS objective. New source models use `projection_solver="auto"`;
-old serialized models retain SciPy. Numerical checks and fallback are required.
-Saved benchmarks keep their original source fingerprints; subsequent benchmarks
-must freeze this new source and record all execution controls. Optional
-decision thresholds preserve the already-tested strict probability rule;
-they do not supply new accuracy evidence. See the [API details](api.md#spa-projection-execution).
+On October 9, training-only prototype tests supported guarded batched SPA
+projection, reusable process workers, separate projection and native-thread
+controls, and a saved decision threshold. The new models then used
+`projection_solver="auto"`. The loader at the time retained SciPy for older
+models. In 0.5.0, load a saved model with its original implementation and
+dependency versions, or refit from the original training data after upgrading.
+[Model persistence](api.md#model-persistence)
+
+These changes affected query execution and preserved basis fitting, the NNLS
+objective, numerical checks and fallback. The optional decision threshold
+used the tested strict probability rule. Benchmarks retain the source and
+execution controls used for their measurements.
+[SPA projection execution](api.md#spa-projection-execution)
 
 The remaining diagnostics supported early release of SPA anchor-selection
 workspaces. This memory optimization occurs after the
@@ -1980,18 +1946,29 @@ rerun or replace those studies.
 - **Final study:** execute the frozen protocol on untouched tests, then report
   paired differences and uncertainty without tuning on final outcomes.
 
-The reference study proposes 27 simulation conditions with 30 independent data
-replications, harder correlation/interaction cases, and 20 paired CelebA training
-runs per attribute. These are a research protocol proposal, not completed work.
-The initial implementation provides generators and auditable comparisons; it
-does not imply this full study has been run. Repeated evaluations of the same
-CelebA test images are not independent test samples.
+The original proposal called for 27 simulation conditions, harder
+correlation and interaction cases, and 20 paired CelebA training runs per
+attribute. The October 6 simulation study completed all 27 factorial
+conditions plus three stress cases (cross-block correlation, null signal
+and XOR), with 30 independent training/test draws each.
+[Simulation results](wang-simulation-validation.md)
 
-Balanced accuracy is the development tuning metric, following the study draft.
-Report accuracy, balanced accuracy, ROC AUC, average precision, precision, recall,
-F1, prevalence and confusion counts. Include majority prediction. Distinguish
-average precision from trapezoidal PR area. Revisit metric choices only using
-development data, and record any change.
+For Smiling and Wearing Necktie, the October 6 development study completed
+20 paired training resamples with fixed settings and 10 independently retuned
+resamples on shared validation images. The final official-test phase of the
+original default-selection protocol remains unfinished. Reusing the same
+evaluation images does not yield independent test samples.
+[Matched CelebA results](wang-real-data-validation.md) · [Original default-selection results](celeba-default-results.md)
+
+The October 6 CelebA development study selected candidates by balanced accuracy.
+The original study draft also called for reporting ordinary and balanced
+accuracy, ROC AUC, average precision, precision, recall, F1, prevalence,
+confusion counts and a majority-prediction reference. Average precision and
+trapezoidal PR area are distinct measures.
+Version 0.5.0 generic calibration defaults to ordinary accuracy. Choose
+`scoring="balanced_accuracy"` to select by mean class recall. Specify the
+objective on development data before evaluating on the test set.
+[Calibration objective](api.md#selection-objective-and-report-fields)
 
 The feature-anchor SPA model and its normalization must be stated alongside
 results. General clipped simulations and CelebA are not assumed separable.
@@ -2115,9 +2092,9 @@ qualification and fitted-basis condition check. Near the guard, small residuals 
 the same coefficient precision as public SciPy. Batched pivot rounds and SciPy
 iterations are different units; fallback receives the original iteration cap.
 These limits accompany the runtime evidence and shared-kernel maintenance
-benefit in the adoption decision. Historical source snapshots and study results
-remain unchanged. Existing serialized bases are preserved; refitting uses the
-current implementation.
+benefit in the adoption decision. The October 25 implementation preserved saved
+bases and used the revised kernel on refit. For loading saved models in version
+0.5.0, see [model persistence](api.md#model-persistence).
 
 ## October 26 MU precision recovery
 
@@ -2145,31 +2122,15 @@ decision; memory reduction is not a justification for slower execution.
 
 ## October 29 third-party review workflow
 
-For each review item, first assess the reported behavior independently of the
-reviewer's recommended change. Use a neutral problem statement, reproduction
-evidence, original source and API contracts. Form and record an independent
-recommendation, its rationale and uncertainties before examining the external
-recommendation.
-
-Then compare the two recommendations and explore credible alternatives,
-including preserving current behavior when appropriate. Consider correctness,
+The October 29 protocol called for assessing a reported behavior against
+reproduction evidence, original source and the documented API contract. It
+distinguished demonstrated failures from plausible risks and considered the
+option of keeping existing behavior. Decision criteria included correctness,
 methodological fidelity, numerical behavior, compatibility, runtime and
-maintenance costs. Distinguish demonstrated failures from plausible risks and
-possible improvements. Present the chosen approach and its evidence, then
-request Chang Cheng's explicit approval before implementation. Questions or
-requests for further investigation do not constitute approval. After approval,
-implement the agreed change and validate it; the review's recommendations are
-proposals, not instructions.
+maintenance costs.
 
-If the external recommendation has already been read, disclose that limitation.
-Use a fresh reviewer without the prior discussion, supplied only the neutral
-problem and original sources, for the independent assessment. Keep proposed
-patches out of that assessment until its recommendation is recorded.
-
-Validate package changes from this review in both local environments,
-`snmf_mkl` and `snmf_aocl`, using checks appropriate to the change. Record the
-actual loaded numerical libraries alongside results for each environment.
-
-Use the agreed priority indices when discussing and completing the review
-queue; retain the original review numbers only where needed for traceability.
+The protocol called for checks appropriate to the change on both AOCL and
+MKL, with the actual loaded numerical libraries recorded alongside each
+runtime's results. The [numerical test interpretation](#numerical-test-interpretation)
+describes which solver diagnostics and outcomes to compare.
 

@@ -9,6 +9,11 @@ Release dates are GitHub publication dates in America/Indianapolis time.
 
 ## Unreleased
 
+- Date historical study results and runtime profiles and identify which
+  study tools the public source includes. The distribution metadata now
+  provides a shorter installation and usage guide with versioned links.
+  The source archive retains the complete README and API guide for offline use.
+
 ## 0.5.0 — 2026-11-18
 
 See the [release notes](docs/release-0.5.0.md) for changes to defaults, migration guidance and measured costs.
@@ -82,9 +87,9 @@ See the [release notes](docs/release-0.5.0.md) for changes to defaults, migratio
   and progress files. Preserve existing progress retry limits, file contents,
   and failure reporting.
 
-- Retry transient Windows file-replacement failures when saving three-label
-  study receipts, preserving receipt checksums and durable staging. Persistent
-  failures still raise after the bounded retry limit.
+- The private three-label study tooling added bounded retries for transient
+  Windows file-replacement failures when saving receipts. It preserved receipt
+  checksums and durable staging and continued to raise on persistent failures.
 
 - Restore NMF projection timing in Fashion-MNIST pipeline profiles, including
   failed projection attempts, while preserving classifier projection behavior.
@@ -213,21 +218,24 @@ See the [release notes](docs/release-0.5.0.md) for changes to defaults, migratio
   document small-request and failure-path costs, without promising bitwise
   batch invariance or higher accuracy. See [MU projection policies](docs/api.md#prediction-batches).
 
-- Make retained dataset and CelebA study helpers request balanced accuracy
-  explicitly for initial calibration and refinement. Canonicalize threadpool
-  record order in new protocols while retaining exact source/runtime checks.
-  The public calibration default remains accuracy. See the
+- The private dataset and CelebA study helpers began requesting balanced
+  accuracy explicitly for initial calibration and refinement. They sorted
+  threadpool records in new protocols and retained exact source/runtime checks.
+  The public calibration functions default to accuracy. See the
   [selection objective](docs/api.md#selection-objective-and-report-fields).
-- Validate three-label report declarations and use explicit amended schedules
-  for scope and repeat counts. Label reconstructed scope as provisional and
-  withhold affirmative planned-study inference. Preserve saved metadata and
-  disclose scope provenance; see the [reporting contract](docs/three-label-refinement-reuse.md#declared-reporting-scope).
+- The private three-label reporter began validating declarations and using
+  explicit amended schedules for scope and repeat counts. It marked reports
+  with reconstructed scope as provisional, withheld affirmative planned-study
+  inference, preserved saved metadata and recorded how scope was determined.
+  See the [reporting contract](docs/three-label-refinement-reuse.md#declared-reporting-scope).
 
 - Remove the combined four-solver runner's environment-directory-name restriction
   while preserving source, executable and runtime identity requirements for
-  resume. Mark frozen three-label and shared-screening launch guides as historical
-  tooling outside current runtime qualification; direct current users to the
-  grouped example and public API.
+  resume.
+- The private three-label and shared-screening launch guides now identify the
+  frozen source and runtime as the scope of their instructions. For current
+  subject-separated fitting and evaluation, see the [grouped tuning example](examples/grouped_tuning.py)
+  and [public API](docs/api.md).
 
 - Publish four-solver orchestration JSON through private temporary files and
   bounded retries when replacement is denied. Preserve the previous complete
@@ -239,10 +247,11 @@ See the [release notes](docs/release-0.5.0.md) for changes to defaults, migratio
   Preserve historical source and receipts, read-only provenance checks, and
   ordinary study resume with identical data, settings, source and runtime.
   See the [four-solver workflow](docs/nmf-solver-comparison.md).
-- Verify the original three-label refinement ledger before activating reused
-  artifacts. Reject a missing or changed recorded ledger, or a newly appearing
-  unrecorded ledger, before writing activation outputs. Preserve legitimate
-  no-ledger searches, historical charges and failed-operation evidence. See the
+- The private three-label refinement tool began verifying the original ledger
+  before activating reused artifacts. It rejected a missing or changed recorded
+  ledger, or a newly appearing unrecorded ledger, before writing activation
+  outputs. It preserved legitimate no-ledger searches, historical charges and
+  failed-operation evidence. See the
   [refinement reuse contract](docs/three-label-refinement-reuse.md).
 
 - Reject inconsistent current shared-KNN CV receipts in the CelebA and

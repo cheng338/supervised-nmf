@@ -77,9 +77,11 @@ the preserved reference source under `runs/blas-spa-20261006/reference/`.
 The extra simulation equivalence receipt is
 `runs/blas-spa-20261006/strong-case-equivalence/result.json`.
 The reference is from commit `832734c6149644492fea98e38fc89e4e0d552d31`.
-The reproducible benchmark is benchmark_spa_blas.py (retained locally: `../scripts/benchmark_spa_blas.py`):
+The benchmark script and reference implementation are retained in the original
+study workspace. The public source includes the [SPA equivalence tests](../tests/test_spa_blas.py).
 
-```powershell
+```text
+# Original study workspace only (PowerShell)
 python scripts/benchmark_spa_blas.py `
   --reference-source runs/blas-spa-20261006/reference/decomposition.py `
   --output runs/blas-spa-20261006/aocl-recheck

@@ -1,3 +1,5 @@
+# Historical Python 3.10.12 numerical profile for the original Ubuntu target.
+# See docs/compatibility.md for the Windows validation and current Python requirement.
 numpy==2.2.6
 scipy==1.15.3
 scikit-learn==1.7.0

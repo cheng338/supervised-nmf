@@ -6,6 +6,10 @@ import sys
 
 
 def main():
+    if sys.platform == "linux":
+        # The completed-reuse tests need a fresh worker to see single-threaded native pools.
+        for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+            os.environ[key] = "1"
     if os.name == "nt":
         import ctypes
         # Limit this policy to this test process and its children. Native

@@ -6,8 +6,11 @@ study's protocol and records the later scoped decision separately.
 
 The subsequent [four-solver comparison](nmf-solver-comparison.md#development-results)
 on Fashion-MNIST and CelebA also selected SPA with absolute screening. That report
-remains `selected_for_audit`. The CelebA evidence and both screening decisions are
-preserved separately. Official-test evaluation has not been completed.
+remains `selected_for_audit`. The official-test phase of the original CelebA
+default-selection protocol remains unfinished. A separate study evaluated
+projected SPA training coordinates on an official test partition on October 12.
+[Original default-selection results](celeba-default-results.md) and
+[October 12 results](validation.md#october-12-official-partition-evaluation)
 
 See [the first development results](celeba-initial-results.md) for observed
 metrics, timing examples and limitations.
@@ -34,8 +37,9 @@ balanced accuracy is 71.7846%, 0.5587 points below the best combination; its
 Smiling and Necktie deficits are 0.4479 and 0.9222 points. CD-absolute remains a
 more accurate but costlier alternative. Rank, cutoff and neighbors remain tunable.
 
-The original decision is preserved under `runs/default-selection/decision/`;
-the amendment is under `runs/default-selection/decision-spca-preference/`.
+The original study workspace retains the decision under
+`runs/default-selection/decision/` and the amendment under
+`runs/default-selection/decision-spca-preference/`.
 This preference was not preregistered. Both revised theoretical proof routes
 remain conditional and do not compel a solver; absolute screening has a simpler
 connection to the threshold theorem, but CV does not verify its assumptions.
@@ -59,14 +63,21 @@ and generalization claims remain outside the completed default study.
 
 ## Questions and comparisons
 
-The first priority is whether factorization improves on screening alone and
-whether screened NMF improves on screened PCA (Wang's R7). Compare the two NMF
-estimators, CD and feature-anchor SPA, and the two screening rules, percentile
-and absolute pooled-t cutoff. Include screening-only KNN, raw-feature KNN,
-independently tuned unscreened NMF, and majority prediction. These completed
-comparisons used KNN throughout. Optional logistic regression is now available
-for a separate comparison across the same representation paths; its matched
-development results and theoretical assessment remain pending.
+The first study asked whether factorization improved on screening alone and
+whether screened NMF improved on screened PCA (Wang's R7). It compared CD,
+feature-anchor SPA, PCA and screening alone under percentile and absolute
+pooled-t screening, using KNN throughout. Other baselines were raw-feature
+KNN, independently tuned unscreened CD-NMF with KNN, and majority prediction.
+
+The October 6 follow-up paired KNN and L2-logistic regression within each of
+ten independently retuned 2,000-image training samples and used a fixed
+4,000-image validation cohort. SPA used anchor-derived coordinates for training
+and NNLS projections for validation. Screened SPA with logistic regression
+gained 3.39 balanced-accuracy points on Smiling and 15.21 on Wearing_Necktie over screened
+SPA with KNN. Screening-only logistic regression scored higher on both tasks.
+These comparisons include procedure-specific scaling and tuning. A theoretical
+bound specific to logistic regression remains open.
+[Matched CelebA results](wang-real-data-validation.md#independent-audit-and-paired-comparisons)
 
 Each method receives its own explicit parameter grid and is tuned separately
 for Smiling and Wearing_Necktie. Within each attribute, shared samples, folds
@@ -128,8 +139,9 @@ sizes and seeds must be declared in the run configuration. Fit screening and
 factorization inside each of five stratified training folds. Use validation for
 the declared development assessment after training-only selection; save and
 disclose all development evaluations. Do not use official test data until the
-protocol is frozen. Identity overlap remains a separate audit because identity
-annotations have not been supplied.
+protocol is frozen. Identity annotations were unavailable for this original
+study. A later Smiling evaluation separated training and test identities on
+its own cohort. [Identity-disjoint validation](celeba-identity-validation.md)
 
 The first substantive development allocation is 4,000 official training images
 and 4,000 official validation images, sampled with seed 42. Both attributes use
@@ -186,11 +198,9 @@ decomposition and classifier stages at the selected settings.
 
 ## Resource plan and execution history
 
-The study uses up to eight worker processes, each limited to one native
-numerical thread, on the current machine with 39.23 GiB total physical RAM.
-Available RAM is shared with the operating system and other applications; total
-physical capacity is not a reserved memory allocation for this study. Monitor
-usage while running and keep the worker limit explicit.
+The October 3 study ran on a workstation with 39.23 GiB of physical RAM shared
+with the operating system and other applications. It used up to eight worker
+processes, each limited to one native numerical thread.
 
 The completed study began with four workers and continued with eight. The original
 run, `runs/celeba-parameter-study-20261003T085938Z-638645d8/`, is preserved. Its
@@ -217,8 +227,11 @@ excluded from selection; their failure records are retained.
 The completed starting grid by itself does not establish convergence for untested
 settings, computational speedup, completed tuning or package defaults. Its
 training-only review identified the boundaries and numerical qualifications used
-for the later refinement/default study above. Wider replication, uncertainty
-analysis and final-test evaluation remain open.
+for the later refinement/default study above. Subsequent studies examined
+uncertainty on resampled training cohorts and evaluated a separate
+identity-disjoint Smiling test cohort. Generalization beyond the evaluated
+cohorts remains open. [Training-resample results](wang-real-data-validation.md)
+and [identity-disjoint results](celeba-identity-validation.md)
 
 ## Running the study, profiling and reporting
 
@@ -267,6 +280,15 @@ runtime/configuration uses a process pool under the routing policy below.
 Runs with multiple
 effective workers retain their process parallelism; Windows and macOS retain
 the existing process route.
+
+To enable the one-thread startup setting for a Linux resume, prefix the usual
+command with `OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1`.
+Keep the study's original protocol and requested native-thread count. If the
+fresh thread observes a wider native pool, a process worker validates and
+reuses the saved folds. The default-study CLI prints the counts for each
+chunk. For example, `new=0 reused=5` means it reused all five folds. The
+parameter-study chunk report records the same counts as
+`new_representation_fits` and `reused_representation_folds`.
 
 The isolated WSL investigation saved about 1.16–1.77 seconds in the tested
 completed one-worker workflows, beyond the separate report-serialization

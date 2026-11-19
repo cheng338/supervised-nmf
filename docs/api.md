@@ -1388,20 +1388,16 @@ have no usable mean; a search without a qualified selection reports a null
 selected mean. Metric-specific aliases name only the metric actually used:
 accuracy scores are never stored under `balanced_accuracy` keys.
 
-The local research helpers `scripts/dataset_search_support.py`,
-`scripts/validate_celeba_unscreened.py` and
-`scripts/validate_celeba_screened_cd.py` explicitly request balanced accuracy
-for both initial calibration and refinement, matching their winner selection.
-This does not change the public default of `scoring="accuracy"`.
+In the original research workspace, three private helpers requested balanced
+accuracy for both initial calibration and refinement to match the criterion
+used to select winners. The study scripts were `scripts/dataset_search_support.py`,
+`scripts/validate_celeba_unscreened.py` and `scripts/validate_celeba_screened_cd.py`.
+Their protocol captures sorted complete threadpool records, including duplicates,
+so enumeration order alone did not prevent reuse. Reuse still required matching
+library paths, versions, thread counts and source. A source change required a new
+search directory. The frozen protocols retained their original runtime scope.
 
-New protocol captures in these helpers sort complete threadpool records into
-canonical order. They retain every field and duplicate record, so enumeration
-order alone does not prevent compatible reuse. Library paths, versions, thread
-counts and source bindings still have to match. Changed source requires new
-search directories; existing protocols are not rewritten or requalified.
-These helper changes do not qualify frozen study launchers for current runtimes.
-
-The study-specific [CelebA grid reviewer](../scripts/review_celeba_cv.py),
+In the public source, the [CelebA grid reviewer](../scripts/review_celeba_cv.py),
 [CelebA default selector](../scripts/select_celeba_default.py) and
 [four-solver reporter](../scripts/report_four_solver_benchmarks.py) audit saved
 shared-KNN CV results under their declared balanced-accuracy objectives.
@@ -2172,8 +2168,11 @@ header with no labels still fails, and leading empty records do not replace
 the required first header. CSV malformed-row numbers count logical data records
 after the header, including ignored empty records, rather than physical lines.
 
-The loader checks IDs, labels, required images,
-and official partition codes. Sampling is uniform within a partition; it does
-not artificially balance classes. This development example loads training and
-validation partitions only. Official test evaluation and identity-overlap audit
-remain separate work after the protocol and defaults are frozen.
+The loader checks IDs, labels, required images and official partition codes.
+It samples uniformly within each partition. This development example uses only
+training and validation images. It checks that their image IDs are disjoint.
+Checking whether the same person appears in both partitions requires a separate
+identity audit. The final-test attempt in the original
+[default-selection study](celeba-default-results.md) ended before it produced
+test predictions. A separate [October 12 official-partition study](validation.md#october-12-official-partition-evaluation)
+evaluated held-out test images with identity and exact-image-duplicate exclusions.

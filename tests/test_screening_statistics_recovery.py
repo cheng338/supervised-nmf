@@ -1,4 +1,6 @@
 """Public option, numerical policies and exact ordinary-result parity."""
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import warnings
 import numpy as np
 import pytest
@@ -161,32 +163,64 @@ def custom_weights(distances):
     return np.ones_like(distances)
 
 
-@pytest.mark.parametrize('custom', ['screen', 'weights', 'pipeline_memory'])
+@pytest.mark.parametrize('custom', ['screen', 'weights'])
 def test_custom_or_unsupported_layout_remains_ordinary(tmp_path, custom):
-    from contextlib import ExitStack
-    from pathlib import Path
-    import tempfile
-    with ExitStack() as context:
-        model = estimator()
-        if custom == 'screen':
-            model.steps[0] = ('screen', CustomScreen(score_threshold=0.))
-        elif custom == 'weights':
-            model.set_params(knn__weights=custom_weights)
-        else:
-            # Joblib appends long internal names. Keep its real cache under a
-            # short system-temp path, rather than beyond Windows path limits.
-            cache = context.enter_context(tempfile.TemporaryDirectory(prefix='i9m-'))
-            model.set_params(memory=cache)
-        reference = run(tmp_path / 'off', model=model, early=False)
-        actual = run(tmp_path / 'early', model=model)
-        assert science(actual) == science(reference)
-        assert not event_paths(tmp_path / 'early')
-        assert actual['screening_statistics_recovery']['eligible'] is False
-        assert_accounting(actual)
-        if custom == 'pipeline_memory':
-            assert list(Path(cache).rglob('output.pkl')), 'ordinary Joblib cache was not published'
-            assert all(not row['warnings'] for report in (reference, actual)
-                       for row in report['representation_folds'])
+    model = estimator()
+    if custom == 'screen':
+        model.steps[0] = ('screen', CustomScreen(score_threshold=0.))
+    else:
+        model.set_params(knn__weights=custom_weights)
+    reference = run(tmp_path / 'off', model=model, early=False)
+    actual = run(tmp_path / 'early', model=model)
+    assert science(actual) == science(reference)
+    assert not event_paths(tmp_path / 'early')
+    assert actual['screening_statistics_recovery']['eligible'] is False
+    assert_accounting(actual)
+
+
+def test_cached_pipeline_remains_ordinary_on_cache_miss_and_hit(tmp_path):
+    def cached_run(name, cache, *, early, expected_fits):
+        directory = tmp_path / name
+        model = estimator().set_params(memory=cache)
+        with observe_science() as observed:
+            report = run(directory, model=model, early=early)
+        assert len(observed['fits']) == expected_fits
+        assert len(observed['predictions']) == 8  # Four candidates in two folds.
+        assert all(candidate['valid'] for candidate in report['candidates'])
+        assert any(Path(cache).rglob('output.pkl')), 'ordinary Joblib cache was not published'
+        assert not event_paths(directory)
+        if early:
+            assert report['screening_statistics_recovery']['eligible'] is False
+            assert_accounting(report)
+        return report, observed['predictions']
+
+    def fold_warnings(report):
+        return [(row['parameters'], row['fold'], row['warnings'])
+                for row in report['representation_folds']]
+
+    # Short cache paths leave room for Joblib's internal filenames on Windows.
+    with TemporaryDirectory(prefix='i9m-') as off_cache, TemporaryDirectory(prefix='i9m-') as early_cache:
+        cold_off, cold_off_predictions = cached_run('cold-off', off_cache, early=False, expected_fits=4)
+        cold_early, cold_early_predictions = cached_run('cold-early', early_cache, early=True, expected_fits=4)
+        warm_off, warm_off_predictions = cached_run('warm-off', off_cache, early=False, expected_fits=0)
+        warm_early, warm_early_predictions = cached_run('warm-early', early_cache, early=True, expected_fits=0)
+
+    for ordinary, early in ((cold_off, cold_early), (warm_off, warm_early)):
+        assert science(early) == science(ordinary)
+        assert fold_warnings(early) == fold_warnings(ordinary)
+    assert all(not row['warnings'] for row in cold_off['representation_folds'])
+
+    # Cache reads can emit dependency warnings. Compare the remaining scientific
+    # fields on fresh projections so the original warning records stay intact.
+    cold_science, warm_science = science(cold_off), science(warm_off)
+    for projection in (cold_science, warm_science):
+        for candidate in projection['candidates']:
+            for fold in candidate['folds']:
+                del fold['warnings']
+    assert warm_science == cold_science
+    for predictions in (cold_early_predictions, warm_off_predictions, warm_early_predictions):
+        for actual, expected in zip(predictions, cold_off_predictions, strict=True):
+            np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.parametrize('failure', ['invalid_screen', 'zero_selected', 'neighbor_preflight', 'rank_after_stats'])

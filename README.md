@@ -1,16 +1,36 @@
-# supervised-nmf
+# Overview
 
-`supervised-nmf` is a Python package for binary classification of dense,
-nonnegative data. It uses the training labels to select features, represents
-each observation by a small set of nonnegative coordinates, and fits a
-classifier on those coordinates. New observations use the feature mask and
-basis learned during training.
+`supervised-nmf` implements supervised nonnegative matrix factorization for
+binary classification of dense, nonnegative data. It is based on Chang
+Cheng’s original research scripts accompanying his dissertation.
 
-The main estimator, `NMFClassifier`, follows scikit-learn’s `fit`, `transform`
-and `predict` interface. Feature screening (`BinaryScreening`) and feature-anchor
-factorization (`FeatureSPA`) are also available as standalone transformers.
+- **Supervised NMF classification** (`NMFClassifier`) screens features using
+  the training labels, fits a nonnegative representation, and classifies new
+  observations in those coordinates using k-nearest neighbors (KNN), logistic
+  regression or a linear support vector machine (SVM). The estimator follows
+  scikit-learn’s `fit`, `transform` and `predict` interface.
+- **Feature screening** (`BinaryScreening`) selects columns by an absolute
+  pooled-t cutoff or a retained percentile. It can be used independently in a
+  scikit-learn pipeline.
+- **Feature-anchor factorization** (`FeatureSPA`) selects anchor features and
+  encodes observations by nonnegative least squares against the fitted basis.
+- **Baseline comparisons** evaluate screened PCA, screening alone, raw features
+  and unscreened coordinate-descent NMF with the selected classifier.
 
-## Installation
+Cheng describes the supervised NMF method in Chapter 7 of his dissertation.
+
+> Cheng, Chang (2026). *Ensemble Kernel Distance-Weighted Discrimination and
+> Supervised Nonnegative Matrix Factorization for Classification*. Doctoral
+> dissertation manuscript, Purdue University, Department of Statistics.
+
+See [CITATION.cff](CITATION.cff) for the software citation and
+[source provenance](provenance/README.md) for the original scripts.
+
+Copyright 2026 Chang Cheng. **All Rights Reserved.** A distribution license for
+the original work has yet to be selected. See [LICENSE](LICENSE) and the
+[third-party notices](THIRD_PARTY_NOTICES).
+
+# Installation
 
 Use Python 3.11 or later. Download the wheel from the
 [GitHub release](https://github.com/cheng338/supervised-nmf/releases/tag/v0.5.1),
@@ -32,7 +52,7 @@ python -m pip install .
 Use `python -m pip install ".[examples]"` from the source directory for image
 examples. The `study` extra also installs Matplotlib.
 
-## Quick start
+# Quick start
 
 Each row is an observation and each column a feature. Supply a finite,
 nonnegative matrix and two classes of training labels. This example generates
@@ -103,7 +123,7 @@ refitting, fallback models and checkpoint reuse. The
 [grouped example](examples/grouped_tuning.py) works through subject-separated
 tuning and final evaluation.
 
-## Solvers and classifiers
+# Solvers and classifiers
 
 | Solver | How it represents an observation |
 | --- | --- |
@@ -121,7 +141,7 @@ controls. See [training coordinates](docs/api.md#training-coordinates) and
 [prediction batches](docs/api.md#prediction-batches) when choosing a projection
 policy for repeated or batched predictions.
 
-## Examples and further reading
+# Examples and further reading
 
 From a source checkout or unpacked source archive, run a small classification
 example or a grouped tuning study.
@@ -137,7 +157,7 @@ python examples/grouped_tuning.py --output runs/grouped-example
 - [Runtime compatibility](docs/compatibility.md) and [model persistence](docs/api.md#model-persistence) — numerical backends and loading fitted models.
 - [Study recovery](docs/celeba-parameter-study-recovery.md) — checkpoint costs and how to resume a CelebA parameter study. Use only trusted local model files for restoration.
 
-## Tests and local builds
+# Tests and local builds
 
 From the source directory, install the study and test extras and run the
 project’s test launcher.
@@ -163,16 +183,6 @@ python scripts/build_release.py
 python -I scripts/check_wheel.py
 ```
 
-## Citation and license
-
-Chang Cheng developed the method and original research scripts for Chapter 7
-of *Ensemble Kernel Distance-Weighted Discrimination and Supervised Nonnegative
-Matrix Factorization for Classification* (Purdue University, 2026). The
-[citation file](CITATION.cff) gives the software citation, and
-[source provenance](provenance/README.md) identifies the original scripts.
-
-Copyright © 2026 Chang Cheng. All Rights Reserved. A distribution license for
-the original work has yet to be selected. See the [license notice](LICENSE)
-and [third-party notices](THIRD_PARTY_NOTICES) for the applicable terms.
+# Changelog
 
 See the [changelog](CHANGELOG.md) for release history.

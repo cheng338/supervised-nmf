@@ -9,10 +9,20 @@ Release dates are GitHub publication dates in America/Indianapolis time.
 
 ## Unreleased
 
+## 0.5.1 — 2026-11-18
+
+- Start the Linux source test suite with one OpenMP, MKL and OpenBLAS thread
+  so tests of completed checkpoints can exercise in-process reuse. A separate
+  test covers the scheduler's decision when native pools start with two threads.
+- Test cached scikit-learn pipelines with screening-statistics recovery set to
+  `"off"` and `"early"`. Compare held-out predictions on matched cache misses
+  and hits, and check when the screening step refits.
 - Date historical study results and runtime profiles and identify which
   study tools the public source includes. The distribution metadata now
   provides a shorter installation and usage guide with versioned links.
   The source archive retains the complete README and API guide for offline use.
+
+See the [release notes](docs/release-0.5.1.md).
 
 ## 0.5.0 — 2026-11-18
 

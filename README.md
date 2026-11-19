@@ -58,6 +58,10 @@ projection for newly fitted MU classifiers. Standalone screening now defaults
 to the absolute pooled-t cutoff. See the [upgrade guide](docs/release-0.5.0.md)
 for explicit alternatives and the [changelog](CHANGELOG.md) for the release history.
 
+Version **0.5.1** strengthens checkpoint recovery tests and documents the Linux
+startup settings for reusing completed study results in the same process.
+See the [0.5.1 release notes](docs/release-0.5.1.md).
+
 **Copyright (c) 2026 Chang Cheng. All Rights Reserved.** A distribution license
 has not yet been selected. Public availability of this repository does not
 grant an open-source license. See [LICENSE](LICENSE) and the separately
@@ -65,20 +69,20 @@ applicable [third-party notices](THIRD_PARTY_NOTICES).
 
 # Installation
 
-Python 3.11 or later is required for version 0.5.0. Python 3.10 support
+Python 3.11 or later is required for version 0.5.1. Python 3.10 support
 ended on October 20, 2026. Dependencies are NumPy, SciPy, scikit-learn
 1.6 or later (below 2.0), threadpoolctl, and joblib 1.3 or later.
 Download the wheel from the [GitHub releases](https://github.com/cheng338/supervised-nmf/releases)
 and install it:
 
 ```shell
-python -m pip install --upgrade supervised_nmf-0.5.0-py3-none-any.whl
+python -m pip install --upgrade supervised_nmf-0.5.1-py3-none-any.whl
 ```
 
 To install the release from source:
 
 ```shell
-git clone --branch v0.5.0 https://github.com/cheng338/supervised-nmf.git
+git clone --branch v0.5.1 https://github.com/cheng338/supervised-nmf.git
 cd supervised-nmf
 python -m pip install .
 ```
@@ -92,7 +96,7 @@ python -m pip install ".[study]"
 ```
 
 For a downloaded wheel, append the extra to the local filename, for example
-`python -m pip install "supervised_nmf-0.5.0-py3-none-any.whl[examples]"`.
+`python -m pip install "supervised_nmf-0.5.1-py3-none-any.whl[examples]"`.
 The study extra also includes Matplotlib. Use `python -m pip install -e .`
 for an editable development installation. Tested environments and remaining
 compatibility checks are listed in [validation](docs/validation.md).
@@ -732,7 +736,7 @@ python scripts/build_release.py
 python -I scripts/check_wheel.py
 ```
 
-The build produces `dist/supervised_nmf-0.5.0-py3-none-any.whl` and a source
+The build produces `dist/supervised_nmf-0.5.1-py3-none-any.whl` and a source
 archive. The wheel check verifies
 imports, authorship metadata, SPA/MU/CD fitting and prediction, and archive
 contents. It does not publish a release.

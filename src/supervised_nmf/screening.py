@@ -13,6 +13,7 @@ from sklearn import get_config
 from sklearn.utils.multiclass import check_classification_targets
 from sklearn.utils.validation import check_array, check_is_fitted
 
+from ._feature_names import _check_input_features, _input_feature_names
 from ._labels import _check_labeled_data, _label_values, _validate_class_labels
 
 
@@ -55,8 +56,8 @@ def _percentile_support(scores, eligible, percentile):
         return eligible.copy()
     if percentile == 0:
         return np.zeros(scores.size, dtype=bool)
-    # Any strictly increasing score mapping leaves the percentile mask unchanged.
-    # Ranking distinct scores avoids undefined interpolation with infinite scores.
+    # Interpolate between integer ranks so infinite or adjacent float64
+    # magnitudes can be ordered without interpolating the magnitudes themselves.
     ranking = scores.copy()
     ranking[~eligible] = -np.inf
     _, ordered = np.unique(ranking, return_inverse=True)
@@ -249,16 +250,19 @@ class BinaryScreening(TransformerMixin, BaseEstimator):
     settings, including through ``set_params``, affects the next fit.
     Transform keeps using the stored mask until refitting.
 
-    ``percentile`` follows sklearn SelectPercentile rounding and deterministic
-    index-order tie handling for finite nonconstant scores. Its denominator is
-    the original feature count. Globally constant features are always excluded.
+    Percentile screening applies the percentile cutoff to ranks of the
+    computed float64 magnitudes of ``t_scores_``, using the original feature
+    count. Features above the cutoff are retained. If a cutoff splits a group
+    of equal magnitudes, lower input-column indices take the remaining places.
+    Mathematically equal statistics can round to different magnitudes and then
+    follow their computed order. Globally constant features are always excluded.
     ``absolute`` keeps ``abs(t) >= score_threshold`` (a t threshold, not an F
     threshold). Features constant within each class but different between
     classes have infinite scores and are eligible; no variance floor is added.
     The signed t statistic uses mean(classes_[1]) - mean(classes_[0]).
     Statistics use float64 after subtracting each training feature's minimum
-    and rescaling its range. This preserves the exact pooled t/F statistic
-    while avoiding avoidable cancellation and extreme measurement units.
+    and rescaling its range. In exact arithmetic, centering and rescaling
+    a nonconstant feature preserve its pooled t statistic.
     Transform preserves input float32/float64 values. Diagnostic variances and
     standard errors are in these centered, scaled units.
     F scores can overflow when finite t scores are squared; selection ranks |t|
@@ -283,8 +287,9 @@ class BinaryScreening(TransformerMixin, BaseEstimator):
     def fit(self, X, y):
         _clear_fitted_attributes(self)
         self._validate_settings()
+        feature_names = _input_feature_names(X)
         X, y, classes, counts = _binary_data(X, y)
-        return self._fit_statistics(X, _label_values(y), classes, counts)
+        return self._fit_statistics(X, _label_values(y), classes, counts, feature_names)
 
     def _validate_settings(self):
         if self.screening not in {"percentile", "absolute"}:
@@ -331,7 +336,7 @@ class BinaryScreening(TransformerMixin, BaseEstimator):
             raise
         return self
 
-    def _fit_statistics(self, X, y, classes, counts):
+    def _fit_statistics(self, X, y, classes, counts, feature_names=None):
         # Translate and scale only statistics, never transformed features.
         # Subtract before dividing: scaling a large offset first can discard
         # a small spread that is still represented in the supplied input.
@@ -401,6 +406,8 @@ class BinaryScreening(TransformerMixin, BaseEstimator):
             scores = np.square(t_scores)
         support = self._support_from_statistics(t_scores, constant)
         try:
+            if feature_names is not None:
+                self.feature_names_in_ = feature_names
             self.n_features_in_ = X.shape[1]
             self.n_samples_seen_ = X.shape[0]
             self.classes_ = classes
@@ -427,6 +434,7 @@ class BinaryScreening(TransformerMixin, BaseEstimator):
 
     def transform(self, X):
         check_is_fitted(self, "support_")
+        _check_input_features(self, X, reset=False)
         X = _nonnegative_array(X)
         if X.shape[1] != self.n_features_in_:
             raise ValueError(
@@ -444,9 +452,14 @@ class BinaryScreening(TransformerMixin, BaseEstimator):
     def get_feature_names_out(self, input_features=None):
         check_is_fitted(self, "support_")
         _validate_class_labels(self.classes_)
+        fitted_names = getattr(self, "feature_names_in_", None)
+        if input_features is None and fitted_names is not None:
+            return fitted_names[self.support_]
         if input_features is None:
             input_features = [f"x{i}" for i in range(self.n_features_in_)]
         names = np.asarray(input_features, dtype=object)
         if names.ndim != 1 or names.size != self.n_features_in_:
             raise ValueError("input_features must contain one name per original feature.")
+        if fitted_names is not None and not np.array_equal(names, fitted_names):
+            raise ValueError("input_features is not equal to feature_names_in_")
         return names[self.support_]

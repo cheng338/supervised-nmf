@@ -41,25 +41,30 @@ def test_two_full_k_products_preserve_padding_and_cover_output(monkeypatch,m,k,n
     a,b=operands(m,k,n)
     a=layout(a,other_layout);b=layout(b,'c_view' if borrowed_view else 'c')
     a.setflags(write=False);b.setflags(write=False);before=state(a),state(b)
-    calls=[];allocated=[]
+    calls=[];buffers=[]
     class Proxy:
         def __getattr__(self,name):return getattr(np,name)
         def empty(self,shape,**kw):
-            value=np.empty(shape,**kw);value.fill(np.nan);allocated.append(('empty',value));return value
+            value=np.empty(shape,**kw);value.fill(np.nan);buffers.append(value);return value
         def zeros(self,shape,**kw):
-            value=np.zeros(shape,**kw);allocated.append(('zeros',value));return value
+            value=np.zeros(shape,**kw);buffers.append(value);return value
         def matmul(self,left,right):
             assert left.shape[0]%8==right.shape[1]%8==0
             assert left.shape[1]==right.shape[0]==k
             assert np.isfinite(left).all() and np.isfinite(right).all()
             value=reference(left,right);calls.append((left,right,value));return value
     monkeypatch.setattr(_aocl,'np',Proxy());actual=_aocl.padded_matmul(a,b)
-    mp,npad=(m+7)//8*8,(n+7)//8*8;mc,nc=m//8*8,n//8*8
-    assert len(calls)==2 and [tag for tag,_ in allocated]==['zeros','zeros','empty']
-    assert allocated[-1][1] is actual
+    mp,nc=(m+7)//8*8,n//8*8
+    # Explicit zero/empty allocations cover the padded left, fringe and result.
+    # Products returned by the reference multiplication are accounted separately.
+    assert sum(value.nbytes for value in buffers) <= (mp*k + k*8 + m*n) * a.itemsize
+    assert len(calls)==2
     assert [(x.shape,y.shape) for x,y,_ in calls]==[((mp,k),(k,nc)),((mp,k),(k,8))]
     full,core,fringe=calls[0][0],calls[0][1],calls[1][1]
-    assert calls[1][0] is full and allocated[0][1] is full and allocated[1][1] is fringe
+    assert calls[1][0] is full
+    assert not np.shares_memory(full,a) and not np.shares_memory(fringe,b)
+    for role in (full,fringe,actual):
+        assert any(np.shares_memory(role,value) for value in buffers)
     old=np.zeros((mp,k));old[:m]=a
     np.testing.assert_array_equal(bits(full),bits(old))
     assert np.shares_memory(core,b) and core.strides==b.strides
@@ -69,7 +74,7 @@ def test_two_full_k_products_preserve_padding_and_cover_output(monkeypatch,m,k,n
     for x in (full,fringe):assert x.dtype==np.float64 and x.flags.c_contiguous and x.flags.aligned
     np.testing.assert_array_equal(actual,reference(a,b))
     assert np.isfinite(actual).all() and actual.flags.owndata and actual.flags.c_contiguous and actual.flags.writeable and actual.base is None
-    assert all(not np.shares_memory(actual,x) for x in (a,b,*[p for _,_,p in calls]))
+    assert all(not np.shares_memory(actual,x) for x in (a,b,full,fringe,*[p for _,_,p in calls]))
     assert before==(state(a),state(b))
 
 class Subclass(np.ndarray):pass

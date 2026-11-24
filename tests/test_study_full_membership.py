@@ -68,7 +68,43 @@ def run_grid(problem, directory, kind="raw", ks=(1, 3, 48), *, model=None, grid=
 
 def native_proof_runtime():
     # Other supported dependency versions deliberately retain native fallback.
-    return sklearn.__version__ == "1.9.1" and joblib.__version__ == "1.6.0"
+    return (sklearn.__version__, joblib.__version__) in {("1.9.1", "1.6.0"), ("1.9.0", "1.5.3")}
+
+
+@pytest.mark.parametrize("unit", ["ns", "D"])
+def test_temporal_neighbor_count_rejected_before_checkpoint_creation(problem, tmp_path, unit):
+    directory = tmp_path / "grid"
+    with pytest.raises(ValueError, match="n_neighbors.*positive integer"):
+        run_grid(problem, directory, ks=(np.int64(3), np.timedelta64(1, unit)))
+    assert not directory.exists()
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_ball_tree_calibration_matches_independent_selected_widths(dtype, tmp_path):
+    # A distant cluster makes the rounded BallTree pruning bound sensitive
+    # to how many neighbors the search requests, even with identical leaves.
+    near = np.nextafter(dtype(1), dtype(2))
+    query = np.nextafter(dtype(1), dtype(0))
+    X = np.array([*range(-30, -15), .9, near, *([2**54] * 15),
+                  query, .87, -24.13, -27.31], dtype=dtype)[:, None]
+    y = np.r_[np.repeat([0, 1], 16), [1, 0, 0, 1]]
+    train, valid = np.arange(32), np.arange(32, 36)
+    folds = [(train, valid), (valid, train)]
+    settings = dict(algorithm="ball_tree", leaf_size=1, metric="euclidean", n_jobs=1)
+    report = study.calibration_knn_grid(
+        KNeighborsClassifier(**settings), {"n_neighbors": [1, 3]}, X, y,
+        folds=folds, cv=2, threads=1, seed=7, checkpoint_dir=tmp_path)
+    means = {}
+    for k, candidate in zip((1, 3), report["candidates"], strict=True):
+        expected = []
+        for train, valid in folds:
+            fitted = KNeighborsClassifier(n_neighbors=k, **settings).fit(X[train], y[train])
+            expected.append(np.mean(fitted.predict(X[valid]) == y[valid]))
+        assert candidate["parameters"]["n_neighbors"] == k
+        assert [fold["score"] for fold in candidate["folds"]] == expected
+        means[k] = np.mean(expected)
+        assert candidate["mean_score"] == means[k]
+    assert report["selected_parameters"]["n_neighbors"] == max(means, key=means.get)
 
 
 def saved_bytes(directory):

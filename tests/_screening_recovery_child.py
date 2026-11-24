@@ -48,6 +48,8 @@ def main():
                 result[label] += 1
             elif frame.f_code is archive:
                 value = frame.f_locals.get('file')
+                if not isinstance(value, (str, Path)):
+                    value = getattr(value, 'name', None)
                 if isinstance(value, (str, Path)) and Path(value).name.startswith('payload-'):
                     result['payload_opens'] += 1
         sys.setprofile(observe)

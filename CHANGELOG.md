@@ -7,7 +7,126 @@ records retain their original scope.
 
 Release dates are GitHub publication dates in America/Indianapolis time.
 
-## Unreleased
+## 0.6.0 — 2026-11-23
+
+See the [release notes](docs/releases/release-0.6.0.md) for upgrade guidance.
+
+- Require scikit-learn 1.6.1 or later and remove the upper version bound.
+  Version 1.6.1 fixed cross-validation with metadata routing enabled when
+  callers omit `params` or pass `None`.
+  [scikit-learn 1.6.1 release notes](https://scikit-learn.org/1.6/whats_new/v1.6.html#version-1-6-1)
+- Standalone calibration now emits `CalibrationFallbackWarning` when it
+  substitutes a training-majority classifier. Pass the calibration result to
+  `evaluate_classifier` to carry that information into the evaluation report.
+  Formatted comparison records also identify the fallback.
+- Shared KNN calibration stops before committing a fold if the fitted training
+  coordinates are unavailable or a pipeline's final KNN fit cannot be shared.
+  A restart with the same source and runtime can reuse earlier completed folds.
+  Shared grids check each candidate's constructor parameters, supported containers,
+  and function captures for registered scikit-learn fit callbacks. A detected
+  callback stops the grid before fitting or accessing checkpoints. Use
+  `calibration_search(..., refit=False, checkpoint_path=None)` to run callbacks,
+  including those held in opaque user code.
+  Validation now follows the fitted pipeline's prediction order for intermediate
+  steps that provide `fit_transform` and `transform` without a separate `fit`.
+- Estimators fitted on uniquely named string columns check those names and
+  their order at prediction or transformation. Calibration and comparison
+  checkpoints also record the column schema. Standalone FeatureSPA supports
+  named component output, and BinaryScreening reports the selected input names.
+  The classifier now keeps its component coordinates as arrays for all three
+  solvers even under a global scikit-learn table-output setting.
+- The comparison examples use one worker and one native thread for final
+  fitting and prediction. Their CV thread limit remains configurable. New
+  timing records identify the host, effective numerical pools and interval.
+  Serial comparisons complete CV before final fitting and retain separate
+  measurements for the selected fit and cumulative refit work on restart.
+- Preserve the selected classifier's predictions and fold scores when KNN
+  calibration encounters a replaced prediction or query method. KDTree
+  calibration also preserves selected-width warnings and errors when the
+  functions that schedule its neighbor queries have been replaced. Serial
+  brute-force grids that request all training neighbors can also reuse the
+  full-neighborhood vote with scikit-learn 1.9.0 and Joblib 1.5.3.
+- Allow MU projection to use the standard SciPy reduction when optional
+  implementation details are unavailable. NumPy 2.5.2 with SciPy 1.18.0
+  also qualifies for workspace reuse during logarithmic MU recovery.
+- Reduce temporary storage and reporting time for larger low-rank fits on
+  supported single-threaded Linux MKL and Windows MKL/AOCL configurations.
+- Wide float64 rowwise MU projections can skip a direct residual calculation
+  when the error bounds determine the stopping decision even after cancellation.
+  Uncertain decisions still use the original active rows.
+- Protect early screening-statistics recovery when a rename reports an error
+  after publishing the event. Restart can recover the fit without charging
+  it twice. Windows now retries transient rename denials. A new event also
+  preserves the files of an earlier event if their identifiers collide.
+- Preserve the original error or interruption when reading saved screening
+  statistics. If recovery cannot record its read time or restore count, the
+  study can be restarted without a spurious failed-fold receipt.
+
+- Use numerical rank values for bounded calibration decisions and range
+  reports. A custom integer rank could previously fit and score successfully
+  and then fail during comparison. Rank expansion now checks the actual
+  representation in each candidate when a grid replaces a pipeline step.
+  For pipelines with multiple rank parameters, the final report retains the
+  original grid bounds and classifications for the other steps.
+  Calibration checkpoints also distinguish scikit-learn's parameter-validation
+  modes, which can change fold eligibility.
+
+- Fit each KNN calibration candidate before transforming validation data.
+  A pipeline that edited its saved training array during validation could
+  otherwise receive incorrect fold scores and select the wrong neighbor count.
+  Raw fold records now omit an earlier neighbor-count error when the shared
+  representation subsequently reports nonconvergence.
+
+- Preserve a pipeline's fitted neighbor index when calibrating KNN. Rebuilding
+  the index from its coordinates could change the distance metric, fold scores
+  and selected neighbor count.
+
+- Preserve the selected BallTree classifier's predictions when calibrating
+  neighbor counts. On data with widely separated coordinate scales, sharing
+  a wider search could change fold scores and select a different count.
+  Tree-backed calibration also preserves warnings and failures from custom
+  Joblib backends. Neighbor counts in calibration grids must be integers;
+  NumPy durations now raise a validation error.
+
+- Distinguish structured NumPy parameters by their scalar class and field
+  layout in calibration checkpoints and shared-grid searches. For example,
+  a callback can read a named field as an attribute on `np.record`. Shared
+  grids and checkpoint readers also distinguish captured record scalars by
+  their NumPy flags and supported backing storage.
+
+- Check random-state ownership when reusing calibration, rank-search or
+  comparison results. A restart can recognize equivalent supported private
+  generators and reject saved fits that skipped draws needed by a later model.
+  See the [API guide](docs/api.md#reusable-candidate-and-checkpoint-identity).
+
+- The CelebA parameter-study example now checks the original run records,
+  grid, and sample counts before resuming CV. A mistyped `--resume` path
+  exits before creating a run or a data cache. See the
+  [resume guide](docs/celeba-parameter-study-recovery.md).
+
+- Recover fixed-basis MU projection coordinates when a positive update
+  denominator silently underflows. Preserve the solver's callback order and
+  return values when callers replace `numpy.dot`. See the
+  [prediction batch documentation](docs/api.md#prediction-batches) for the
+  effect of instrumentation on extreme inputs.
+
+- Save a common CV partition for all models in a development comparison,
+  including models appended on restart. Bind each saved evaluation to the
+  estimator and grid configuration observed at calibration entry. Earlier
+  releases drew folds for each model. With `seed=None` or a mutable
+  `RandomState` split seed, later models can therefore produce different
+  results after upgrading. Each call lists its models in `comparison.json`.
+  Appending B alone keeps A's per-model files and lists only B in the summary.
+  Supply A and B together for a combined summary.
+- Record the first candidate and fold where checkpointed calibration observes
+  a configuration change. A marked search can finish, and compatible completed
+  CV reports and saved predictions remain readable. Fitting again from marked
+  folds requires repeating the search in a fresh location. To read an archive
+  through the API, reconstruct the original entry configuration, including
+  any callback state. See [Recovering a search with custom transformations](docs/api.md#recovering-a-search-with-custom-transformations).
+- Finish jobs started before upgrading with their original source and
+  environment, or start again after upgrading with a fresh checkpoint path or
+  comparison directory.
 
 ## 0.5.1 — 2026-11-18
 
@@ -22,11 +141,11 @@ Release dates are GitHub publication dates in America/Indianapolis time.
   provides a shorter installation and usage guide with versioned links.
   The source archive retains the complete README and API guide for offline use.
 
-See the [release notes](docs/release-0.5.1.md).
+See the [release notes](docs/releases/release-0.5.1.md).
 
 ## 0.5.0 — 2026-11-18
 
-See the [release notes](docs/release-0.5.0.md) for changes to defaults, migration guidance and measured costs.
+See the [release notes](docs/releases/release-0.5.0.md) for changes to defaults, migration guidance and measured costs.
 
 - Speed up SPA basis fitting and projection by applying the first batched
   NNLS pivot to all pending right-hand sides together.
@@ -39,7 +158,7 @@ See the [release notes](docs/release-0.5.0.md) for changes to defaults, migratio
 - Share CelebA study runtime identity observation between full initialization
   and later checks, preserving numerical behavior. Recovery still verifies
   the recorded source and runtime before reusing a fit. See the
-  [maintenance decision and timing tradeoffs](docs/development-protocol.md#shared-runtime-identity-observation).
+  [maintenance decision and timing tradeoffs](research/engineering/development-protocol.md#shared-runtime-identity-observation).
 
 - Keep prepared-QR construction and transport export in their owning class,
   preserving validation order, immutable buffer ownership, process reuse
@@ -49,7 +168,7 @@ See the [release notes](docs/release-0.5.0.md) for changes to defaults, migratio
   files. Reject helpers from another checkout and loaded helpers whose source
   has changed, with guidance to restart the interpreter. Preserve shared
   recovery ownership, lazy helper loading, numerical calculations and saved
-  schemas; see [study helper imports](docs/development-protocol.md#study-helper-imports-and-source-changes).
+  schemas; see [study helper imports](research/engineering/development-protocol.md#study-helper-imports-and-source-changes).
 
 - Clear partial learned state after ordinary fit failures in `FeatureSPA`
   and `BinaryScreening`, including screening-statistics reuse. Preserve
@@ -85,7 +204,7 @@ See the [release notes](docs/release-0.5.0.md) for changes to defaults, migratio
   and warning/error behavior. Unsupported contexts retain the existing path;
   no public option or dependency minimum changes. Benefits and costs depend on
   shape, layout and the complete workflow; see the
-  [screening reuse decision](docs/development-protocol.md#guarded-c-layout-screening-reuse).
+  [screening reuse decision](research/engineering/development-protocol.md#guarded-c-layout-screening-reuse).
 
 - Reduce temporary allocation and reduction work in eligible logarithmic MU
   projection and recovery using an owned workspace. Preserve numerical order,
@@ -136,57 +255,57 @@ See the [release notes](docs/release-0.5.0.md) for changes to defaults, migratio
   controller discovery after registration changes. Numerical algorithms and
   the default recovery policy remain unchanged. Gains and costs depend on the
   workflow; see the
-  [finalization decision](docs/development-protocol.md#celeba-finalization-initialization-and-ownership).
+  [finalization decision](research/engineering/development-protocol.md#celeba-finalization-initialization-and-ownership).
 
 - Reduce repeated sample/group identifier work during evaluation using owned
   native comparisons, proved exact mixed-format promotion and guarded small or
   uniform-group routes. Preserve identifier precision, original report scalars
   and validation/error behavior; no public option or solver change is added.
   Benefits and costs remain workload-dependent; see the
-  [identifier evaluation decision](docs/development-protocol.md#exact-identifier-evaluation-and-group-bookkeeping).
+  [identifier evaluation decision](research/engineering/development-protocol.md#exact-identifier-evaluation-and-group-bookkeeping).
 
 - Reduce screening work for eligible Fortran-order inputs using bounded
   statistics blocks and the existing float32 widening allocation. Preserve
   screening rules, selected values and fitted diagnostics; no public option is
   added. Gains and costs depend on shape and layout; see the
-  [screening layout decision](docs/development-protocol.md#screening-statistics-for-fortran-order-inputs).
+  [screening layout decision](research/engineering/development-protocol.md#screening-statistics-for-fortran-order-inputs).
 
 - Reduce copying work for eligible experimental ANLS-BPP fitted/returned factors
   and final reconstruction-report workspaces. Preserve independent C-order
   factor arrays, solver arithmetic and stopping rules; other layouts retain
   their existing copies. No public option is added. Whole-workflow effects
   remain workload-dependent; see the
-  [copying decision](docs/development-protocol.md#experimental-anls-factor-and-report-copying).
+  [copying decision](research/engineering/development-protocol.md#experimental-anls-factor-and-report-copying).
 
 - Reuse eligible completed H-solve residuals and gradients within experimental
   ANLS-BPP training. Preserve solver results, stopping and warning/error behavior;
   bypass reuse for rank-one inputs with at most 16,384 elements. No public option
   is added. Benefits and costs remain workload-dependent; see the
-  [training-state reuse decision](docs/development-protocol.md#experimental-anls-training-state-reuse).
+  [training-state reuse decision](research/engineering/development-protocol.md#experimental-anls-training-state-reuse).
 
 - Reduce fingerprinting work in eligible rank-one experimental ANLS-BPP repeat
   detection using a CRC32 index with unchanged full-factor bit verification.
   Preserve stopping rules and retained arrays; no option is added. Whole-fit
   effects remain workload-dependent; see the
-  [indexing decision](docs/development-protocol.md#exact-rank-one-repeat-indexing).
+  [indexing decision](research/engineering/development-protocol.md#exact-rank-one-repeat-indexing).
 
 - Reduce repeated work in eligible MU recovery by retaining completed row
   prefixes, reusing guarded setup within a call and using smaller logarithmic
   panels for C-contiguous right operands. Preserve ordered scalar recovery for
   the remaining rows and the existing warning/error contract. Public defaults
   are unchanged and no option is added. Gains and costs depend on the workload;
-  see the [recovery decision](docs/development-protocol.md#interrupted-mu-recovery-and-panel-refinement).
+  see the [recovery decision](research/engineering/development-protocol.md#interrupted-mu-recovery-and-panel-refinement).
 
 - Reduce Linux default-study CLI startup for eligible multiworker checkpoint
   runs using an empty-preload `forkserver`. New output directories retain
   `spawn`; original workers still validate every checkpoint. Imported defaults,
   calls requesting one worker and the parameter-study launcher are unchanged. No new
-  public option is added. See the [startup policy](docs/celeba-study.md#process-startup-for-current-runs).
+  public option is added. See the [startup policy](research/celeba-study.md#process-startup-for-current-runs).
 
 - Reduce redundant implementation-source discovery in reusable search checks.
   Preserve fresh per-check source hashes, configuration validation and existing
   checkpoint guards; custom source layouts retain their original discovery path.
-  See the [development decision](docs/development-protocol.md#implementation-source-discovery-for-reusable-searches).
+  See the [development decision](research/engineering/development-protocol.md#implementation-source-discovery-for-reusable-searches).
 
 - Correct supporting study utilities to request balanced accuracy explicitly,
   capture projection diagnostics per call, and profile MU prediction without
@@ -197,7 +316,7 @@ See the [release notes](docs/release-0.5.0.md) for changes to defaults, migratio
 - Update current-consumer test fixtures to use the installed package identity;
   retain historical qualification checks as explicitly marked, opt-in tests.
   Correct test import isolation, owned-process cleanup and portable fixture
-  paths. See the [test scope](docs/validation.md#current-regressions-and-archived-qualification)
+  paths. See the [test scope](research/validation.md#current-regressions-and-archived-qualification)
   for the qualification boundaries and measured utility cleanup costs.
 
 - Reduce repeated distance, boundary and vote work in compatible shared-KNN
@@ -210,7 +329,7 @@ See the [release notes](docs/release-0.5.0.md) for changes to defaults, migratio
   effective. Reuse still validates checkpoint contents and source/runtime
   identity; incomplete or ineligible work uses the existing process route.
   Multiworker runs retain their process parallelism. See the
-  [startup policy](docs/celeba-study.md#process-startup-for-current-runs).
+  [startup policy](research/celeba-study.md#process-startup-for-current-runs).
 - Accelerate exact sample/group identifier checks and report serialization.
   Preserve extended precision, scalar-subclass behavior and saved representations;
   discover the native floating-point format only when needed. Small requests
@@ -237,7 +356,7 @@ See the [release notes](docs/release-0.5.0.md) for changes to defaults, migratio
   explicit amended schedules for scope and repeat counts. It marked reports
   with reconstructed scope as provisional, withheld affirmative planned-study
   inference, preserved saved metadata and recorded how scope was determined.
-  See the [reporting contract](docs/three-label-refinement-reuse.md#declared-reporting-scope).
+  See the [reporting contract](research/three-label-refinement-reuse.md#declared-reporting-scope).
 
 - Remove the combined four-solver runner's environment-directory-name restriction
   while preserving source, executable and runtime identity requirements for
@@ -251,18 +370,18 @@ See the [release notes](docs/release-0.5.0.md) for changes to defaults, migratio
   bounded retries when replacement is denied. Preserve the previous complete
   file on publication denial, retain interrupted evidence, and keep exact-source
   resume requirements. Document retry costs, reader availability and durability
-  limits in the [status-file publication guide](docs/nmf-solver-comparison.md#status-file-publication-for-new-runs).
+  limits in the [status-file publication guide](research/nmf-solver-comparison.md#status-file-publication-for-new-runs).
 
 - Retire the legacy schema-1 four-solver numerical-repair migration command.
   Preserve historical source and receipts, read-only provenance checks, and
   ordinary study resume with identical data, settings, source and runtime.
-  See the [four-solver workflow](docs/nmf-solver-comparison.md).
+  See the [four-solver workflow](research/nmf-solver-comparison.md).
 - The private three-label refinement tool began verifying the original ledger
   before activating reused artifacts. It rejected a missing or changed recorded
   ledger, or a newly appearing unrecorded ledger, before writing activation
   outputs. It preserved legitimate no-ledger searches, historical charges and
   failed-operation evidence. See the
-  [refinement reuse contract](docs/three-label-refinement-reuse.md).
+  [refinement reuse contract](research/three-label-refinement-reuse.md).
 
 - Reject inconsistent current shared-KNN CV receipts in the CelebA and
   four-solver audit tools. Check schema types, qualification/refit flags and
@@ -320,7 +439,7 @@ See the [release notes](docs/release-0.5.0.md) for changes to defaults, migratio
   missing or malformed manifests; keep this option off by default and retain
   hard errors for committed integrity failures. Compatible completed caches
   keep their existing arrays and manifests. See the
-  [restart policy](docs/celeba-default-results.md#preparing-and-restarting-caches).
+  [restart policy](research/celeba-default-results.md#preparing-and-restarting-caches).
 - Skip shared-grid screening, representation fitting and validation projection
   when every requested neighbor count exceeds a fold's training size. Record
   the neighbor-feasibility failure and zero skipped work, retaining all declared
@@ -386,7 +505,7 @@ See the [release notes](docs/release-0.5.0.md) for changes to defaults, migratio
 
 ## 0.4.3 — 2026-11-02
 
-See the [release notes](docs/release-0.4.3.md) for compatibility and validation details.
+See the [release notes](docs/releases/release-0.4.3.md) for compatibility and validation details.
 
 - Consistently reject Boolean, complex and temporal sample/group identifiers
   across scalar and array representations before fitting or prediction.
@@ -418,7 +537,7 @@ See the [release notes](docs/release-0.4.3.md) for compatibility and validation 
 
 ## 0.4.2 — 2026-11-02
 
-See the [release notes](docs/release-0.4.2.md) for compatibility and validation details.
+See the [release notes](docs/releases/release-0.4.2.md) for compatibility and validation details.
 
 - Reject mismatched numeric/string identifier types between training and
   evaluation sample IDs or subject IDs before prediction, so overlap checks
@@ -455,11 +574,11 @@ See the [release notes](docs/release-0.4.2.md) for compatibility and validation 
   and records `convergence_reason_="repeated_iterate"` and scalar `cycle_event_`
   metadata. The original projected-gradient criterion, `tol=0` behavior and
   higher-rank stopping rules are unchanged. See the
-  [repeat policy and measured costs](docs/nmf-solver-comparison.md#experimental-anls-stopping-and-repeated-iterates).
+  [repeat policy and measured costs](research/nmf-solver-comparison.md#experimental-anls-stopping-and-repeated-iterates).
 - Reduce redundant finite checks and combine protected reconstruction with
   residual subtraction in the experimental projected-gradient diagnostic,
   preserving its nonfinite checks and the solver's stopping calculation. See
-  the [diagnostic measurements](docs/nmf-solver-comparison.md#experimental-diagnostic-cost--november-2-2026).
+  the [diagnostic measurements](research/nmf-solver-comparison.md#experimental-diagnostic-cost--november-2-2026).
 - Add linear-SVM controls to the simulation and CelebA example CLIs, with
   per-model grid overrides and settings recorded for resume. SVM decision
   margins remain distinct from probabilities.
@@ -487,8 +606,8 @@ and KNN. Experimental ANLS-BPP remains outside the public solver choices.
 - Clarify training-only tuning and current-package comparison guidance without
   reinterpreting frozen historical studies.
 
-See the [release notes](docs/release-0.4.1.md) and
-[workaround retirement policy](docs/aocl-nnls-workaround.md#retirement-policy).
+See the [release notes](docs/releases/release-0.4.1.md) and
+[workaround retirement policy](research/engineering/aocl-nnls-workaround.md#retirement-policy).
 
 ## 0.4.0 — 2026-10-29
 
@@ -503,7 +622,7 @@ See the [release notes](docs/release-0.4.1.md) and
   longer updates estimator `last_transform_*` attributes; callers that inspect
   those attributes must use the evaluation report instead.
 
-See the [release notes and migration guidance](docs/release-0.4.0.md).
+See the [release notes and migration guidance](docs/releases/release-0.4.0.md).
 
 ## 0.3.3 — 2026-10-26
 
@@ -515,7 +634,7 @@ See the [release notes and migration guidance](docs/release-0.4.0.md).
 - Expand class-support and timing reports; require pytest 9 or later for the
   source test launcher. Classifier choices and defaults remain unchanged.
 
-See the [release notes](docs/release-0.3.3.md).
+See the [release notes](docs/releases/release-0.3.3.md).
 
 ## 0.3.2 — 2026-10-20
 
@@ -524,7 +643,7 @@ See the [release notes](docs/release-0.3.3.md).
 - Clarify research documentation. Numerical behavior, public APIs, defaults
   and dependency requirements are unchanged.
 
-See the [release notes](docs/release-0.3.2.md).
+See the [release notes](docs/releases/release-0.3.2.md).
 
 ## 0.3.1 — 2026-10-20
 
@@ -534,7 +653,7 @@ See the [release notes](docs/release-0.3.2.md).
   documentation. Numerical behavior and public APIs are unchanged. The
   additional packaging checks are subsequently simplified in 0.3.2.
 
-See the [release notes](docs/release-0.3.1.md).
+See the [release notes](docs/releases/release-0.3.1.md).
 
 ## 0.3.0 — 2026-10-20
 
@@ -550,7 +669,7 @@ See the [release notes](docs/release-0.3.1.md).
 - Reuse neighbors across KNN-grid candidates and add bounded reconstruction-error
   computation for qualified reporting workloads.
 
-See the [release notes and migration guidance](docs/release-0.3.0.md).
+See the [release notes and migration guidance](docs/releases/release-0.3.0.md).
 
 ## 0.2.0 — 2026-10-09
 
@@ -561,7 +680,7 @@ See the [release notes and migration guidance](docs/release-0.3.0.md).
   `predict_with_probabilities` to share projection work.
 - Release SPA anchor workspaces earlier and make `joblib>=1.3` a direct dependency.
 
-See the [release notes](docs/release-0.2.0.md).
+See the [release notes](docs/releases/release-0.2.0.md).
 
 ## 0.1.0 — 2026-10-07
 
@@ -584,4 +703,4 @@ See the [GitHub release](https://github.com/cheng338/supervised-nmf/releases/tag
   `training_coordinates="fit_transform"` convention.
 
 See the [GitHub prerelease](https://github.com/cheng338/supervised-nmf/releases/tag/v0.1.0a2)
-and [tuning improvements](docs/tuning-improvements.md).
+and [tuning improvements](research/engineering/tuning-improvements.md).

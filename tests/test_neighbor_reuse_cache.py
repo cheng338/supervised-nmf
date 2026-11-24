@@ -18,6 +18,102 @@ import supervised_nmf._neighbors as neighbors
 ORDINARY = dict(divide="warn", over="warn", under="ignore", invalid="warn")
 
 
+def test_mismatched_head_uses_its_fitted_count_and_keeps_siblings_eligible():
+    X = np.array([0., .35, .8, 1.5, 2.1, 3.05, 5., 6.2])[:, None]
+    y = [1, 0, 0, 0, 1, 1, 0, 1]
+    Q = np.array([[.01]])
+    models = {key: KNeighborsClassifier(n_neighbors=k, algorithm="brute").fit(X, y)
+              for key, k in ((1, 3), (3, 3), (5, 5))}
+    reuse = neighbors._KNNQueryReuse(models, Q)
+    for key, model in models.items():
+        actual, metadata, _ = reuse.predict(key, probabilities=True)
+        np.testing.assert_array_equal(actual, model.predict_proba(Q))
+        assert metadata["shared_query_attempted"] is (key != 1)
+        if key == 1:
+            assert metadata["reason"] == "neighbor_key_mismatch"
+
+
+@pytest.mark.parametrize("unit", ["ns", "D"])
+def test_timedelta_neighbor_key_delegates_to_selected_head(unit):
+    X = np.arange(8, dtype=float)[:, None]
+    Q = np.array([[.25], [2.25]])
+    temporal = np.timedelta64(1, unit)
+    models = {key: KNeighborsClassifier(n_neighbors=k, algorithm="brute").fit(X, np.arange(8) % 2)
+              for key, k in [(temporal, 1), (3, 3), (5, 5)]}
+    reuse = neighbors._KNNQueryReuse(models, Q)
+    actual, metadata, _ = reuse.predict(temporal, probabilities=True)
+    np.testing.assert_array_equal(actual, models[temporal].predict_proba(Q))
+    assert metadata["reason"] == "neighbor_key_mismatch"
+    assert not metadata["shared_query_attempted"]
+    assert reuse.predict(3, probabilities=True)[1]["shared_query_attempted"]
+
+
+@pytest.mark.parametrize("alias", [True, 1.0])
+def test_non_integer_lookup_of_an_integer_key_calls_its_own_estimator(alias):
+    X = np.arange(8, dtype=float)[:, None]
+    Q = np.array([[.25], [2.25]])
+    heads = {k: KNeighborsClassifier(n_neighbors=k, algorithm="brute").fit(X, np.arange(8) % 2)
+             for k in (1, 3)}
+    reuse = neighbors._KNNQueryReuse(heads, Q)
+    assert heads[alias] is heads[1]
+    actual, metadata, _ = reuse.predict(alias)
+    np.testing.assert_array_equal(actual, heads[1].predict(Q))
+    assert metadata["reason"] == "neighbor_key_mismatch"
+    assert not reuse.query_records()[0]["queried"]
+
+
+@pytest.mark.parametrize("unit", ["ns", "D"])
+def test_timedelta_fitted_count_preserves_the_selected_call(unit):
+    X = np.arange(8, dtype=float)[:, None]
+    Q = np.array([[.25], [2.25]])
+    models = {k: KNeighborsClassifier(n_neighbors=k, algorithm="brute").fit(X, np.arange(8) % 2)
+              for k in (1, 3, 5)}
+    models[1].set_params(n_neighbors=np.timedelta64(1, unit))
+    reuse = neighbors._KNNQueryReuse(models, Q)
+    assert reuse.by_k[1] == (None, "unsupported_neighbor_count")
+    with patch.object(models[1], "predict_proba", side_effect=ValueError("selected count")) as selected:
+        with pytest.raises(ValueError, match="selected count"):
+            reuse.predict(1, probabilities=True)
+    selected.assert_called_once_with(Q)
+    assert not reuse.query_records()[0]["queried"]
+    assert reuse.predict(3, probabilities=True)[1]["shared_query_attempted"]
+
+
+@pytest.mark.parametrize("algorithm", ["brute", "ball_tree"])
+@pytest.mark.parametrize("positive_index", [
+    None, True, -1, 2, np.timedelta64(1, "ns"), np.timedelta64(1, "D"),
+])
+def test_grouped_threshold_requires_a_valid_class_column_before_query(algorithm, positive_index):
+    X = np.arange(4, dtype=float)[:, None]
+    Q = np.array([[.25]])
+    models = {k: KNeighborsClassifier(n_neighbors=k, algorithm=algorithm).fit(X, [0, 1, 0, 1])
+              for k in (1, 2)}
+    reuse = neighbors._KNNQueryReuse(models, Q)
+    with pytest.raises(IndexError, match="positive class index"):
+        reuse.predict(2, probabilities=True, decision_threshold=.5, positive_index=positive_index)
+    assert not reuse.query_records()[0]["queried"]
+    actual, _, _ = reuse.predict(2, probabilities=True, decision_threshold=.5, positive_index=1)
+    np.testing.assert_array_equal(actual, models[2].predict_proba(Q))
+
+
+@pytest.mark.parametrize("algorithm", ["brute", "ball_tree"])
+@pytest.mark.parametrize("threshold", [
+    "invalid", np.full((2, 1), .5), np.timedelta64(1, "ns"), np.timedelta64(1, "D"),
+])
+def test_grouped_threshold_requires_a_real_scalar_before_query_or_fallback(algorithm, threshold):
+    X = np.arange(8, dtype=float)[:, None]
+    Q = np.array([[.25], [2.25]])
+    y = np.arange(len(X)) % 2
+    models = {k: KNeighborsClassifier(n_neighbors=k, algorithm=algorithm, leaf_size=1).fit(X, y)
+              for k in (1, 2)}
+    reuse = neighbors._KNNQueryReuse(models, Q)
+    with pytest.raises(TypeError, match="real scalar"):
+        reuse.predict(2, probabilities=True, decision_threshold=threshold, positive_index=1)
+    assert not reuse.query_records()[0]["queried"]
+    actual, _, _ = reuse.predict(2, probabilities=True, decision_threshold=np.float32(.5), positive_index=1)
+    np.testing.assert_array_equal(actual, models[2].predict_proba(Q))
+
+
 @pytest.fixture(autouse=True)
 def native_budget_and_state():
     original_error = np.geterr().copy()
@@ -43,7 +139,7 @@ def problem(weights, *, ks=(1, 3, 5, 7), dtype=np.float64,
               for k in ks}
     reference = {k: (model.predict(Q), model.predict_proba(Q))
                  for k, model in models.items()}
-    reuse = neighbors._KNNQueryReuse(models, Q)
+    reuse = neighbors._KNNQueryReuse(models, Q, _head_fit_input=X)
     assert len(reuse.groups) == 1
     return models, Q, reuse, reference
 
@@ -53,8 +149,7 @@ def compare(models, Q, reuse, reference, order=None):
         labels, _, _ = reuse.predict(k)
         np.testing.assert_array_equal(labels, reference[k][0])
         for threshold in (0., .5, 1.):
-            with patch.object(models[k], "predict_proba",
-                              wraps=models[k].predict_proba) as public:
+            with patch.object(reuse, "_public", wraps=reuse._public) as public:
                 actual, metadata, _ = reuse.predict(
                     k, probabilities=True, decision_threshold=threshold,
                     positive_index=1)
@@ -62,8 +157,8 @@ def compare(models, Q, reuse, reference, order=None):
                 public.assert_not_called()
                 np.testing.assert_allclose(actual, reference[k][1], rtol=1e-12, atol=1e-14)
             else:
-                public.assert_called_once()
-                assert public.call_args.args[0] is Q
+                public.assert_called_once_with(models[k], True)
+                assert reuse.query is Q
                 np.testing.assert_array_equal(actual, reference[k][1])
             np.testing.assert_array_equal(actual[:, 1] > threshold,
                                           reference[k][1][:, 1] > threshold)
@@ -95,11 +190,11 @@ def test_unsorted_clean_subset_and_training_endpoint_match_native(weights, dtype
     assert list(reuse.groups[0]["prefix_votes"]) == [1, 3, 4, 5, 7, 8]
     # k=2 cuts the duplicated coordinate; a cache for other heads cannot
     # certify it. The endpoint k=n needs no nonexistent next neighbor.
-    with patch.object(models[2], "predict", wraps=models[2].predict) as public:
+    with patch.object(reuse, "_public", wraps=reuse._public) as public:
         actual, metadata, _ = reuse.predict(2)
     np.testing.assert_array_equal(actual, reference[2][0])
-    public.assert_called_once()
-    assert public.call_args.args[0] is Q
+    public.assert_called_once_with(models[2], False)
+    assert reuse.query is Q
     assert metadata["near_boundary_rows"] == len(Q)
     assert metadata["vote_checks_performed"] is False
     assert (X.tobytes(), Q.tobytes()) == before
@@ -166,13 +261,12 @@ def test_boundary_fallback_skips_votes_and_reports_only_computed_diagnostics(wei
     models, Q, reuse, reference = problem(
         weights, ks=(1, 3, 5), coordinates=[0, 0, 1, 2, 3, 4],
         query=[[0.], [1.1]])
-    method = "predict_proba" if probabilities else "predict"
     with patch.object(reuse, "_prefix_votes", side_effect=AssertionError("votes attempted")), \
-            patch.object(models[1], method, wraps=getattr(models[1], method)) as public:
+            patch.object(reuse, "_public", wraps=reuse._public) as public:
         actual, metadata, _ = reuse.predict(1, probabilities=probabilities)
     np.testing.assert_array_equal(actual, reference[1][int(probabilities)])
-    public.assert_called_once()
-    assert public.call_args.args[0] is Q
+    public.assert_called_once_with(models[1], probabilities)
+    assert reuse.query is Q
     assert metadata["reason"] == "numerical_or_boundary_uncertainty"
     assert metadata["near_boundary_rows"] == 1
     assert metadata["uncertainty_lower_bound_rows"] == 1
@@ -190,17 +284,19 @@ def test_boundary_fallback_preserves_selected_warning_as_error():
         "distance", ks=(1, 3, 5), coordinates=[0, 0, 1, 2, 3, 4],
         query=[[0.], [1.1]])
 
-    def selected(query):
-        assert query is Q
-        warnings.warn("selected warning", UserWarning)
-        raise AssertionError("warning-as-error did not propagate")
-
+    # Only the selected head expects named columns. Its public validation
+    # warns on the unnamed query after the shared boundary detects the tie.
+    models[1].feature_names_in_ = np.array(["coordinate"])
     with warnings.catch_warnings():
         warnings.simplefilter("error", UserWarning)
         filters = list(warnings.filters)
-        with patch.object(models[1], "predict", selected):
-            with pytest.raises(UserWarning, match="selected warning"):
+        with pytest.raises(UserWarning, match="feature names") as direct:
+            models[1].predict(Q)
+        with patch.object(reuse, "_public", wraps=reuse._public) as public:
+            with pytest.raises(UserWarning) as actual:
                 reuse.predict(1)
+        public.assert_called_once_with(models[1], False)
+        assert str(actual.value) == str(direct.value)
         assert warnings.filters == filters
 
 
@@ -326,10 +422,10 @@ def test_published_clean_proof_reuses_readonly_mask_without_boundary_work(weight
     # These already qualified, confident heads need neither a new boundary
     # radius nor a public fallback. The final uncertainty union must not write
     # into the aliased finite-distance mask.
-    with patch.object(neighbors.np, "maximum", side_effect=AssertionError("boundary recomputed")):
+    with patch.object(neighbors.np, "maximum", side_effect=AssertionError("boundary recomputed")), \
+            patch.object(reuse, "_public", side_effect=AssertionError("public fallback")):
         for k in (7, 3, 5, 1, 3):
-            with patch.object(models[k], "predict_proba", side_effect=AssertionError("public fallback")):
-                results.append((k, reuse.predict(k, probabilities=True)))
+            results.append((k, reuse.predict(k, probabilities=True)))
     for k, (actual, metadata, _) in results:
         np.testing.assert_allclose(actual, reference[k][1], rtol=1e-12, atol=1e-14)
         assert metadata["accelerated"]
@@ -338,3 +434,112 @@ def test_published_clean_proof_reuses_readonly_mask_without_boundary_work(weight
     assert not mask.flags.writeable
     assert mask.tobytes() == saved_mask
     assert {k: value.tobytes() for k, value in group["prefix_votes"].items()} == saved_votes
+
+
+def _kd_refit_head(k, *, weights="uniform", leaf_size=30):
+    return KNeighborsClassifier(n_neighbors=k, algorithm="kd_tree", metric="euclidean",
+                                weights=weights, leaf_size=leaf_size, n_jobs=1)
+
+
+@pytest.mark.parametrize("donor_k", [1, 3])
+@pytest.mark.parametrize("weights", ["uniform", "distance"])
+def test_nominally_euclidean_heads_use_their_actual_fitted_metric(donor_k, weights):
+    from sklearn.neighbors import NearestNeighbors
+
+    X = np.array([[2., 2.], [2.05, 2.], [2.1, 2.], [3., 0.], [3.1, 0.], [3.2, 0.]])
+    y = np.array([0, 0, 0, 1, 1, 1])
+    Q = np.zeros((1, 2))
+    donor = NearestNeighbors(algorithm="kd_tree", metric="manhattan").fit(X)
+    models = {k: _kd_refit_head(k, weights=weights).fit(donor if k == donor_k else X, y)
+              for k in (1, 3)}
+    assert models[1]._fit_X is models[3]._fit_X
+    assert models[1].effective_metric_ == models[3].effective_metric_ == "euclidean"
+    # At the origin the L1 and L2 nearest triples have opposite labels.
+    for order in ((1, 3), (3, 1)):
+        reuse = neighbors._KNNQueryReuse({k: models[k] for k in order}, Q)
+        for k in order:
+            expected = models[k].predict(Q)
+            assert expected.tolist() == [int(k == donor_k)]
+            np.testing.assert_array_equal(reuse.predict(k)[0], expected)
+            actual = reuse.predict(k, probabilities=True, decision_threshold=.5, positive_index=1)[0]
+            np.testing.assert_allclose(actual, models[k].predict_proba(Q), rtol=1e-12, atol=1e-14)
+
+
+@pytest.mark.parametrize("history", ["wrong_width", "feature_names"])
+def test_public_euclidean_index_refit_retains_selected_head_validation(history):
+    from sklearn.neighbors import NearestNeighbors
+
+    X = np.arange(6, dtype=float)[:, None]
+    y = np.array([0, 0, 0, 1, 1, 1])
+    Q = np.array([[.1]])
+    if history == "feature_names":
+        # Only the test for a real named frame needs the optional dependency.
+        pandas = pytest.importorskip("pandas")
+        initial = pandas.DataFrame(X, columns=["coordinate"])
+        expected_error = UserWarning
+    else:
+        initial = np.column_stack((X, X))
+        expected_error = ValueError
+    donor = NearestNeighbors(algorithm="kd_tree", metric="euclidean").fit(X)
+    small = _kd_refit_head(1).fit(initial, y).fit(donor, y)
+    reuse = neighbors._KNNQueryReuse({1: small, 3: _kd_refit_head(3).fit(X, y)}, Q)
+    # The selected head validates Q against metadata retained from its first fit.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(expected_error) as reference:
+            small.predict_proba(Q)
+        with pytest.raises(type(reference.value)) as actual:
+            reuse.predict(1, probabilities=True)
+    assert str(actual.value) == str(reference.value)
+    if history == "feature_names":
+        with pytest.warns(UserWarning) as direct:
+            expected = small.predict_proba(Q)
+        with warnings.catch_warnings(record=True) as visible:
+            warnings.simplefilter("always")
+            actual, _, shared = reuse.predict(1, probabilities=True)
+        assert [(w.category, str(w.message)) for w in [*visible, *shared]] == [
+            (w.category, str(w.message)) for w in direct]
+        np.testing.assert_array_equal(actual, expected)
+
+
+def test_float32_trees_fit_before_and_after_input_edit_use_selected_snapshot():
+    X = np.array([[1., 1.], [2., 2.], [3., 0.], [4., 0.]], dtype=np.float32)
+    Q = np.zeros((1, 2), dtype=np.float32)
+    y = np.array([0, 0, 1, 1])
+    small = _kd_refit_head(1).fit(X, y)
+    X[[0, 2]] = X[[2, 0]]
+    large = _kd_refit_head(3).fit(X, y)
+    reuse = neighbors._KNNQueryReuse({1: small, 3: large}, Q)
+    np.testing.assert_array_equal(reuse.predict(1)[0], small.predict(Q))
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_kdtree_predictions_follow_selected_width_after_input_edit(warm):
+    X = np.array([0., 1., 2., 4., 6., 7., 8., 9.])[:, None]
+    y = np.array([0, 0, 1, 0, 1, 1, 1, 1])
+    Q = np.array([[4.125]])
+    models = {k: _kd_refit_head(k, leaf_size=2).fit(X, y) for k in (1, 3)}
+    reuse = neighbors._KNNQueryReuse(models, Q)
+    if warm:
+        np.testing.assert_array_equal(reuse.predict(1)[0], models[1].predict(Q))
+        # With a prior result, moving a row in the left leaf changes native k=1.
+        X[2, 0] = 4.12525
+    else:
+        # The right leaf retains its old lower bound at 6. Native k=1 may
+        # prune it while a wider query visits it and includes the moved row.
+        X[4, 0] = 4.13
+    np.testing.assert_array_equal(reuse.predict(1)[0], models[1].predict(Q))
+
+
+@pytest.mark.parametrize("threshold,index,error", [(.5, 2, IndexError), ("bad", 1, TypeError)])
+def test_grouped_kdtree_threshold_errors_precede_selected_or_shared_query(threshold, index, error):
+    X = np.arange(8, dtype=float)[:, None]
+    y = np.arange(8) % 2
+    Q = np.array([[.25]])
+    models = {k: _kd_refit_head(k, leaf_size=1).fit(X, y) for k in (1, 3)}
+    reuse = neighbors._KNNQueryReuse(models, Q)
+    before = [model._tree.get_n_calls() for model in models.values()]
+    with pytest.raises(error):
+        reuse.predict(1, probabilities=True, decision_threshold=threshold, positive_index=index)
+    assert [model._tree.get_n_calls() for model in models.values()] == before
+    assert all(not record["queried"] for record in reuse.query_records())

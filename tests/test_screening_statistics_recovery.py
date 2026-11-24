@@ -323,10 +323,10 @@ def test_private_completed_probe_keeps_its_internal_option_without_new_work(tmp_
     before = stable_bytes(tmp_path)
     X, y = problem()
     with observe_science() as observed:
-        result = study._reuse_calibration_knn_grid(
+        result = study._calibration_knn_grid(
             estimator(), {'screen__score_threshold': [0., 2.], 'knn__n_neighbors': [1, 3]},
             X, y, cv=2, seed=29, threads=1, checkpoint_dir=tmp_path,
-            _screening_statistics_recovery='early')
+            _reuse_only=True, _screening_statistics_recovery='early')
     assert not any(observed.values())
     after = stable_bytes(tmp_path)
     assert {k:v for k,v in before.items() if k != 'report.json'} == {k:v for k,v in after.items() if k != 'report.json'}

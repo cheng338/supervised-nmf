@@ -20,6 +20,7 @@ from copy import deepcopy
 from contextlib import ExitStack
 import hashlib
 import json
+import math
 import multiprocessing
 import os
 from pathlib import Path
@@ -35,12 +36,15 @@ from threadpoolctl import threadpool_limits
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from supervised_nmf.datasets import _attribute_labels, load_celeba
 from supervised_nmf.evaluation import (
-    _diagnostics, _digest, _file_lock, _nonconverged, _warning_records, comparison_models,
+    _SerialTimingError, _check_serial_workers, _diagnostics, _digest, _file_lock, _nonconverged,
+    _timing_study_lock,
+    _warning_records, comparison_models,
     data_fingerprint, evaluate_classifier, new_run_directory, provenance,
     refinement_diagnostics, save_data_manifest, write_json,
 )
 from supervised_nmf._completed_reuse import _try_completed
-from supervised_nmf.study import calibration_knn_grid, _reuse_calibration_knn_grid
+from supervised_nmf.study import (_calibrate_worker_cache, _cv_wall_attempt, _cv_work_pending,
+                                  _frozen_study_cv, _seal_study_cv, _time_study_fit)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import recovery_store
@@ -59,6 +63,20 @@ _INITIALIZATION_DEFAULT_HELPER = recovery_store.active_runtime_identity
 
 def _source_hash():
     return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+def _finite_json_float(token):
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError(f"Study metadata contains a nonfinite number: {token}")
+    return value
+
+
+def _read_study_json(path):
+    # The report digest normalizes nonfinite floats to null. Detect both
+    # nonstandard numeric literals and overflow before computing any identity.
+    return json.loads(path.read_text(encoding="utf-8"), parse_constant=_finite_json_float,
+                      parse_float=_finite_json_float)
 
 
 def prepare_cache(directory, images, attributes, partitions, n_train, n_validation, seed):
@@ -83,7 +101,7 @@ def prepare_cache(directory, images, attributes, partitions, n_train, n_validati
                     "data_sha256": data_fingerprint(data.data, y)}
             manifest["splits"][split] = record
         write_json(manifest_path, manifest)
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = _read_study_json(manifest_path)
     if manifest["seed"] != seed or manifest["official_test_loaded"]:
         raise ValueError("Incompatible cache seed or test access.")
     for split, count in (("train", n_train), ("validation", n_validation)):
@@ -91,12 +109,19 @@ def prepare_cache(directory, images, attributes, partitions, n_train, n_validati
         if len(record["image_ids"]) != count or record["metadata"]["partition_code"] != (0 if split == "train" else 1):
             raise ValueError("Cached sample count or official partition differs.")
         X = np.load(directory / f"{split}-X.npy", mmap_mode="r", allow_pickle=False)
-        if X.shape != (count, 4096) or X.dtype != np.float32:
-            raise ValueError("Cached preprocessing differs from the 64x64 float32 representation.")
-        for attribute in ATTRIBUTES:
-            y = np.load(directory / f"{split}-{attribute}-y.npy", allow_pickle=False)
-            if data_fingerprint(X, y) != record["attributes"][attribute]["data_sha256"]:
-                raise ValueError("Cached data failed their fingerprint check.")
+        try:
+            if X.shape != (count, 4096) or X.dtype != np.float32:
+                raise ValueError("Cached preprocessing differs from the 64x64 float32 representation.")
+            for attribute in ATTRIBUTES:
+                y = np.load(directory / f"{split}-{attribute}-y.npy", allow_pickle=False)
+                # A malformed label array can raise inside data_fingerprint and
+                # retain its feature argument in the caller's live traceback.
+                if count == 0 or getattr(y, "shape", None) != (count,) or y.dtype != np.int64:
+                    X = np.array(X, copy=True)
+                if data_fingerprint(X, y) != record["attributes"][attribute]["data_sha256"]:
+                    raise ValueError("Cached data failed their fingerprint check.")
+        finally:
+            del X
     if set(manifest["splits"]["train"]["image_ids"]) & set(manifest["splits"]["validation"]["image_ids"]):
         raise ValueError("Training and validation image IDs overlap.")
     return manifest
@@ -125,25 +150,17 @@ def chunks_for_models(models):
     return chunks
 
 
-def _worker(job, *, reuse_only=False, _reuse_environment=None):
+def _worker(job, *, reuse_only=False, _reuse_environment=None, _frozen_report=None):
     cache, output, attribute, name, chunk_id, grid, settings, seed, threads, script_hash = job
     if _reuse_environment is not None:
         _reuse_environment(threads)
     if _source_hash() != script_hash:
         raise ValueError("Experiment script changed during this run.")
-    X = np.load(Path(cache) / "train-X.npy", mmap_mode="r", allow_pickle=False)
-    try:
-        y = np.load(Path(cache) / f"train-{attribute}-y.npy", allow_pickle=False)
-        estimator = study_models(settings, seed)[name][0]
-        calibrate = _reuse_calibration_knn_grid if reuse_only else calibration_knn_grid
-        options = {} if _reuse_environment is None else {"_reuse_environment": _reuse_environment}
-        report = calibrate(estimator, grid, X, y, cv=5, seed=seed, threads=threads,
-                                      scoring="balanced_accuracy",
-                                      checkpoint_dir=Path(output) / attribute / name / chunk_id, **options)
-    finally:
-        # Linux completed reuse owns this mapping, including on errors.
-        if sys.platform == "linux":
-            X._mmap.close()
+    report = _calibrate_worker_cache(
+        lambda: study_models(settings, seed)[name][0], grid, Path(cache) / "train-X.npy",
+        Path(cache) / f"train-{attribute}-y.npy", cv=5, seed=seed, threads=threads,
+        scoring="balanced_accuracy", checkpoint_dir=Path(output) / attribute / name / chunk_id,
+        reuse_only=reuse_only, _reuse_environment=_reuse_environment, _frozen_report=_frozen_report)
     if report is None:
         return None
     return {"attribute": attribute, "method": name, "chunk": chunk_id,
@@ -193,27 +210,27 @@ def _ordinary_final_fit(result, estimator, parameters, X, y, Xv, yv, manifest, t
         result["evaluation"] = {"status": "held", "reason": "No candidate passed all five numerical checks."}
         return result
     fitted = clone(estimator).set_params(**parameters)
+    _check_serial_workers(fitted)
     recovery_store._hook("fit-start", details)
-    start = time.perf_counter()
-    with threadpool_limits(limits=threads), warnings.catch_warnings(record=True) as caught:
+    with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         try:
-            fitted.fit(X, y)
-            result["final_fit_seconds"] = time.perf_counter() - start
+            _time_study_fit(fitted, X, y, result)
             result["diagnostics"] = _diagnostics(fitted)
             recovery_store._hook("fit-complete", details)
             if _nonconverged(fitted, caught):
                 result["evaluation"] = {"status": "held", "reason": "Selected final fit did not converge."}
             else:
                 recovery_store._hook("evaluation-start", details)
+                result["prediction_execution"] = {}
                 result["evaluation"] = evaluate_classifier(fitted, Xv, yv, threads=threads,
-                    sample_ids=manifest["splits"]["validation"]["image_ids"])
+                    sample_ids=manifest["splits"]["validation"]["image_ids"],
+                    _serial_timing=result["prediction_execution"])
                 recovery_store._hook("evaluation-complete", details)
+        except _SerialTimingError:
+            raise
         except Exception as error:
             result["evaluation"] = {"status": "failed", "error_type": type(error).__name__, "error": str(error)}
-        finally:
-            if result["final_fit_seconds"] == 0.0:
-                result["final_fit_seconds"] = time.perf_counter() - start
     result["final_fit_warnings"] = _warning_records(caught)
     return result
 
@@ -318,25 +335,23 @@ def _recoverable_final_fit(result, directory, result_path, estimator, parameters
             result["evaluation"] = {"status": "held", "reason": "No candidate passed all five numerical checks."}
         else:
             fitted = clone(estimator).set_params(**parameters)
+            _check_serial_workers(fitted)
             accounting["fit_performed"] = True
             recovery_store._hook("fit-start", details)
-            start = time.perf_counter()
-            with threadpool_limits(limits=threads), warnings.catch_warnings(record=True) as caught:
+            with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 try:
-                    fitted.fit(X, y)
-                    result["final_fit_seconds"] = time.perf_counter() - start
+                    _time_study_fit(fitted, X, y, result)
                     result["diagnostics"] = _diagnostics(fitted)
                     if _nonconverged(fitted, caught):
                         result["evaluation"] = {"status": "held", "reason": "Selected final fit did not converge."}
                     else:
                         fit_ready = True
+                except _SerialTimingError:
+                    raise
                 except Exception as error:
                     initialization.clear()
                     result["evaluation"] = {"status": "failed", "error_type": type(error).__name__, "error": str(error)}
-                finally:
-                    if result["final_fit_seconds"] == 0.0:
-                        result["final_fit_seconds"] = time.perf_counter() - start
             result["final_fit_warnings"] = _warning_records(caught)
             accounting["new_fit_seconds"] = result["final_fit_seconds"]
             fit_metadata = deepcopy(result)
@@ -353,11 +368,15 @@ def _recoverable_final_fit(result, directory, result_path, estimator, parameters
             store.record(attempt, "outcome-committed", published)
         if fit_ready:
             recovery_store._hook("evaluation-start", details)
-            with threadpool_limits(limits=threads), warnings.catch_warnings(record=True) as caught:
+            with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 try:
+                    result["prediction_execution"] = {}
                     result["evaluation"] = evaluate_classifier(fitted, Xv, yv, threads=threads,
-                        sample_ids=manifest["splits"]["validation"]["image_ids"])
+                        sample_ids=manifest["splits"]["validation"]["image_ids"],
+                        _serial_timing=result["prediction_execution"])
+                except _SerialTimingError:
+                    raise
                 except Exception as error:
                     initialization.clear()
                     result["evaluation"] = {"status": "failed", "error_type": type(error).__name__, "error": str(error)}
@@ -387,6 +406,8 @@ def _recoverable_final_fit(result, directory, result_path, estimator, parameters
 
 
 def aggregate_and_evaluate(output, cache, models, manifest, threads, configuration):
+    if type(threads) is not int or threads != 1:
+        raise ValueError("Final fit and prediction require one native thread.")
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     with _file_lock(output / ".final-evaluation.lock",
@@ -462,7 +483,7 @@ def _aggregate_and_evaluate(output, cache, models, manifest, threads, configurat
                       "evaluation_identity": evaluation_identity,
                       "selected_parameters": parameters,
                       "cv_balanced_accuracy": calibration["cv_balanced_accuracy"],
-                      "tuning_compute_seconds": compute, "final_fit_seconds": 0.0,
+                      "tuning_compute_seconds": compute, "final_fit_seconds": None,
                       "tuning_complete": False, "defaults_frozen": False, "is_fallback": False,
                       "evaluation_role": "development_validation_not_final_test"}
             if _ensure_final_guard is not None:
@@ -476,13 +497,15 @@ def _aggregate_and_evaluate(output, cache, models, manifest, threads, configurat
     return summaries
 
 
-def _completed_or_spawned(jobs, workers):
+def _completed_or_spawned(jobs, workers, *, _pins=None):
+    frozen = {} if _pins is None else {id(job): pin for job, pin in zip(jobs, _pins, strict=True)}
     def describe(job):
         _, output, attribute, name, chunk_id, grid, settings, seed, threads, _ = job
         return study_models(settings, seed)[name][0], grid, Path(output) / attribute / name / chunk_id, threads
 
     def invoke(job, environment):
-        return _worker(job, reuse_only=True, _reuse_environment=environment)
+        options = {"_frozen_report": frozen[id(job)]} if frozen else {}
+        return _worker(job, reuse_only=True, _reuse_environment=environment, **options)
 
     completed = _try_completed(jobs, workers, describe=describe, invoke=invoke)
     if completed is not None:
@@ -490,9 +513,42 @@ def _completed_or_spawned(jobs, workers):
         return
     if jobs:
         with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) as pool:
-            futures = [pool.submit(_worker, job) for job in jobs]
+            futures = [pool.submit(_worker, job, reuse_only=True, _frozen_report=frozen[id(job)])
+                       for job in jobs] if frozen else [pool.submit(_worker, job) for job in jobs]
             for future in as_completed(futures):
-                yield future.result()
+                result = future.result()
+                if frozen and result is None:
+                    raise ValueError("A frozen CV fold or identity is missing or incompatible; fresh CV is closed.")
+                yield result
+
+
+
+def _resume_records(output, *, check_writers=False):
+    paths = [output / name for name in ("configuration.json", "data.json", "provenance.json")]
+    if not all(path.is_file() for path in paths):
+        raise ValueError("--resume requires an initialized study with configuration.json, data.json and provenance.json")
+    with ExitStack() as locks:
+        if check_writers:
+            for path in paths[:2]:
+                marker = path.with_name(f".{path.name}.lock")
+                locks.enter_context(_file_lock(marker, f"Another process or thread is writing this checkpoint: {path}"))
+        records = [_read_study_json(path) for path in paths]
+    if not all(isinstance(record, dict) for record in records):
+        raise ValueError("Invalid CelebA run metadata")
+    return records
+
+
+def _check_resume_sample_counts(manifest, n_train, n_validation):
+    """Compare the requested cache row counts with the original selected IDs."""
+    for split, count in (("train", n_train), ("validation", n_validation)):
+        try:
+            image_ids = manifest["splits"][split]["image_ids"]
+        except (KeyError, TypeError) as error:
+            raise ValueError(f"Study manifest is missing {split} image_ids") from error
+        if not isinstance(image_ids, list) or not image_ids:
+            raise ValueError(f"Study manifest requires a nonempty list of {split} image_ids")
+        if len(image_ids) != count:
+            raise ValueError(f"--max-{split}={count} differs from the {len(image_ids)} saved {split} images")
 
 
 def main():
@@ -506,8 +562,8 @@ def main():
     parser.add_argument("--max-train", type=int, default=4000)
     parser.add_argument("--max-validation", type=int, default=4000)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=4, help="Concurrent training CV workers.")
+    parser.add_argument("--threads", type=int, default=1, help="Native threads per CV worker. Final fitting and prediction use one.")
     parser.add_argument("--output", type=Path, default=Path("runs"))
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--final-fit-recovery", choices=recovery_store.POLICIES, default="off",
@@ -517,44 +573,97 @@ def main():
                              "Do not resume untrusted or received model files; integrity checks do not establish trust. "
                              "The choice is saved and must match on resume.")
     args = parser.parse_args()
+    with _timing_study_lock():
+        _run(args, parser)
+
+
+def _run(args, parser):
     try:
         recovery_store.validate_policy(args.final_fit_recovery)
     except ValueError as error:
         parser.error(str(error))
     if args.workers < 1 or args.threads < 1:
         parser.error("workers and threads must be positive")
-    if not (args.data_cache / "manifest.json").exists() and not all((args.dir, args.attributes, args.partitions)):
+    if args.resume is not None:
+        try:
+            original = _resume_records(args.resume)
+            _check_resume_sample_counts(original[1], args.max_train, args.max_validation)
+        except (OSError, ValueError) as error:
+            parser.error(f"Cannot resume {args.resume}: {error}")
+    cache_exists = (args.data_cache / "manifest.json").exists()
+    if not cache_exists and not all((args.dir, args.attributes, args.partitions)):
         parser.error("Creating a cache requires --dir, --attributes and --partitions")
-    settings = json.loads(args.grid_json.read_text(encoding="utf-8"))
-    manifest = prepare_cache(args.data_cache, args.dir, args.attributes, args.partitions,
-                              args.max_train, args.max_validation, args.seed)
+    try:
+        settings = _read_study_json(args.grid_json)
+    except ValueError as error:
+        parser.error(f"Invalid study grid {args.grid_json}: {error}")
+    cache_args = (args.data_cache, args.dir, args.attributes, args.partitions,
+                  args.max_train, args.max_validation, args.seed)
+    manifest = prepare_cache(*cache_args) if args.resume is None else original[1]
     models = study_models(settings, args.seed)
     config = {"final_fit_recovery": args.final_fit_recovery, "grid": settings, "seed": args.seed, "workers": args.workers, "threads": args.threads,
+              "final_workers": 1, "final_native_threads": 1,
               "data_manifest_sha256": _digest(manifest), "script_sha256": _source_hash(),
               "source_sha256": provenance(args.threads)["source_sha256"], "cv": 5,
               "selection_metric": "balanced_accuracy", "ties": "first candidate in sklearn ParameterGrid order",
               "tuning_complete": False, "defaults_frozen": False}
     output = args.resume or new_run_directory(args.output, "celeba-parameter-study")
-    save_data_manifest(output / "configuration.json", config)
-    save_data_manifest(output / "data.json", manifest)
-    if not args.resume:
+    if args.resume is None:
+        save_data_manifest(output / "configuration.json", config)
+        save_data_manifest(output / "data.json", manifest)
         write_json(output / "provenance.json", provenance(args.threads))
+    else:
+        saved, _, origin = original
+        config_hash = _digest(config)
+        original_threads = origin.get("native_threads_requested")
+        if (_digest(saved) != config_hash
+                or origin.get("source_sha256") != config["source_sha256"]
+                or type(original_threads) is not int or original_threads != args.threads):
+            parser.error(f"Study configuration or original provenance is incompatible: {output}")
+        if not cache_exists:
+            for split in ("train", "validation"):
+                record = manifest["splits"][split]
+                metadata = record.get("metadata")
+                if not isinstance(metadata, dict):
+                    continue
+                count = len(record["image_ids"])
+                limit = metadata.get("max_samples")
+                population = metadata.get("partition_size")
+                if type(population) is int and population == count and type(limit) is int and limit > count:
+                    parser.error(f"The original {split} cache used --max-{split}={limit} for {count} available "
+                                 f"images. Resume with the original or identically rebuilt cache and --max-{split}={count}")
+        manifest = prepare_cache(*cache_args)
+        if _digest(manifest) != config["data_manifest_sha256"]:
+            parser.error(f"Verified data differ from the saved study manifest: {output}")
+        expected_hashes = [config_hash, config["data_manifest_sha256"], _digest(origin)]
+        if [_digest(record) for record in _resume_records(output, check_writers=True)] != expected_hashes:
+            raise ValueError(f"Study metadata changed during startup: {output}")
     chunks = chunks_for_models(models)
     jobs = [(str(args.data_cache.resolve()), str(output.resolve()), attribute, name, chunk_id, grid,
              settings, args.seed, args.threads, config["script_sha256"])
             for name, chunk_id, grid in chunks for attribute in ATTRIBUTES]
     print(f"Run: {output.resolve()}\nExplicit training-CV chunks: {len(jobs)}; workers={args.workers}, threads={args.threads}", flush=True)
-    start = time.perf_counter()
     completed = []
-    for record in _completed_or_spawned(jobs, args.workers):
-        completed.append(record)
-        write_json(output / "progress.json", {"completed_chunks": len(completed), "total_chunks": len(jobs), "chunks": completed})
-        print(f"{len(completed)}/{len(jobs)} {record['attribute']} {record['method']} {record['chunk']}: "
-              f"{record['valid_candidates']}/{record['candidates']} valid", flush=True)
-    calibration_wall_seconds = time.perf_counter() - start
-    results = aggregate_and_evaluate(output, args.data_cache, models, manifest, args.threads, config)
+    directories = [output / attribute / name / chunk_id for _, _, attribute, name, chunk_id, *_ in jobs]
+    pins = _frozen_study_cv(output, config, directories)
+    records = (_completed_or_spawned(jobs, args.workers) if pins is None
+               else _completed_or_spawned(jobs, args.workers, _pins=pins))
+    with _cv_wall_attempt(output, _digest(config),
+                          active=pins is None and _cv_work_pending(directories, (job[5] for job in jobs)),
+                          preexisting_work=any(path.exists() for path in directories),
+                          workers=args.workers, native_threads=args.threads) as cv_timing:
+        for record in records:
+            completed.append(record)
+            write_json(output / "progress.json", {"completed_chunks": len(completed), "total_chunks": len(jobs), "chunks": completed})
+            print(f"{len(completed)}/{len(jobs)} {record['attribute']} {record['method']} {record['chunk']}: "
+                  f"{record['valid_candidates']}/{record['candidates']} valid", flush=True)
+    _seal_study_cv(output, config, directories)
+    results = aggregate_and_evaluate(output, args.data_cache, models, manifest, config["final_native_threads"], config)
     write_json(output / "comparison.json", {"author": "Chang Cheng", "attributes": results,
-        "calibration_call_wall_seconds": calibration_wall_seconds,
+        "calibration_call_wall_seconds": cv_timing["cv_wall_seconds_this_invocation"],
+        "cv_wall_seconds_this_invocation": cv_timing["cv_wall_seconds_this_invocation"],
+        "cv_wall_seconds_cumulative": cv_timing["cv_wall_seconds_cumulative"],
+        "cv_wall_seconds_recorded": cv_timing["cv_wall_seconds_recorded"],
         "tuning_complete": False, "defaults_frozen": False, "official_test_loaded": False,
         "timing_note": "Chunk compute times count shared fits once; simultaneous worker times are not wall time.",
         "replications": 1, "role": "explicit_grid_development_comparison"})

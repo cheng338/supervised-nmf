@@ -175,6 +175,20 @@ def test_completed_final_result_precedes_missing_model_state(case):
     assert hashes(case.output) == before
 
 
+@pytest.mark.parametrize("policy", ["off", "all"])
+def test_ineligible_method_has_no_measured_final_fit(case, policy):
+    report = receipt(case.report)
+    for candidate in report["candidates"]:
+        candidate.update(valid=False, mean_balanced_accuracy=None)
+    study.write_json(case.report, {"payload": report, "sha256": study._digest(report)})
+    case.config["final_fit_recovery"] = policy
+    with patch.object(KNeighborsClassifier, "fit", side_effect=AssertionError("ineligible final fit")):
+        result = aggregate(case)
+    assert result["evaluation"]["status"] == "held"
+    assert result["final_fit_seconds"] is None
+    assert "fit_execution" not in result and "prediction_execution" not in result
+
+
 def test_corrupt_final_result_does_not_fall_back_to_a_model_checkpoint(case):
     case.config["final_fit_recovery"] = "all"
     aggregate(case)

@@ -38,7 +38,7 @@ import scipy
 from scipy import linalg
 from scipy.optimize import nnls
 
-from ._aocl import nnls_matmul
+from ._aocl import _uses_native_product, nnls_matmul
 
 
 # The acceleration guard is intentionally much stricter than SPA's modelling
@@ -55,6 +55,7 @@ _FACTOR_CACHE_LIMIT = 128
 _MIN_EXPONENT = -450
 _MAX_EXPONENT = 450
 _MAX_SCALED_DIMENSION = 2**32
+_MAX_QUALIFICATION_VALUE = 2.0**_MAX_EXPONENT
 
 
 _QR_ORIGINAL_QR = linalg.qr
@@ -314,16 +315,41 @@ def _qualified_rows(design, targets, coefficients, *, matmul=np.matmul, cross_sc
         gradient = matmul(design.T, residual)
         if cross_scale is None:
             cross_scale = matmul(design.T, np.abs(targets))
+        # The original test adds a nonnegative roundoff allowance. If every
+        # feasible column already passes the smaller tolerance, we only need
+        # to establish that the original allowance would have been finite.
+        absolute_projected = None
+        if (_uses_native_product(matmul, np)
+                and type(design) is np.ndarray and type(targets) is np.ndarray
+                and type(coefficients) is np.ndarray and type(cross_scale) is np.ndarray
+                and design.size and design.dtype == targets.dtype == coefficients.dtype == cross_scale.dtype == np.float64):
+            projected = np.where((coefficients > 0) | (gradient < 0), gradient, 0.0)
+            lower = 1e-12 * cross_scale
+            absolute_projected = np.abs(projected)
+            within = (absolute_projected <= lower).all(axis=0)
+            # On this domain every feasible-column product is bounded by
+            # 2**32 * 2**450 * (2 * 2**450), comfortably inside float64.
+            if ((within | ~feasible).all() and np.isfinite(lower).all()
+                    and max(design.shape) <= _MAX_SCALED_DIMENSION and design.min() >= 0
+                    and design.max() <= _MAX_QUALIFICATION_VALUE and fitted.max(initial=0.) <= _MAX_QUALIFICATION_VALUE
+                    and targets.min(initial=0.) >= 0 and targets.max(initial=0.) <= _MAX_QUALIFICATION_VALUE):
+                active_rhs = np.any(targets != 0, axis=0)
+                return feasible & (~active_rhs | np.any(cross_scale >= np.finfo(float).tiny, axis=0))
         roundoff_input = np.abs(fitted)
         roundoff_input += np.abs(targets)
         roundoff_scale = matmul(design.T, roundoff_input)
-        tolerance = (1e-12 * cross_scale
-                     + 64 * np.finfo(float).eps * max(design.shape) * roundoff_scale)
-        projected = np.where((coefficients > 0) | (gradient < 0), gradient, 0.0)
+        if absolute_projected is None:
+            tolerance = (1e-12 * cross_scale
+                         + 64 * np.finfo(float).eps * max(design.shape) * roundoff_scale)
+            projected = np.where((coefficients > 0) | (gradient < 0), gradient, 0.0)
+        else:
+            tolerance = lower + 64 * np.finfo(float).eps * max(design.shape) * roundoff_scale
         finite = (np.isfinite(gradient).all(axis=0)
                   & np.isfinite(tolerance).all(axis=0)
                   & np.isfinite(residual).all(axis=0))
-        kkt = (np.abs(projected) <= tolerance).all(axis=0)
+        if absolute_projected is None:
+            absolute_projected = np.abs(projected)
+        kkt = (absolute_projected <= tolerance).all(axis=0)
         # Underflow of a nonzero nonnegative RHS must not certify a zero
         # solution merely because both products rounded down to zero.
         active_rhs = np.any(targets != 0, axis=0)

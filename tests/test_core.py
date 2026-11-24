@@ -77,6 +77,24 @@ class ScreeningTests(CoreTestCase):
                 expected = sklearn_selector.get_support()
                 np.testing.assert_array_equal(_percentile_support(scores, np.ones(scores.size, bool), percentile), expected)
 
+    def test_percentile_breaks_only_equal_computed_magnitudes_by_index(self):
+        # Scaling gives a standard error of 1/2 in both columns.
+        extent, level = 2**54, 2**51
+        X = np.array([[0, 0], [extent, extent], [level, level], [level, level]], dtype=np.float64)
+        y = [0, 0, 1, 1]
+        screen = BinaryScreening(screening="percentile", percentile=50)
+        screen.fit(X, y)
+        np.testing.assert_array_equal(np.abs(screen.t_scores_), [0.75, 0.75])
+        np.testing.assert_array_equal(screen.get_support(indices=True), [0])
+        X[2:, 0] += 1
+        screen.fit(X, y)
+        np.testing.assert_array_equal(np.abs(screen.t_scores_), [np.nextafter(0.75, 0), 0.75])
+        np.testing.assert_array_equal(screen.get_support(indices=True), [1])
+        # At 25% the cutoff lies between the two ranks. Interpolating raw
+        # magnitudes here would round the cutoff up to the higher magnitude.
+        screen.set_params(percentile=25).fit(X, y)
+        np.testing.assert_array_equal(screen.get_support(indices=True), [1])
+
     def test_inclusive_absolute_t_threshold(self):
         probe = BinaryScreening(screening="percentile", percentile=100).fit(self.X, self.y)
         index = int(np.argsort(np.abs(probe.t_scores_))[-2])

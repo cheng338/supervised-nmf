@@ -43,7 +43,9 @@ def data():
 
 
 def call(directory, data, *, reuse=False, grid=None, **kwargs):
-    fn = study._reuse_calibration_knn_grid if reuse else study.calibration_knn_grid
+    fn = study._calibration_knn_grid if reuse else study.calibration_knn_grid
+    if reuse:
+        kwargs['_reuse_only'] = True
     return fn(KNeighborsClassifier(), grid or {"n_neighbors": [1, 3]}, *data,
               cv=3, seed=17, threads=1, checkpoint_dir=directory, **kwargs)
 
@@ -208,25 +210,39 @@ def test_default_source_context_mismatch_defers_before_loading_data():
 
 
 
+def _worker_files(directory, attribute):
+    X = np.arange(12, dtype=np.float32).reshape(4, 3)
+    np.save(directory / "train-X.npy", X)
+    np.save(directory / f"train-{attribute}-y.npy", [0, 1, 0, 1])
+    return X
+
+
+def _assert_detached_snapshot(directory, array, expected):
+    # A caller may retain its read-only array while the original file is replaced.
+    owner = array
+    while isinstance(owner, np.ndarray):
+        assert getattr(owner, "_mmap", None) is None
+        owner = owner.base
+    assert not array.flags.writeable
+    original = directory / "train-X.npy"
+    original.rename(directory / "original.npy")
+    np.save(original, np.zeros_like(expected))
+    np.testing.assert_array_equal(array, expected)
+
+
 @pytest.mark.parametrize("platform", ["linux", "win32", "darwin"])
-def test_default_missing_probe_closes_mapping_and_defers_tail_check(monkeypatch, platform):
+def test_default_missing_probe_detaches_input_and_defers_tail_check(monkeypatch, platform, tmp_path):
     monkeypatch.setattr(DEFAULT.sys, "platform", platform)
-    class Mapping:
-        class Mmap:
-            closed = False
-            def close(self): self.closed = True
-        _mmap = Mmap()
-    X = Mapping()
+    expected_X = _worker_files(tmp_path, "a")
     expected = {"runtime": "worker"}
-    work = ("output", {"job": {"id": "job", "cache": "cache", "attribute": "a", "seed": 17}},
+    work = ("output", {"job": {"id": "job", "cache": str(tmp_path), "attribute": "a", "seed": 17}},
             {"id": "chunk", "grid": {}}, expected)
     with patch.object(DEFAULT, "_source_identity", return_value=expected), \
             patch.object(DEFAULT, "_check_source", side_effect=AssertionError("incomplete probe has no tail check")), \
-            patch.object(DEFAULT.np, "load", side_effect=[X, object()]), \
             patch.object(DEFAULT, "_estimator", return_value=object()), \
-            patch.object(DEFAULT, "_reuse_calibration_knn_grid", return_value=None):
+            patch.object(study, "_calibration_knn_grid", return_value=None) as calibrate:
         assert DEFAULT._worker(work, reuse_only=True) is None
-    assert X._mmap.closed
+    _assert_detached_snapshot(tmp_path, calibrate.call_args.args[2], expected_X)
 
 
 
@@ -253,27 +269,21 @@ def test_invalid_terminal_folds_are_reused_without_retry(tmp_path, data):
 @pytest.mark.parametrize("platform", ["linux", "win32", "darwin"])
 @pytest.mark.parametrize("error", [False, True])
 @pytest.mark.parametrize("reuse_only", [False, True])
-def test_parameter_worker_mapping_lifecycle_is_linux_scoped(monkeypatch, platform, error, reuse_only):
+def test_parameter_worker_keeps_detached_input_valid(monkeypatch, platform, error, reuse_only, tmp_path):
     monkeypatch.setattr(PARAMETER.sys, "platform", platform)
-    class Mapping:
-        class Mmap:
-            closed = False
-            def close(self): self.closed = True
-        _mmap = Mmap()
-    X = Mapping()
-    job = ("cache", "output", "attribute", "method", "chunk", {}, {}, 17, 1, "source")
+    expected_X = _worker_files(tmp_path, "attribute")
+    job = (str(tmp_path), "output", "attribute", "method", "chunk", {}, {}, 17, 1, "source")
     with patch.object(PARAMETER, "_source_hash", return_value="source"), \
-            patch.object(PARAMETER.np, "load", side_effect=[X, object()]), \
             patch.object(PARAMETER, "study_models", return_value={"method": (object(), {})}), \
-            patch.object(PARAMETER, "_reuse_calibration_knn_grid" if reuse_only else "calibration_knn_grid",
+            patch.object(study, "_calibration_knn_grid",
                          return_value=None if reuse_only else {"candidates": [], "unique_representation_fits": 0,
                              "tuning_seconds": 0.0, "new_representation_fits": 0, "reused_representation_folds": 3},
-                         side_effect=ValueError("validation") if error else None):
+                         side_effect=ValueError("validation") if error else None) as calibrate:
         if error:
             with pytest.raises(ValueError, match="validation"):
                 PARAMETER._worker(job, reuse_only=reuse_only)
         else:
             result = PARAMETER._worker(job, reuse_only=reuse_only)
             assert (result is None) is reuse_only
-    assert X._mmap.closed is (platform == "linux")
+    _assert_detached_snapshot(tmp_path, calibrate.call_args.args[2], expected_X)
 

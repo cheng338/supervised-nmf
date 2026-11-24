@@ -24,6 +24,7 @@ def main():
     args = parser.parse_args()
     if args.output.exists():
         raise FileExistsError('Preserve previous verification receipts')
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     rng = np.random.RandomState(23)
     y = np.arange(80) % 2
     coordinates = rng.uniform(.1, 1, (80, 2))

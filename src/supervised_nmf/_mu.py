@@ -12,12 +12,14 @@ from scipy.special import logsumexp
 from sklearn.decomposition import NMF
 from sklearn.exceptions import ConvergenceWarning
 
+from ._mu_dispatch import initial_or_restored_transform, native_projection
+
 
 _CappedPrefix = namedtuple("_CappedPrefix", "count coordinates")
 _SuffixSetup = namedtuple("_SuffixSetup", "result cache")
 
 
-_NMF_TRANSFORM = NMF.transform
+_NMF_TRANSFORM = vars(NMF).get("transform")
 _DTYPES = (np.dtype(np.float32), np.dtype(np.float64))
 
 
@@ -55,7 +57,7 @@ def _standard_mu_basis(decomposition, selected):
             selected.shape[0] == 0 or selected.shape[1] == 0 or selected.dtype not in _DTYPES):
         return None
     if ("transform" in vars(decomposition) or
-            type(decomposition).transform is not _NMF_TRANSFORM):
+            not initial_or_restored_transform(vars(type(decomposition)).get("transform"))):
         return None
     if not hasattr(decomposition, "init") or hasattr(decomposition, "feature_names_in_"):
         return None
@@ -376,7 +378,7 @@ def _row_log_invariant(cache, key, calculate):
     return value
 
 
-def _project_log_mu(x, h, max_iter, tol, *, _basis_cache=None):
+def _project_log_mu(x, h, max_iter, tol, *, _basis_cache=None, emit_warning=True):
     """Frobenius MU with fixed H and positive products represented by logs.
 
     A uniform initializer and the every-ten-iterations relative-improvement
@@ -444,8 +446,9 @@ def _project_log_mu(x, h, max_iter, tol, *, _basis_cache=None):
     if iteration == max_iter and tol > 0:
         if _basis_cache is not None:
             _basis_cache.clear()
-        warnings.warn(f"Maximum number of iterations {max_iter} reached. "
-                      "Increase it to improve convergence.", ConvergenceWarning, stacklevel=2)
+        if emit_warning:
+            warnings.warn(f"Maximum number of iterations {max_iter} reached. "
+                          "Increase it to improve convergence.", ConvergenceWarning, stacklevel=2)
     return (_rank_one_output(x, h) if len(h) == 1
             else _restore(log_w, x.dtype, row_exponents - basis_exponent))
 
@@ -684,7 +687,7 @@ def _project_float64_mu(decomposition, selected, basis):
     widened = copy(decomposition)
     widened.components_ = basis.astype(np.float64)
     with np.errstate(invalid="raise", divide="raise", over="raise", under="raise"):
-        result = widened.transform(selected.astype(np.float64))
+        result = native_projection(widened, selected.astype(np.float64))
     if (result.shape != (len(selected), basis.shape[0])
             or not np.isfinite(result).all() or np.any(result < 0)
             or np.any(result > np.finfo(selected.dtype).max)):
@@ -753,7 +756,7 @@ def _project_scaled_float64_mu(decomposition, selected, basis, *, _basis_cache=N
     if _basis_cache is not None:
         _basis_cache.clear()
     with np.errstate(invalid="raise", divide="raise", over="raise", under="raise"):
-        result = temporary.transform(scaled_x)
+        result = native_projection(temporary, scaled_x)
     if (result.shape != (len(selected), len(basis))
             or not np.isfinite(result).all() or np.any(result < 0)):
         raise FloatingPointError("Scaled MU coordinates are invalid.")
@@ -777,42 +780,80 @@ def _make_owned_log_sum():
     import importlib
     from pathlib import Path
     import sys
+    from types import CodeType, FunctionType
 
-    SCIPY_VERSION = "1.18.1"
-    NUMPY_VERSION = "2.5.4"
+    QUALIFIED_PAIRS = (("2.5.4", "1.18.1"), ("2.5.2", "1.18.0"))
     SCIPY_SOURCE = (
         "7da908306d6382cd8214628b24f0f753ea035378ff6285276828b7af33c5b101"
     )
+    AT_SOURCE = "313c2b0e3719cfff3efbef1adfb4a40a802850d3254a3a9ce34818beed7c9346"
     VALUE_BOUND = 2.0 ** 60
     COUNT_BOUND = 2 ** 53
     mu = sys.modules[__name__]
     np = mu.np
     scipy = importlib.import_module("scipy")
+    versions = (getattr(np, "__version__", None), getattr(scipy, "__version__", None))
+    qualified_pair = all(type(v) is str for v in versions) and versions in QUALIFIED_PAIRS
     # A diagnostic snapshot, not mutable authority for subsequent admission.
     contract = {
         "scope": (
             "owned native-float64 C products with finite bounded row maxima; "
             "mixed negative infinity admitted"
         ),
-        "numpy": np.__version__,
-        "scipy": scipy.__version__,
-        "required_numpy": NUMPY_VERSION,
-        "required_scipy": SCIPY_VERSION,
+        "numpy": versions[0],
+        "scipy": versions[1],
+        "qualified_numpy_scipy_pairs": QUALIFIED_PAIRS,
+        "required_numpy": versions[0] if qualified_pair else None,
+        "required_scipy": versions[1] if qualified_pair else None,
         "normalized_scipy_source_required": SCIPY_SOURCE,
         "row_max_abs_bound": VALUE_BOUND,
         "feature_count_bound": COUNT_BOUND,
         "admitted_implementation": False,
         "reason": None,
     }
+    def matches_definitions(module, source, path, signatures, *, owner=None):
+        # Compile the fingerprinted source without running decorators or imports.
+        code = compile(source, str(path), "exec", dont_inherit=True)
+        definitions = {c.co_name: c for c in code.co_consts if type(c) is CodeType}
+        if owner is not None:
+            code = definitions[owner.__name__]
+            definitions = {c.co_name: c for c in code.co_consts if type(c) is CodeType}
+        namespace = vars(module if owner is None else owner)
+        for name, defaults, keywords in signatures:
+            function = namespace.get(name)
+            if (type(function) is not FunctionType or function.__globals__ is not vars(module)
+                    or function.__code__ != definitions.get(name)):
+                return False
+            actual = function.__defaults__
+            if defaults is None:
+                if actual is not None:
+                    return False
+            elif (type(actual) is not tuple or len(actual) != len(defaults)
+                    or any(a is not b for a, b in zip(actual, defaults))):
+                return False
+            actual = function.__kwdefaults__
+            if keywords is None:
+                if actual is not None:
+                    return False
+            elif (type(actual) is not dict or len(actual) != len(keywords)
+                    or any(actual.get(key) is not value for key, value in keywords.items())):
+                return False
+        return True
+
+    def regular_source(module):
+        path = Path(module.__file__).resolve()
+        if not path.is_file():
+            raise OSError("optional numerical source is not a regular file")
+        return path, path.read_bytes()
+
     implementation = xp = None
     try:
-        if scipy.__version__ != SCIPY_VERSION or np.__version__ != NUMPY_VERSION:
+        if not qualified_pair:
             contract["reason"] = "unqualified numerical version"
         else:
             implementation = importlib.import_module("scipy.special._logsumexp")
             xp = importlib.import_module("scipy._external.array_api_compat.numpy")
-            scipy_path = Path(implementation.__file__).resolve()
-            scipy_bytes = scipy_path.read_bytes()
+            scipy_path, scipy_bytes = regular_source(implementation)
             contract.update(
                 scipy_source_path=str(scipy_path),
                 scipy_raw_sha256=hashlib.sha256(scipy_bytes).hexdigest(),
@@ -824,54 +865,90 @@ def _make_owned_log_sum():
                     or mu.logsumexp is not implementation.logsumexp):
                 contract["reason"] = "unqualified source or logsumexp binding"
             else:
-                contract["admitted_implementation"] = True
-    except (ImportError, OSError, AttributeError) as error:
+                # The owned arithmetic omits these calls from SciPy's
+                # public reduction. An instrumented export must reach SciPy
+                # even if it was replaced before this package was imported.
+                array_api = importlib.import_module("scipy._lib._array_api")
+                extra = implementation.xpx
+                at_module = importlib.import_module("scipy._external.array_api_extra._lib._at")
+                delegation = importlib.import_module("scipy._external.array_api_extra._delegation")
+                direct_numpy = ("max", "min", "sum", "where", "log1p", "log", "all", "isfinite",
+                                "isdtype", "exp", "abs", "squeeze", "inf", "nan",
+                                "atleast_1d", "result_type")
+                at_path, at_bytes = regular_source(at_module)
+                if hashlib.sha256(at_bytes.replace(b"\r\n", b"\n")).hexdigest() != AT_SOURCE:
+                    raise ValueError("unqualified SciPy indexed-update source")
+                sums = (("logsumexp", (None, None, False, False), None),
+                        ("_logsumexp", None, None),
+                        ("_elements_and_indices_with_max_real", None, {"axis": -1}))
+                updates = (("__init__", (at_module._undef,), None),
+                           ("__getitem__", None, None), ("set", (None, None), None))
+                if (all(getattr(xp, name) is getattr(np, name) for name in direct_numpy)
+                        and type(xp.inf) is float and xp.inf == math.inf
+                        and type(xp.nan) is float and math.isnan(xp.nan)
+                        and all(getattr(xp, name) is getattr(xp._aliases, name)
+                                for name in ("sign", "astype", "asarray"))
+                        # SciPy promotes the input and copies it for its first indexed update.
+                        and np.iterable is np.lib._function_base_impl.iterable
+                        and np.asanyarray is np._core.multiarray.asanyarray
+                        and np.array is np._core.multiarray.array
+                        and implementation.np is np and np.errstate is np._core._ufunc_config.errstate
+                        and all(getattr(np, name) is getattr(np._core.umath, name)
+                                for name in ("add", "subtract", "exp", "sign"))
+                        and all(getattr(implementation, name) is getattr(array_api, name)
+                                for name in ("array_namespace", "xp_promote", "xp_size", "xpx"))
+                        and extra.at is at_module.at and type(extra.at) is type
+                        and extra.atleast_nd is delegation.atleast_nd
+                        and matches_definitions(implementation, scipy_bytes, scipy_path, sums)
+                        and matches_definitions(at_module, at_bytes, at_path, updates, owner=extra.at)):
+                    contract["admitted_implementation"] = True
+                else:
+                    contract["reason"] = "changed SciPy reduction binding"
+    except (ImportError, OSError, AttributeError, KeyError, TypeError, ValueError, RuntimeError, SyntaxError) as error:
         contract["reason"] = "optional implementation unavailable: " + type(error).__name__
-
-    def token(value):
-        keywords = getattr(value, "__kwdefaults__", None)
-        return (
-            value, getattr(value, "__code__", None),
-            getattr(value, "__defaults__", None), keywords,
-            tuple(keywords.items()) if type(keywords) is dict else None,
-        )
-
-    def unchanged(value, saved):
-        if (value is not saved[0] or getattr(value, "__code__", None) is not saved[1]
-                or getattr(value, "__defaults__", None) is not saved[2]):
-            return False
-        keywords = getattr(value, "__kwdefaults__", None)
-        if keywords is not saved[3]:
-            return False
-        if saved[4] is not None:
-            return (type(keywords) is dict and len(keywords) == len(saved[4])
-                    and all(key in keywords and keywords[key] is item
-                            for key, item in saved[4]))
-        return True
 
     admitted = bool(contract["admitted_implementation"])
     watched = []
+    functions = []
     if admitted:
         declarations = [
             (mu, ("np", "logsumexp", "_log_sum", "_log_cross",
                   "_log_cross_reference", "_log_cross_panel")),
             (implementation, (
                 "logsumexp", "_logsumexp", "_elements_and_indices_with_max_real",
-                "array_namespace",
+                "array_namespace", "xp_promote", "xp_size", "xpx", "np",
             )),
-            (np, ("empty", "add", "subtract", "exp", "errstate", "ndarray",
-                  "dtype", "float64", "inf")),
-            (xp, ("max", "min", "astype", "sum", "where", "log1p", "log",
-                  "all", "isfinite", "isdtype")),
+            (extra, ("at", "atleast_nd")),
+            (extra.at, ("__init__", "__getitem__", "set")),
+            (np, ("empty", "add", "subtract", "exp", "sign", "errstate", "ndarray",
+                  "dtype", "float64", "inf", "iterable", "asanyarray", "array")),
+            (xp, (*direct_numpy, "astype", "sign", "asarray")),
         ]
-        for owner, names in declarations:
-            for name in names:
-                watched.append((owner, name, token(getattr(owner, name))))
+        try:
+            for owner, names in declarations:
+                for name in names:
+                    namespace = vars(owner)
+                    value = namespace.get(name)
+                    if value is None:
+                        raise AttributeError(f"{owner.__name__}.{name} is unavailable")
+                    watched.append((namespace, name, value))
+                    if type(value) is FunctionType:
+                        keywords = value.__kwdefaults__
+                        if keywords is not None and type(keywords) is not dict:
+                            raise TypeError("unexpected keyword defaults")
+                        functions.append((value, value.__code__, value.__defaults__, keywords,
+                                          tuple(keywords.items()) if keywords is not None else ()))
+        except (AttributeError, TypeError) as error:
+            admitted = contract["admitted_implementation"] = False
+            contract["reason"] = "optional numerical binding unavailable: " + str(error)
 
     def compatible():
         return (admitted
-                and all(unchanged(getattr(owner, name), saved)
-                        for owner, name, saved in watched))
+                and all(namespace.get(name) is original for namespace, name, original in watched)
+                and all(fn.__code__ is code and fn.__defaults__ is defaults and fn.__kwdefaults__ is keywords
+                        and (keywords is None or (len(keywords) == len(items)
+                             and all(k in keywords and keywords[k] is v for k, v in items)))
+                        for fn, code, defaults, keywords, items in functions))
 
     def owned_sum(products):
         # Only the panel's fresh allocation enters this private closure.
@@ -962,7 +1039,7 @@ def transform_mu(decomposition, selected, *, _basis_cache=None):
             _basis_cache.clear()
         try:
             with np.errstate(invalid="raise", divide="raise", over="raise", under="raise"):
-                return decomposition.transform(selected)
+                return native_projection(decomposition, selected)
         except FloatingPointError:
             pass
     if selected.dtype == np.float32 and not small_input:

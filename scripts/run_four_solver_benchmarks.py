@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -112,45 +113,133 @@ def output_lock(output):
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
+def _protocol_key(selected):
+    """Return the checkout-relative key for this physical protocol file."""
+    path = Path(selected).resolve(strict=True)
+    relative = path.relative_to(ROOT)
+    # Windows path comparisons can fold case even inside a case-sensitive directory.
+    checkout = Path(*path.parts[:len(ROOT.parts)])
+    if not checkout.samefile(ROOT) or not path.samefile(ROOT / relative):
+        raise ValueError(f"Selected protocol {path} does not belong to checkout {ROOT} at {relative}")
+    return relative.as_posix()
+
+
+def _check_archive_root_spelling(archive):
+    """Check the stored name when the filesystem resolves the archive entry."""
+    if os.path.lexists(archive) and archive.name not in os.listdir(archive.parent):
+        raise FileExistsError(f"Archive directory {archive.parent} does not contain the exact name {archive.name!r}")
+
+
+def _archive_children(archive, keys):
+    """List the required child names for each directory using literal path spellings."""
+    children = {str(archive.parent): {archive.name}}
+    for key in keys:
+        parent = archive
+        for name in key.split("/"):
+            children.setdefault(str(parent), set()).add(name)
+            parent = parent / name
+    return children
+
+
+def _archive_files(files, archive):
+    """Copy each selected name to a separate file without writing through an alias."""
+    sources = {path.relative_to(ROOT).as_posix(): path for path in files}
+    live_files = {}
+    for source in sources.values():
+        info = source.stat()
+        live_files[info.st_dev, info.st_ino] = source
+
+    existing_files = {}
+    missing = []
+    existing = []
+    for key, source in sources.items():
+        destination = archive / key
+        try:
+            info = destination.stat()
+        except FileNotFoundError:
+            missing.append((key, source, destination))
+            continue
+        file_id = (info.st_dev, info.st_ino)
+        if file_id in live_files:
+            raise shutil.SameFileError(f"{destination} is a selected source file ({live_files[file_id]})")
+        if file_id in existing_files:
+            raise FileExistsError(f"Archive destinations {existing_files[file_id]} and {destination} share a file")
+        if not stat.S_ISREG(info.st_mode) or destination.is_symlink() or info.st_nlink > 1:
+            raise FileExistsError(f"Archive destination {destination} must be an independent regular file")
+        existing_files[file_id] = destination
+        existing.append((key, source, destination))
+
+    directories = _archive_children(archive, sources)
+    for parent in directories:
+        try:
+            info = os.lstat(parent)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or (
+                os.name == "nt" and info.st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT):
+            raise FileExistsError(f"Archive directory {parent} redirects to another directory")
+
+    # The destination filesystem decides which names can coexist. Create all new
+    # files exclusively before updating any previous, unpublished partial copies.
+    identity = dict.fromkeys(sources)
+
+    def copy_entries(entries, mode):
+        for key, source, destination in entries:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            content = source.read_bytes()
+            with destination.open(mode) as stream:
+                stream.write(content)
+            shutil.copystat(source, destination)
+            identity[key] = hashlib.sha256(content).hexdigest()
+
+    copy_entries(missing, "xb")
+    for parent, names in directories.items():
+        absent = names.difference(os.listdir(parent))
+        if absent:
+            raise FileExistsError(f"Archive directory {parent} does not contain the exact names {sorted(absent)!r}")
+    copy_entries(existing, "wb")
+    return identity
+
+
 def freeze_run(output, fashion_protocol=DEFAULT_FASHION_PROTOCOL, celeba_protocol=DEFAULT_CELEBA_PROTOCOL):
     """Freeze exact selected protocols and sources without starting any fitting."""
     output = Path(output).resolve()
     suppress_crash_dialogs()
     output.mkdir(parents=True, exist_ok=True)
-    fashion_protocol, celeba_protocol = Path(fashion_protocol).resolve(), Path(celeba_protocol).resolve()
-    protocol_paths = {"fashion": fashion_protocol.relative_to(ROOT).as_posix(),
-                      "celeba": celeba_protocol.relative_to(ROOT).as_posix()}
+    protocol_paths = {"fashion": _protocol_key(fashion_protocol), "celeba": _protocol_key(celeba_protocol)}
     files = list((ROOT / "src").rglob("*.py")) + [
         Path(__file__).resolve(), ROOT / "scripts" / "fashion_mnist_study.py",
         ROOT / "scripts" / "celeba_four_solver_study.py",
         ROOT / "scripts" / "experimental_nmf.py",
         ROOT / "scripts" / "report_four_solver_benchmarks.py",
+        ROOT / "scripts" / "_audit_identity.py",
         ROOT / "scripts" / "profile_celeba_stages.py",
         ROOT / "scripts" / "prepare_fashion_mnist.py",
         ROOT / "scripts" / "check_four_solver_training.py",
-        fashion_protocol, celeba_protocol,
-        ROOT / "docs" / "fashion-mnist-protocol.md",
-        ROOT / "docs" / "nmf-solver-comparison.md",
-        ROOT / "docs" / "numerical-repair-20261004.md",
+        ROOT / protocol_paths["fashion"], ROOT / protocol_paths["celeba"],
+        ROOT / "research" / "fashion-mnist-protocol.md",
+        ROOT / "research" / "nmf-solver-comparison.md",
+        ROOT / "research" / "numerical-repair-20261004.md",
     ]
-    identity = {str(path.relative_to(ROOT)).replace("\\", "/"): sha256(path) for path in files}
+    archive = output / "source"
     freeze_path = output / "source-freeze.json"
     if freeze_path.exists():
+        identity = {path.relative_to(ROOT).as_posix(): sha256(path) for path in files}
         freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
         if (freeze["files"] != identity or freeze["python_executable"] != sys.executable
                 or freeze.get("protocol_paths") != protocol_paths):
             raise RuntimeError("Frozen source/environment changed; preserve this run and use a new output directory.")
+        _check_archive_root_spelling(archive)
     else:
-        freeze = {"author": "Chang Cheng", "created_utc": now(), "files": identity,
+        _check_archive_root_spelling(archive)
+        created = now()
+        identity = _archive_files(files, archive)
+        freeze = {"author": "Chang Cheng", "created_utc": created, "files": identity,
                   "protocol_paths": protocol_paths,
                   "error_dialog_policy": ERROR_DIALOG_POLICY,
                   "python_executable": sys.executable, "official_test_loaded": False,
                   "historical_celeba_outcomes_known": True,
                   "fashion_development_validation_outcomes_seen_before_freeze": False}
-        for path in files:
-            destination = output / "source" / path.relative_to(ROOT)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, destination)
         write_json(freeze_path, freeze)
     return freeze
 

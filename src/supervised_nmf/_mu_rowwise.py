@@ -8,6 +8,10 @@ from sklearn.exceptions import ConvergenceWarning
 
 from ._mu import (_CappedPrefix, _SuffixSetup, _standard_mu_basis,
                   _try_log_row_recovery, transform_mu)
+from ._mu_dispatch import QUALIFIED_VERSION, stock_dot
+
+if QUALIFIED_VERSION:
+    from ._mu_updates import check_stop, recover_update, retry_matmul
 
 
 _SUFFIX_CACHE_TRANSFORM = transform_mu
@@ -17,6 +21,27 @@ _SUFFIX_SETUP_TRY = _try_log_row_recovery
 def _direct_row_errors(x, w, h):
     residual = x - w @ h
     return np.sqrt(np.einsum("ij,ij->i", residual, residual))
+
+
+def _row_denominator(current, gram, numerator, tiny, epsilon, flagged, iteration, max_iter, tol):
+    """Repair active tiny products before the ordinary zero substitution."""
+    if tiny is None:
+        denominator = current @ gram
+        denominator[denominator == 0] = epsilon
+        return denominator, False
+    try:
+        denominator = current @ gram
+    except FloatingPointError as error:
+        # A later first exception can affect rows already stopped. Retain
+        # ordered per-row recovery in that case and preserve cap warnings.
+        if tol > 0 and (max_iter <= 10 or (not flagged and iteration > 10)):
+            raise
+        return retry_matmul(current, gram, numerator, tiny, error), True
+    small = denominator < tiny
+    if small.any():
+        recover_update(current, numerator, gram, denominator, small)
+        denominator[denominator == 0] = epsilon
+    return denominator, flagged
 
 
 def _gram_range(values):
@@ -41,11 +66,13 @@ def _gram_error_interval(current, numerator, gram, xnorm, features):
     squared = xnorm - 2 * cross + quadratic
     factor = 64 * np.finfo(np.float64).eps * (features + 2 * current.shape[1] + 8)
     bound = factor * scale
-    # Crossing zero is uncertainty, never a reason to declare exact convergence.
-    valid = squared > bound
+    # A zero lower bound still permits a decision if the full interval clears
+    # the stopping threshold. A nonpositive squared upper bound requires a direct residual.
+    squared_high = squared + bound
+    valid = squared_high > 0
     direct_rounding = factor * np.sqrt(scale)
     low = np.maximum(0, np.sqrt(np.maximum(squared - bound, 0)) - direct_rounding)
-    high = np.sqrt(np.maximum(squared + bound, 0)) + direct_rounding
+    high = np.sqrt(np.maximum(squared_high, 0)) + direct_rounding
     return low, high, valid
 
 
@@ -68,6 +95,8 @@ def _ordinary_rows_cached(x, h, max_iter, tol):
         active = initial != 0
         # Match the ordinary MU recurrence's treatment of zero denominators.
         epsilon = np.finfo(np.float32).eps
+        tiny = np.finfo(x.dtype).tiny if QUALIFIED_VERSION and stock_dot() else None
+        flagged = False
         for block_start in range(1, max_iter + 1, 10):
             indices = np.flatnonzero(active)
             if not len(indices):
@@ -78,8 +107,8 @@ def _ordinary_rows_cached(x, h, max_iter, tol):
             active_numerator = numerator[indices]
             block_end = min(block_start + 9, max_iter)
             for iteration in range(block_start, block_end + 1):
-                denominator = current @ gram
-                denominator[denominator == 0] = epsilon
+                denominator, flagged = _row_denominator(
+                    current, gram, active_numerator, tiny, epsilon, flagged, iteration, max_iter, tol)
                 current *= active_numerator / denominator
                 if not np.isfinite(current).all() or np.any(current < 0):
                     raise FloatingPointError("Rowwise MU produced invalid coordinates.")
@@ -88,9 +117,14 @@ def _ordinary_rows_cached(x, h, max_iter, tol):
             if tol > 0 and block_end % 10 == 0:
                 residual = x[indices] - current @ h
                 error = np.sqrt(np.einsum("ij,ij->i", residual, residual))
-                stopped = (previous[indices] - error) / initial[indices] < tol
+                ratio = (previous[indices] - error) / initial[indices]
+                if flagged:
+                    check_stop(previous[indices], error, initial[indices], ratio, tol, x[indices], len(h))
+                stopped = ratio < tol
                 active[indices[stopped]] = False
                 previous[indices] = error
+    if flagged and tol > 0 and np.any(iterations == max_iter):
+        raise FloatingPointError("Retain capped rowwise warning order")
     return w, iterations
 
 
@@ -116,6 +150,8 @@ def _ordinary_rows_gram(x, h, max_iter, tol):
         iterations = np.zeros(len(x), dtype=np.int64)
         active = initial != 0
         epsilon = np.finfo(np.float32).eps
+        tiny = np.finfo(x.dtype).tiny if QUALIFIED_VERSION and stock_dot() else None
+        flagged = False
         # Small/narrow, non-double and extreme domains retain the direct path.
         eligible = (tol > 0 and x.dtype == np.float64 and h.dtype == np.float64
                     and 64 <= x.shape[1] <= 2 ** 20 and len(h) <= 2 ** 12
@@ -129,8 +165,8 @@ def _ordinary_rows_gram(x, h, max_iter, tol):
             active_numerator = numerator[indices]
             block_end = min(block_start + 9, max_iter)
             for iteration in range(block_start, block_end + 1):
-                denominator = current @ gram
-                denominator[denominator == 0] = epsilon
+                denominator, flagged = _row_denominator(
+                    current, gram, active_numerator, tiny, epsilon, flagged, iteration, max_iter, tol)
                 current *= active_numerator / denominator
                 if not np.isfinite(current).all() or np.any(current < 0):
                     raise FloatingPointError("Rowwise MU produced invalid coordinates.")
@@ -138,7 +174,7 @@ def _ordinary_rows_gram(x, h, max_iter, tol):
             iterations[indices] = block_end
             if tol > 0 and block_end % 10 == 0:
                 fallback = True
-                if eligible and _gram_range(current):
+                if eligible and not flagged and _gram_range(current):
                     try:
                         low, high, valid = _gram_error_interval(
                             current, active_numerator, gram, xnorm[indices], x.shape[1])
@@ -149,7 +185,10 @@ def _ordinary_rows_gram(x, h, max_iter, tol):
                         # rounding. Ambiguity falls back for the entire active block.
                         stopped = previous_high[indices] - low < threshold - rounding
                         continued = previous_low[indices] - high > threshold + rounding
-                        fallback = not np.all(valid & (stopped | continued))
+                        # For a continuing row whose interval reaches zero, store a direct error
+                        # if its upper endpoint is still near or above the stopping threshold.
+                        usable = (low > 0) | (high < threshold - rounding)
+                        fallback = not np.all(valid & (stopped | (continued & usable)))
                     except FloatingPointError:
                         # The shortcut introduces arithmetic such as tol*initial.
                         # Its range failure must not change the established solver
@@ -163,7 +202,10 @@ def _ordinary_rows_gram(x, h, max_iter, tol):
                         old_error = _direct_row_errors(
                             x[previous_indices], previous_coordinates, h)
                         previous[indices] = old_error[np.searchsorted(previous_indices, indices)]
-                    stopped = (previous[indices] - error) / initial[indices] < tol
+                    ratio = (previous[indices] - error) / initial[indices]
+                    if flagged:
+                        check_stop(previous[indices], error, initial[indices], ratio, tol, x[indices], len(h))
+                    stopped = ratio < tol
                     low = high = error
                 else:
                     error = (low + high) / 2
@@ -171,6 +213,8 @@ def _ordinary_rows_gram(x, h, max_iter, tol):
                 previous[indices] = error
                 previous_low[indices], previous_high[indices] = low, high
                 previous_indices, previous_coordinates = indices, current.copy()
+    if flagged and tol > 0 and np.any(iterations == max_iter):
+        raise FloatingPointError("Retain capped rowwise warning order")
     return w, iterations
 
 
@@ -187,21 +231,28 @@ def _ordinary_rows_single(x, h, max_iter, tol):
         if initial[0] == 0:
             return current, np.zeros(1, dtype=np.int64)
         epsilon = np.finfo(np.float32).eps
+        tiny = np.finfo(x.dtype).tiny if QUALIFIED_VERSION and stock_dot() else None
+        flagged = False
         for block_start in range(1, max_iter + 1, 10):
             block_end = min(block_start + 9, max_iter)
             for iteration in range(block_start, block_end + 1):
-                denominator = current @ gram
-                denominator[denominator == 0] = epsilon
+                denominator, flagged = _row_denominator(
+                    current, gram, numerator, tiny, epsilon, flagged, iteration, max_iter, tol)
                 current *= numerator / denominator
                 if not np.isfinite(current).all() or np.any(current < 0):
                     raise FloatingPointError("Rowwise MU produced invalid coordinates.")
             if tol > 0 and block_end % 10 == 0:
                 residual = x - current @ h
                 error = np.sqrt(np.einsum("ij,ij->i", residual, residual))
-                stopped = (previous - error) / initial < tol
+                ratio = (previous - error) / initial
+                if flagged:
+                    check_stop(previous, error, initial, ratio, tol, x, len(h))
+                stopped = ratio < tol
                 if stopped[0]:
                     break
                 previous = error
+    if flagged and tol > 0 and block_end == max_iter:
+        raise FloatingPointError("Retain capped rowwise warning order")
     return current, np.full(1, block_end, dtype=np.int64)
 
 

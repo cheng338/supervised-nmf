@@ -21,6 +21,19 @@ class FrozenEvaluationGates(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
+    def test_prepare_and_execute_require_reservation_before_reading_stage_two(self):
+        argv = ["frozen", "--comparison", "comparison", "--decision", "decision", "--freeze", "freeze",
+                "--images", "images", "--attributes", "attributes", "--partitions", "partitions"]
+        for options in (["--prepare-freeze"], ["--output", str(self.root / "output")]):
+            with (self.subTest(options=options), patch.object(sys, "argv", argv + options),
+                  patch.object(final, "_timing_study_lock", side_effect=RuntimeError("reserved")),
+                  patch.object(final, "_validate_freeze") as validate, patch.object(final, "_stage2") as stage,
+                  patch.object(final, "prepare_freeze") as prepare, self.assertRaisesRegex(RuntimeError, "reserved")):
+                final.main()
+            prepare.assert_not_called()
+            stage.assert_not_called()
+            validate.assert_not_called()
+
     def test_incomplete_gate_cannot_call_test_loader(self):
         freeze = {"job_ids": [f"j{i}" for i in range(8)]}
         gate = {"freeze_sha256": _digest(freeze), "job_ids": freeze["job_ids"],

@@ -219,11 +219,19 @@ def _qr_mkl_controller():
                 unsupported = True
                 continue
             cls, info, threads, setter, property_ = entry
+            namespace = type.__getattribute__(cls, "__dict__")
+            user_api, internal_api = namespace.get("user_api"), namespace.get("internal_api")
+            api_pair = (("blas", "mkl") if cls is _QR_DISCOVERY_CLASSES[2]
+                        else ("openmp", "openmp"))
+            if (type(user_api) is not str or type(internal_api) is not str
+                    or (user_api, internal_api) != api_pair):
+                return None
             if (any(_qr_raw_class_attribute(cls, name) is not expected for name, expected in
-                    (("info", info), ("get_num_threads", threads),
+                    (("dynlib", None), ("info", info), ("get_num_threads", threads),
                      ("set_num_threads", setter), ("num_threads", property_)))
                     or any(name in library_state for name in
-                           ("info", "get_num_threads", "set_num_threads", "num_threads"))):
+                           ("info", "get_num_threads", "set_num_threads", "num_threads",
+                            "user_api", "internal_api"))):
                 return None
             has_mkl = has_mkl or cls is _QR_LIBRARY_METHODS[0][0]
         if "libomp" in prefixes and "libiomp" in prefixes:

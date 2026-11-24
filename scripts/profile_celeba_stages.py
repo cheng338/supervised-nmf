@@ -34,17 +34,17 @@ from sklearn.decomposition import NMF, PCA
 from sklearn.dummy import DummyClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
-from threadpoolctl import threadpool_limits
 
 from supervised_nmf.classifier import NMFClassifier
 from supervised_nmf import classifier as classifier_module
 from supervised_nmf.decomposition import FeatureSPA
 from supervised_nmf.evaluation import (
-    _diagnostics, _digest, _nonconverged, _warning_records,
+    _SerialTimingError, _check_serial_workers, _diagnostics, _digest, _nonconverged, _timing_study_lock, _warning_records,
     comparison_models, data_fingerprint, evaluate_classifier,
     new_run_directory, provenance, write_json,
 )
 from supervised_nmf.screening import BinaryScreening
+from supervised_nmf.study import _time_study_fit
 
 _SOURCE_SHA256_AT_IMPORT = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
@@ -211,27 +211,25 @@ def profile_selected_estimator(estimator, X, y, Xv, yv, *, reference, sample_ids
     are held to one thread; no multiprocessing or model selection occurs here.
     """
     _supported(estimator)
+    _check_serial_workers(estimator)
     model = clone(estimator)
     record = {"status": "failed", "exact_prediction_match": False,
               "timing": {"total_fit_seconds": None, "prediction_seconds": None},
               "fit_warnings": [], "evaluation": None}
     caught = []
-    with threadpool_limits(limits=1), _StageProfiler() as meter:
+    with _StageProfiler() as meter:
         try:
-            start = time.perf_counter()
-            try:
-                with warnings.catch_warnings(record=True) as caught:
-                    warnings.simplefilter("always")
-                    model.fit(X, y)
-            finally:
-                record["timing"]["total_fit_seconds"] = time.perf_counter() - start
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                _time_study_fit(model, X, y, record, profile=True)
             record["diagnostics"] = _diagnostics(model)
             if _nonconverged(model, caught):
                 record["status"] = "nonconverged"
                 record["reason"] = "Additional profiling fit did not converge; no validation prediction made."
             else:
                 meter.phase = "prediction"
-                evaluation = evaluate_classifier(model, Xv, yv, threads=1, sample_ids=sample_ids)
+                evaluation = evaluate_classifier(model, Xv, yv, threads=1, sample_ids=sample_ids,
+                                                 _serial_timing=record.setdefault("prediction_execution", {}))
                 record["evaluation"] = evaluation
                 record["timing"]["prediction_seconds"] = evaluation.get("prediction_seconds")
                 if evaluation["status"] != "valid":
@@ -243,6 +241,8 @@ def profile_selected_estimator(estimator, X, y, Xv, yv, *, reference, sample_ids
                     record["reproducibility"] = check
                     record["exact_prediction_match"] = check["exact_match"]
                     record["status"] = "valid" if check["exact_match"] else "prediction_mismatch"
+        except _SerialTimingError:
+            raise
         except Exception as error:
             record.update(status="failed", error_type=type(error).__name__, error=str(error))
         finally:
@@ -265,8 +265,9 @@ def _load_study(run, cache):
     manifest = _read_json(cache / "manifest.json")
     original_environment = _read_json(run / "provenance.json")
     current_environment = provenance(1)
-    if configuration["threads"] != 1:
-        raise ValueError("This profiler requires a main study performed with one native thread.")
+    if (configuration.get("final_workers", 1) != 1
+            or configuration.get("final_native_threads", configuration["threads"]) != 1):
+        raise ValueError("This profiler requires final fits performed with one worker and one native thread.")
     if main.get("official_test_loaded") is not False or manifest.get("official_test_loaded") is not False:
         raise ValueError("Only development studies that did not load official test data are supported.")
     if _digest(manifest) != configuration["data_manifest_sha256"] or manifest != _read_json(run / "data.json"):
@@ -346,6 +347,7 @@ def profile_study(run, cache, *, output=None, repeats=1):
               "repeats_requested": repeats, "workers": 1, "native_threads": 1,
               "official_test_loaded": False, "tuning_complete": False, "defaults_frozen": False,
               "original_calibration_call_wall_seconds": main.get("calibration_call_wall_seconds"),
+              "original_cv_wall_seconds_cumulative": main.get("cv_wall_seconds_cumulative"),
               "records": [], "skipped": skipped,
               "timing_notes": [
                   "Every record is an additional profiling fit, excluded from original CV and final-fit costs.",
@@ -398,7 +400,8 @@ def main():
     parser.add_argument("--output", type=Path, help="Parent for a new unique directory; defaults to RUN/profiles.")
     parser.add_argument("--repeats", type=int, default=1, help="Additional same-seed profiling fits per valid method.")
     args = parser.parse_args()
-    _, report = profile_study(args.run, args.data_cache, output=args.output, repeats=args.repeats)
+    with _timing_study_lock():
+        _, report = profile_study(args.run, args.data_cache, output=args.output, repeats=args.repeats)
     if not report["all_profiled_predictions_match"]:
         raise SystemExit("Profiling finished with numerical failures or prediction mismatches; inspect profiling.json.")
 

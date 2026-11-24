@@ -9,6 +9,7 @@ from sklearn.preprocessing import StandardScaler
 
 from supervised_nmf import NMFClassifier
 from supervised_nmf._neighbors import _KNNQueryReuse
+from tests.test_neighbor_full_membership import native_queries
 
 
 def near_tie_data():
@@ -161,7 +162,7 @@ def test_overflowed_neighbor_distances_force_public_batch_fallback(probabilities
     query = np.zeros((2, 1))
     models = {k: KNeighborsClassifier(n_neighbors=k, weights="uniform", algorithm="kd_tree").fit(X, y)
               for k in (3, 5)}
-    shared = _KNNQueryReuse(models, query)
+    shared = _KNNQueryReuse(models, query, _head_fit_input=X)
     with np.errstate(invalid="raise"):
         predicted, metadata, _ = shared.predict(3, probabilities=probabilities)
     expected = models[3].predict_proba(query) if probabilities else models[3].predict(query)
@@ -179,15 +180,13 @@ def test_nonfinite_shared_query_never_qualifies_cached_votes(bad_distance):
     query = np.array([[.1], [8.9]])
     models = {k: KNeighborsClassifier(n_neighbors=k, weights="distance", algorithm="kd_tree").fit(X, y)
               for k in (3, 5)}
-    shared = _KNNQueryReuse(models, query)
-    original = models[5].kneighbors
-
-    def faulty_shared(*args, **kwargs):
-        distances, indices = original(*args, **kwargs)
+    shared = _KNNQueryReuse(models, query, _head_fit_input=X)
+    def faulty_shared(count, result):
+        assert count == 6
+        distances, _ = result
         distances[0, -1] = bad_distance
-        return distances, indices
 
-    with patch.object(models[5], "kneighbors", side_effect=faulty_shared):
+    with native_queries(models, on_shared=faulty_shared):
         predicted, metadata, _ = shared.predict(3)
     np.testing.assert_array_equal(predicted, models[3].predict(query))
     assert not metadata["accelerated"]

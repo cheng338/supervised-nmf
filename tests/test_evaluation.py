@@ -1,6 +1,7 @@
 """Check leakage boundaries, numerical rejection, and audit preservation."""
 
 import json
+from importlib.util import find_spec
 from pathlib import Path
 import tempfile
 import unittest
@@ -13,7 +14,8 @@ from sklearn.dummy import DummyClassifier
 from sklearn.exceptions import ConvergenceWarning
 
 from supervised_nmf.evaluation import (
-    calibration_search, comparison_models, evaluate_classifier, provenance, run_comparison, save_data_manifest, support_recovery,
+    CalibrationFallbackWarning, _checkpoint_file, calibration_search, comparison_models,
+    evaluate_classifier, format_evaluation_summary, provenance, run_comparison, save_data_manifest, support_recovery,
 )
 
 
@@ -117,7 +119,11 @@ class EvaluationTests(unittest.TestCase):
                 self.assertGreaterEqual(result.report["final_fit_seconds"], 0)
 
     def test_nonconverged_candidates_produce_flagged_training_only_fallback(self):
-        result = calibration_search(AuditedClassifier(convergence_warning=True), {}, self.X, self.y)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", CalibrationFallbackWarning)
+            result = calibration_search(AuditedClassifier(convergence_warning=True), {}, self.X, self.y)
+        self.assertEqual([warning.category for warning in caught], [CalibrationFallbackWarning])
+        self.assertEqual(Path(caught[0].filename).resolve(), Path(__file__).resolve())
         self.assertTrue(result.report["is_fallback"])
         self.assertIsInstance(result.estimator, DummyClassifier)
         self.assertIsNone(result.report["selected_parameters"])
@@ -127,11 +133,97 @@ class EvaluationTests(unittest.TestCase):
         self.assertFalse(result.report["defaults_frozen"])
 
     def test_final_fit_failure_is_retained_and_cannot_silently_win(self):
-        result = calibration_search(AuditedClassifier(fail_full_size=60), {}, self.X, self.y)
+        with self.assertWarnsRegex(CalibrationFallbackWarning, "training-majority"):
+            result = calibration_search(AuditedClassifier(fail_full_size=60), {}, self.X, self.y)
         self.assertTrue(result.report["candidates"][0]["valid"])
         self.assertTrue(result.report["is_fallback"])
         self.assertEqual(result.report["final_fit_attempts"][0]["status"], "failed")
         self.assertEqual(result.report["final_fit_attempts"][1]["status"], "fallback")
+
+    def test_only_substituted_models_warn(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", CalibrationFallbackWarning)
+            cv_only = calibration_search(AuditedClassifier(convergence_warning=True), {},
+                                         self.X, self.y, refit=False)
+            deliberate = calibration_search(DummyClassifier(strategy="most_frequent"), {}, self.X, self.y)
+            recovered = calibration_search(AuditedClassifier(), {"fail_full_size": [len(self.y), None]},
+                                           self.X, self.y)
+        self.assertIsNone(cv_only.estimator)
+        self.assertIsNone(cv_only.report["selected_candidate_index"])
+        self.assertIsInstance(deliberate.estimator, DummyClassifier)
+        self.assertFalse(deliberate.report["is_fallback"])
+        self.assertEqual(recovered.report["selected_candidate_index"], 1)
+        self.assertEqual([attempt["status"] for attempt in recovered.report["final_fit_attempts"]],
+                         ["failed", "valid"])
+
+    def test_fallback_notification_follows_checkpoint_commit_and_unlock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "search.json"
+            model = AuditedClassifier(fail_full_size=len(self.y))
+            with warnings.catch_warnings(), self.assertRaises(CalibrationFallbackWarning):
+                warnings.simplefilter("error", CalibrationFallbackWarning)
+                calibration_search(model, {}, self.X, self.y, checkpoint_path=path)
+            saved = json.loads(path.read_bytes())
+            self.assertEqual(saved["state"], "completed")
+            self.assertTrue(saved["is_fallback"])
+            FIT_HISTORY.clear()
+
+            def observe(message, category, *args, **kwargs):
+                self.assertIs(category, CalibrationFallbackWarning)
+                with _checkpoint_file(path):
+                    committed = json.loads(path.read_bytes())
+                self.assertEqual(committed["state"], "completed")
+                self.assertEqual([a["status"] for a in committed["final_fit_attempts"]],
+                                 ["failed", "fallback", "failed", "fallback"])
+
+            with warnings.catch_warnings(), patch.object(warnings, "showwarning", side_effect=observe) as handler:
+                warnings.simplefilter("always", CalibrationFallbackWarning)
+                resumed = calibration_search(model, {}, self.X, self.y, checkpoint_path=path)
+            handler.assert_called_once()
+            self.assertEqual(resumed.report["candidates"], saved["candidates"])
+            self.assertEqual(FIT_HISTORY, [list(range(len(self.y)))])
+
+    def test_evaluation_reports_known_fallback_for_success_and_failure(self):
+        with self.assertWarns(CalibrationFallbackWarning):
+            substitute = calibration_search(AuditedClassifier(convergence_warning=True), {}, self.X, self.y)
+        deliberate = calibration_search(DummyClassifier(strategy="most_frequent"), {}, self.X, self.y)
+        cases = ((substitute, substitute.estimator, True),
+                 (substitute.estimator, substitute.estimator, False),
+                 (deliberate, deliberate.estimator, False))
+        for receiver, fitted, expected in cases:
+            with self.subTest(receiver=type(receiver).__name__, expected=expected):
+                valid = evaluate_classifier(receiver, self.X, self.y)
+                with patch.object(fitted, "predict", side_effect=ValueError("held-out failure")):
+                    failed = evaluate_classifier(receiver, self.X, self.y)
+                self.assertEqual(valid["status"], "valid")
+                self.assertEqual(failed["status"], "failed")
+                self.assertEqual(failed["error"], "held-out failure")
+                for report in (valid, failed):
+                    self.assertIs(report.get("is_fallback"), True if expected else None)
+                    self.assertEqual("training-majority fallback" in format_evaluation_summary(report), expected)
+
+    @unittest.skipUnless(find_spec("pandas") is not None, "named validation requires pandas")
+    def test_named_validation_fallback_comparison_keeps_one_flag_on_resume(self):
+        import pandas as pd
+        valid = pd.DataFrame(self.X, columns=["row", "constant"])
+        models = {"audited": (AuditedClassifier(convergence_warning=True), {})}
+        for serial in (False, True):
+            with self.subTest(serial=serial), tempfile.TemporaryDirectory() as directory, warnings.catch_warnings():
+                warnings.simplefilter("error", CalibrationFallbackWarning)
+                options = dict(output_dir=directory, serial_final=serial, threads=1, seed=9)
+                first = run_comparison(models, self.X, self.y, valid, self.y, **options)
+                path = Path(directory) / "audited-evaluation.json"
+                original = path.read_bytes()
+                record = json.loads(original)
+                self.assertTrue(record["is_fallback"])
+                self.assertEqual(record["evaluation"]["status"], "valid")
+                self.assertNotIn("is_fallback", record["evaluation"])
+                self.assertIn("training-majority fallback", format_evaluation_summary(record))
+                FIT_HISTORY.clear()
+                resumed = run_comparison(models, self.X, self.y, valid, self.y, **options)
+                self.assertEqual(resumed, first)
+                self.assertEqual(path.read_bytes(), original)
+                self.assertEqual(FIT_HISTORY, [])
 
     def test_resume_preserves_folds_and_rejects_changed_input(self):
         with tempfile.TemporaryDirectory() as directory:

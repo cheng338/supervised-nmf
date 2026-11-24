@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fractions import Fraction
+import operator
 import sys
 import math
 from numbers import Integral
@@ -43,6 +44,30 @@ def _native_key_format():
                   numerator_limit, denominator_exponent_max)
         _NATIVE_KEY_FORMAT = cached
     return cached
+
+
+def _rank_count(value):
+    """Resolve an integral dimension consistently for slicing and estimator int conversions."""
+    if type(value) is int:
+        return value
+    if isinstance(value, np.integer) and type(value) is value.dtype.type:
+        return int(value)
+    try:
+        count = operator.index(value)
+    except (MemoryError, RecursionError):
+        raise
+    except Exception:
+        # A custom Integral can implement just one usable conversion.
+        return int(value)
+    try:
+        declared = int(value)
+    except (MemoryError, RecursionError):
+        raise
+    except Exception:
+        return count
+    if declared != count:
+        raise ValueError("Conflicting integer and index conversions for a rank.")
+    return count
 
 
 def _validate_threads(value):

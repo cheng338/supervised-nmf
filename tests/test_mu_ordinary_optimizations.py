@@ -163,6 +163,74 @@ def test_gram_envelope_is_used_and_encloses_direct_residual(monkeypatch):
     assert direct_calls == [len(x)]  # Both stopping checks actually used the envelope.
 
 
+@pytest.mark.parametrize("tol, expected_direct_calls, expected_iterations", [
+    (1e-4, 1, 20),  # The first interval is narrow enough to keep.
+    (1e-12, 2, 20),  # Refresh at ten so the second check has an exact previous error.
+    (1., 2, 20),     # A decrease equal to the tolerance continues.
+    (np.nextafter(1., 2.), 2, 10),
+])
+def test_zero_crossing_gram_interval_matches_direct(monkeypatch, tol, expected_direct_calls,
+                                                   expected_iterations):
+    h = np.ones((1, 512))
+    x = np.full((128, 512), 4.)
+    expected = mu._ordinary_rows_cached(x, h, 21, tol)
+    real_direct = mu._direct_row_errors
+    calls = []
+
+    def trace_direct(a, w, b):
+        calls.append(len(a))
+        return real_direct(a, w, b)
+
+    monkeypatch.setattr(mu, "_direct_row_errors", trace_direct)
+    actual = mu._ordinary_rows(x, h, 21, tol)
+    assert_pair_equal(actual, expected)
+    assert np.all(actual[1] == expected_iterations)
+    assert calls == [len(x)] * expected_direct_calls
+
+
+def test_zero_crossing_replay_uses_previous_active_rows(monkeypatch):
+    h = np.ones((1, 512))
+    x = np.full((128, 512), 4.)
+    x[::2, 0] = np.nextafter(4., np.inf)
+    x[1::2, ::2], x[1::2, 1::2] = .5, 1.5
+    expected = mu._ordinary_rows_cached(x, h, 21, 1e-4)
+    real_interval, real_direct = mu._gram_error_interval, mu._direct_row_errors
+    calls = []
+
+    def interval(current, *args):
+        low, high, valid = real_interval(current, *args)
+        if len(current) == len(x):
+            # These rows have a positive direct residual despite the zero lower bound.
+            error = real_direct(x, current, h)
+            assert np.all(valid[::2] & (low[::2] == 0))
+            assert np.all((0 < error[::2]) & (error[::2] <= high[::2]))
+        else:
+            valid[0] = False  # Require a direct check after the odd rows retired.
+        return low, high, valid
+
+    def trace_direct(a, w, b):
+        calls.append(a.copy())
+        return real_direct(a, w, b)
+
+    monkeypatch.setattr(mu, "_gram_error_interval", interval)
+    monkeypatch.setattr(mu, "_direct_row_errors", trace_direct)
+    actual = mu._ordinary_rows(x, h, 21, 1e-4)
+    assert_pair_equal(actual, expected)
+    assert np.all(actual[1][::2] == 20) and np.all(actual[1][1::2] == 10)
+    assert len(calls) == 3
+    for observed, original in zip(calls, (x, x[::2], x)):
+        np.testing.assert_array_equal(observed, original)
+
+
+def test_nonpositive_squared_upper_bound_requires_direct_residual():
+    # Zero scale in row 0 and inconsistent cached products in row 1.
+    current = np.array([[0.], [1.]])
+    numerator = np.array([[0.], [2.]])
+    xnorm = np.array([0., 1.])
+    _, _, valid = mu._gram_error_interval(current, numerator, np.ones((1, 1)), xnorm, 512)
+    assert not valid.any()
+
+
 @pytest.mark.parametrize("side", ["below", "equal", "above"])
 def test_uncertain_second_check_restores_previous_full_block(monkeypatch, side):
     x, h = operands()

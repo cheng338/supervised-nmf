@@ -8,8 +8,10 @@ import io
 import json
 import math
 import os
+from contextlib import closing, contextmanager
 from pathlib import Path
 import re
+import stat
 import time
 import uuid
 import zipfile
@@ -146,6 +148,80 @@ def _event_hook(stage, details):
     """Private interruption boundary; no-op ordinarily."""
 
 
+def _entry_exists(path):
+    # lstat includes dangling symlinks and propagates lookup errors.
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+class _ClosingPayloadResource(closing):
+    """Close a read resource while preserving an abort already escaping its body."""
+
+    def __exit__(self, exc_type, error, traceback):
+        try:
+            super().__exit__(exc_type, error, traceback)
+        except BaseException:
+            if error is None or (isinstance(error, Exception) and not isinstance(error, MemoryError)):
+                raise
+
+
+class _ClosingEventFile(closing):
+    """Keep the original failure unless cleanup has a stronger effect on the caller."""
+
+    def __init__(self, resource, *, publication=False):
+        super().__init__(resource)
+        self.publication = publication
+
+    def _priority(self, error):
+        if not isinstance(error, Exception):  # An interruption must reach the caller.
+            return 3
+        if isinstance(error, MemoryError):
+            return 2
+        if self.publication and isinstance(error, OSError):  # Optional before commit.
+            return 0
+        return 1
+
+    def __exit__(self, exc_type, error, traceback):
+        try:
+            self._close()
+        except BaseException as close_error:
+            if error is None or self._priority(close_error) > self._priority(error):
+                raise
+
+    def _close(self):
+        self.thing.close()
+
+
+class _StagedEventFile(_ClosingEventFile):
+    def __init__(self, path):
+        super().__init__(path.open('xb'), publication=True)
+
+    def _close(self):
+        # BufferedWriter.close can replace a final flush error with a raw close
+        # error. Keep these operations distinct if the flush itself fails.
+        try:
+            self.thing.flush()
+        except BaseException:
+            with _ClosingEventFile(self.thing.raw, publication=True):
+                raise
+        self.thing.close()
+
+
+def _write_array_member(archive, name, raw):
+    # Match writestr's timestamp and ZIP64 size choice, but own the member
+    # so its header rewrite on close cannot mask an interrupted data write.
+    if hasattr(zipfile.ZipInfo, '_for_archive'):  # Documented since Python 3.14.
+        info = zipfile.ZipInfo(name)._for_archive(archive)
+    else:
+        info = zipfile.ZipInfo(name, time.localtime(time.time())[:6])
+    info.file_size = len(raw)
+    with _ClosingEventFile(archive.open(info, 'w'), publication=True) as member:
+        member.write(raw)
+
+
 def _policy_reason():
     if np.geterr() != {'divide': 'warn', 'over': 'warn', 'under': 'ignore', 'invalid': 'warn'}:
         return 'nondefault_numpy_error_policy'
@@ -231,7 +307,8 @@ class StatisticsEventStore:
 
     def _read_metadata(self, path):
         try:
-            raw = path.read_bytes()
+            with _ClosingEventFile(path.open('rb')) as stream:
+                raw = stream.read()
             envelope = json.loads(raw)
             if type(envelope) is not dict or set(envelope) != {'payload', 'sha256'}:
                 raise ValueError('Invalid event envelope')
@@ -293,24 +370,46 @@ class StatisticsEventStore:
         except OSError as error:
             raise StatisticsRecoveryError('Cannot enumerate committed statistics events') from error
 
+    @contextmanager
+    def _timed_read(self, field):
+        try:
+            start = time.perf_counter()
+        except Exception as error:
+            raise StatisticsRecoveryError(f'Cannot start statistics recovery timer {field}') from error
+        # Only a completed read or verification contributes to a report.
+        # Skipping timing on an abort preserves the exception that caused it.
+        yield
+        try:
+            self.current[field] += time.perf_counter() - start
+        except Exception as error:
+            raise StatisticsRecoveryError(f'Cannot record statistics recovery timer {field}') from error
+
     def _index(self):
         if self.events is None:
-            start = time.perf_counter()
             try:
-                events = {}
-                for path in self.committed_paths(self.root):
-                    if path.is_symlink() or not path.is_file():
-                        raise StatisticsRecoveryError('Unexpected linked/non-file statistics event')
-                    event = self._read_metadata(path)
-                    if event['event_id'] in events:
-                        raise StatisticsRecoveryError('Duplicate statistics event identifier')
-                    events[event['event_id']] = event
+                with self._timed_read('metadata_read_seconds'):
+                    events = {}
+                    for path in self.committed_paths(self.root):
+                        if not stat.S_ISREG(path.lstat().st_mode):
+                            raise StatisticsRecoveryError('Unexpected linked/non-file statistics event')
+                        event = self._read_metadata(path)
+                        if event['event_id'] in events:
+                            raise StatisticsRecoveryError('Duplicate statistics event identifier')
+                        events[event['event_id']] = event
                 self.events = events
-            finally:
-                self.current['metadata_read_seconds'] += time.perf_counter() - start
+            except (MemoryError, OSError) as error:
+                raise StatisticsRecoveryError('Cannot build the committed statistics event index') from error
         return self.events
 
     def load(self, fold, record, p, n):
+        # Allocation can fail during read setup, before the timer or payload
+        # reader gets control. The fold runner must abort on that failure.
+        try:
+            return self._load(fold, p, n)
+        except MemoryError as error:
+            raise StatisticsRecoveryError('Cannot allocate resources for statistics restore') from error
+
+    def _load(self, fold, p, n):
         reason = self.eligibility_reason()
         if reason is not None:
             self.current['bypasses'].append({'fold': fold, 'reason': reason})
@@ -318,10 +417,9 @@ class StatisticsEventStore:
         for event in self._index().values():
             if event['fold'] != fold:
                 continue
-            start = time.perf_counter()
-            path = self.root / ('event-' + event['event_id'] + '.json')
-            payload = self.root / ('payload-' + event['event_id'] + '.npz')
-            try:
+            with self._timed_read('array_read_seconds'):
+                path = self.root / ('event-' + event['event_id'] + '.json')
+                payload = self.root / ('payload-' + event['event_id'] + '.npz')
                 # Metadata is historical accounting authority. Its loss or
                 # invalidity never becomes a learned-payload cache miss.
                 if self._read_metadata(path) != event:
@@ -330,7 +428,10 @@ class StatisticsEventStore:
                 try:
                     if payload.is_symlink() or not payload.is_file():
                         raise ValueError('Unexpected linked/non-file statistics payload')
-                    with zipfile.ZipFile(payload, 'r') as archive:
+                    # Keep ownership of the file if reading the ZIP directory
+                    # fails before the archive constructor returns.
+                    with (_ClosingPayloadResource(payload.open('rb')) as stream,
+                          _ClosingPayloadResource(zipfile.ZipFile(stream, 'r')) as archive):
                         entries = archive.infolist()
                         names = [row.filename for row in entries]
                         expected = {name + '.npy' for name in ARRAYS}
@@ -341,7 +442,8 @@ class StatisticsEventStore:
                         for name, descriptor in event['arrays'].items():
                             if archive.getinfo(descriptor['member']).file_size != descriptor['bytes']:
                                 raise ValueError('Statistics member size mismatch: ' + name)
-                            raw = archive.read(descriptor['member'])
+                            with _ClosingPayloadResource(archive.open(descriptor['member'])) as member:
+                                raw = member.read()
                             if len(raw) != descriptor['bytes'] or sha(raw) != descriptor['sha256']:
                                 raise ValueError('Statistics member checksum mismatch: ' + name)
                             value = np.load(io.BytesIO(raw), allow_pickle=False)
@@ -360,19 +462,73 @@ class StatisticsEventStore:
                     if self._read_metadata(path) != event:
                         raise StatisticsRecoveryError('Statistics metadata changed during failed payload read') from error
                     arrays.clear()
-                    self.current['unusable_payload_events'].append(dict(
-                        event_id=event['event_id'], fold=fold,
-                        error_type=type(error).__name__, error=str(error)))
+                    try:
+                        self.current['unusable_payload_events'].append(dict(
+                            event_id=event['event_id'], fold=fold,
+                            error_type=type(error).__name__, error=str(error)))
+                    except Exception as record_error:
+                        raise StatisticsRecoveryError('Cannot record unusable statistics payload') from record_error
                     continue
-                self.current['restored_events'] += 1
+                try:
+                    self.current['restored_events'] += 1
+                except Exception as error:
+                    raise StatisticsRecoveryError('Cannot record the restored statistics event') from error
                 try:
                     _event_hook('after_statistics_loaded', {'event_id': event['event_id'], 'fold': fold})
                 except Exception as error:
                     raise StatisticsRecoveryError('Statistics restore observer failed') from error
                 return restored, event
-            finally:
-                self.current['array_read_seconds'] += time.perf_counter() - start
         return None
+
+    def _ready_to_commit(self, fold):
+        try:
+            with self._timed_read('guard_seconds'):
+                current = self.runtime_guard(self.estimator, self.threads, self.candidates)
+                if current != self.runtime:
+                    raise StatisticsRecoveryError('Source or numerical runtime changed before statistics event commit')
+            if self.eligibility_reason() is not None:
+                self.current['bypasses'].append({'fold': fold, 'reason': 'policy_changed_before_commit'})
+                return False
+        except StatisticsRecoveryError:
+            raise
+        except Exception as error:
+            raise StatisticsRecoveryError('Cannot verify source/runtime before statistics event commit') from error
+        return True
+
+    def _publish_file(self, source, destination, event_path, fold):
+        committing = destination == event_path
+        attempts = 6 if os.name == 'nt' else 1
+        for attempt in range(attempts):
+            if committing and not self._ready_to_commit(fold):
+                return False
+            # A committed event retains its identifier even if its payload is lost.
+            if _entry_exists(event_path):
+                raise StatisticsRecoveryError('Statistics event identifier collision')
+            if not committing and _entry_exists(destination):
+                raise StatisticsRecoveryError('Statistics payload identifier collision')
+            try:
+                source.replace(destination)
+                return True
+            except Exception as error:
+                if committing:
+                    # Writing an unbacked fold receipt would double-count work if
+                    # replacement raised after the rename took effect.
+                    try:
+                        published = _entry_exists(event_path)
+                    except Exception:
+                        raise StatisticsRecoveryError('Cannot determine whether statistics event was committed') from error
+                    if published:
+                        raise StatisticsRecoveryError('Statistics event exists after a failed commit') from error
+                if not isinstance(error, PermissionError) or attempt + 1 == attempts:
+                    raise
+                if not committing:
+                    # An error can be reported after the payload has moved.
+                    # Without its staging file a retry cannot publish it.
+                    try:
+                        source.lstat()
+                    except OSError:
+                        raise error from None
+                time.sleep(0.05 * 2 ** attempt)
 
     def publish(self, fold, base, seconds, record, *, silent):
         reason = self.eligibility_reason()
@@ -389,6 +545,7 @@ class StatisticsEventStore:
         temporary = self.root / ('.event-' + event_id + '.tmp')
         final = self.root / ('event-' + event_id + '.json')
         committed = False
+        propagating_error = False
         try:
             try:
                 arrays, state = _packed_state(base)
@@ -407,59 +564,55 @@ class StatisticsEventStore:
                          state=state, arrays={}, policy='stock-default-silent-v1')
             self.root.mkdir(parents=True, exist_ok=True)
             _event_hook('before_payload_write', details)
-            with temporary_payload.open('xb') as stream:
-                with zipfile.ZipFile(stream, 'w', compression=zipfile.ZIP_STORED) as archive:
-                    for name, raw in encoded_arrays.items():
-                        member = name + '.npy'
-                        value['arrays'][name] = {'member': member, 'bytes': len(raw), 'sha256': sha(raw)}
-                        archive.writestr(member, raw)
+            with (_StagedEventFile(temporary_payload) as stream,
+                  _ClosingEventFile(zipfile.ZipFile(stream, 'w', compression=zipfile.ZIP_STORED),
+                                    publication=True) as archive):
+                for name, raw in encoded_arrays.items():
+                    member = name + '.npy'
+                    value['arrays'][name] = {'member': member, 'bytes': len(raw), 'sha256': sha(raw)}
+                    _write_array_member(archive, member, raw)
             _event_hook('after_payload_write', details)
             _event_hook('before_metadata_write', details)
-            with temporary.open('xb') as stream:
+            with _StagedEventFile(temporary) as stream:
                 stream.write(_plain_json({
                     'payload': value, 'sha256': sha(_plain_json(value))}))
+                # Flush while this guard can still distinguish a write error
+                # from a second error closing the underlying file.
+                stream.flush()
             _event_hook('after_metadata_write', details)
             _event_hook('before_payload_commit', details)
-            if payload.exists():
-                raise StatisticsRecoveryError('Statistics payload identifier collision')
-            temporary_payload.replace(payload)
+            self._publish_file(temporary_payload, payload, final, fold)
             _event_hook('after_payload_commit', details)
             # The final source/runtime check remains after all serialization
             # and precommit hooks. A payload without JSON is uncommitted.
             _event_hook('before_event_commit', details)
-            guard_start = time.perf_counter()
-            try:
-                try:
-                    current = self.runtime_guard(self.estimator, self.threads, self.candidates)
-                except Exception as error:
-                    raise StatisticsRecoveryError('Cannot verify source/runtime before statistics event commit') from error
-                if current != self.runtime:
-                    raise StatisticsRecoveryError('Source or numerical runtime changed before statistics event commit')
-            finally:
-                self.current['guard_seconds'] += time.perf_counter() - guard_start
-            if self.eligibility_reason() is not None:
-                self.current['bypasses'].append({'fold': fold, 'reason': 'policy_changed_before_commit'})
+            if not self._publish_file(temporary, final, final, fold):
                 return None
-            if final.exists():
-                raise StatisticsRecoveryError('Statistics event identifier collision')
-            temporary.replace(final)
             committed = True
-            self.events[event_id] = value
-            self.current['published_events'] += 1
             try:
+                self.events[event_id] = value
+                self.current['published_events'] += 1
                 _event_hook('after_event_commit', details)
             except Exception as error:
-                raise StatisticsRecoveryError('Statistics event committed before a later publication observer failed') from error
+                raise StatisticsRecoveryError('Cannot finish recording the committed statistics event') from error
             return value
         except OSError as error:
-            if committed:
-                raise StatisticsRecoveryError('Statistics event committed before a later publication observer failed') from error
             # Optional publication failure does not invalidate already-computed
-            # statistics; no final artifact is trusted until replacement succeeds.
+            # statistics once a failed event rename is known to be uncommitted.
             self.current['publication_failures'].append(dict(fold=fold, error_type=type(error).__name__, error=str(error)))
             return None
+        except BaseException:
+            propagating_error = True
+            raise
         finally:
-            self.current['write_seconds'] += time.perf_counter() - start - (self.current['guard_seconds'] - guard_before)
+            try:
+                self.current['write_seconds'] += time.perf_counter() - start - (self.current['guard_seconds'] - guard_before)
+            except Exception as error:
+                # Timing must never mask a failed commit check or an interruption.
+                if not propagating_error:
+                    if committed:
+                        raise StatisticsRecoveryError('Cannot record the committed statistics event write time') from error
+                    raise
             # Uncommitted temporary/orphan payload evidence is retained;
             # only the final JSON replacement commits a durable event.
 

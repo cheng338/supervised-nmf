@@ -6,7 +6,6 @@ Public process cases independently qualify the installed provider.
 from contextlib import nullcontext
 import json
 import os
-import sys
 import tempfile
 
 import numpy as np
@@ -16,7 +15,8 @@ from joblib.externals.loky import reusable_executor
 
 from supervised_nmf import _nnls, _projection as projection
 from tests._prepared_qr_support import (
-    assert_coordinates, fixed_model, problem, qr_state,
+    assert_coordinates, assert_worker_binding, fixed_model, parent_inventory_under_limit,
+    fail_large_qr_payload_view, problem, qr_state,
 )
 
 
@@ -191,19 +191,9 @@ def test_large_array_payload_storage_failure_declines_without_retaining_entry(
     design = np.ones((4097, 32), dtype=np.float64)
     entry = _nnls._QRPrepared(design, design, np.eye(32), context)
     monkeypatch.setattr(_nnls, '_prepare_qr_entry', lambda *args, **kwargs: entry)
-    original = np.frombuffer
-    payload_code = _nnls._QRPrepared._transport_payload.__code__
-    failures = []
-    def observed(*args, **kwargs):
-        caller = sys._getframe(1)
-        if (caller.f_code.co_name == '<genexpr>' and caller.f_back is not None
-                and caller.f_back.f_code is payload_code):
-            failures.append(True)
-            raise MemoryError('optional large payload view')
-        return original(*args, **kwargs)
-    monkeypatch.setattr(np, 'frombuffer', observed)
-    assert projection._qr_parent_payload(design, 1, entry, False) == (None, None)
-    assert failures == [True]
+    with fail_large_qr_payload_view(monkeypatch) as failures:
+        assert projection._qr_parent_payload(design, 1, entry, False) == (None, None)
+    assert failures == [design.nbytes]
 
 
 @pytest.mark.parametrize('features', [4095, 4096, 4097])
@@ -213,16 +203,15 @@ def test_actual_public_process_transport_at_mapping_boundary(qr_state, tmp_path,
     directory = tmp_path / 'receipts'
     directory.mkdir()
     receipt_directory = str(directory)
+    parent_inventory = parent_inventory_under_limit(model)
     def observed_shared_block(*args, **kwargs):
         # A by-value observer wraps only the optional transport entry. It invokes
         # the untouched required numerical implementation in the actual child.
         import json
-        import inspect
         import os
-        import sys
         import tempfile
         from supervised_nmf import _projection as implementation
-        from supervised_nmf import _nnls as numerical
+        from tests._prepared_qr_support import observed_worker_binding
         payload = args[-1]
         records = []
         for value in payload[1:4]:
@@ -230,25 +219,12 @@ def test_actual_public_process_transport_at_mapping_boundary(qr_state, tmp_path,
                 size=len(value) if type(value) is bytes else value.nbytes,
                 readonly=None if type(value) is bytes else not value.flags.writeable,
                 mode=getattr(value, 'mode', None)))
-        qr_code = inspect.unwrap(numerical._QR_ORIGINAL_QR).__code__
-        bind_code = implementation._qr_call_bind.__code__
-        qr_calls, bindings = [], []
-        previous = sys.getprofile()
-        assert previous is None
-        def observe(frame, event, value):
-            if event == 'call' and frame.f_code is qr_code:
-                qr_calls.append(True)
-            elif event == 'return' and frame.f_code is bind_code:
-                bindings.append(type(value) is numerical._QRPrepared)
-        try:
-            sys.setprofile(observe)
+        with observed_worker_binding(payload, parent_inventory) as record:
             answer = implementation._project_shared_block(*args, **kwargs)
-        finally:
-            sys.setprofile(previous)
         fd, path = tempfile.mkstemp(prefix='block-', suffix='.json', dir=receipt_directory)
         with os.fdopen(fd, 'w', encoding='utf-8') as stream:
             json.dump(dict(pid=os.getpid(), rows=len(args[1]), buffers=records,
-                           qr_calls=len(qr_calls), bindings=bindings), stream)
+                           **record), stream)
         return answer
     monkeypatch.setattr(projection, '_project_shared_block', observed_shared_block)
     before_owner, before_rows = owner.copy(), rows.copy()
@@ -275,7 +251,7 @@ def test_actual_public_process_transport_at_mapping_boundary(qr_state, tmp_path,
     expected = [('memmap' if size > LIMIT else 'bytes')
                 for size in sizes]
     for row in records:
-        assert row['qr_calls'] == 0 and row['bindings'] == [True]
+        assert_worker_binding(row)
         assert [value['kind'] for value in row['buffers']] == expected
         assert [value['size'] for value in row['buffers']] == sizes
         assert all(value['mode'] == 'r' and value['readonly']

@@ -20,6 +20,7 @@ from sklearn.utils.metaestimators import available_if
 from sklearn.utils.validation import check_consistent_length, check_is_fitted
 
 from .decomposition import FeatureSPA
+from ._feature_names import _check_input_features
 from ._labels import _label_values, _validate_class_label, _validate_class_labels
 from ._mu import transform_mu
 from ._mu_rowwise import transform_mu_rowwise
@@ -110,7 +111,7 @@ def _knn_probabilities_preserve_labels(head, coordinates, probabilities):
     """
     if head.weights == "uniform":
         return True
-    if head.weights != "distance":
+    if head.weights != "distance" or not isinstance(coordinates, np.ndarray):
         return False
     train_dtype = getattr(getattr(head, "_fit_X", None), "dtype", None)
     single = coordinates.dtype == np.float32 or train_dtype == np.float32
@@ -449,6 +450,11 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
             elif class_weight is not None and not (
                     isinstance(class_weight, str) and class_weight == "balanced"):
                 raise ValueError(f"{prefix}_class_weight must be None, 'balanced', or a dictionary.")
+        _check_input_features(self, X, reset=True)
+        # A caller-supplied selector can carry its own named training schema.
+        # Give that selector the actual columns when it validates this fold.
+        named_selector_X = (X if type(prepared_selector) is BinaryScreening
+                            and hasattr(prepared_selector, "feature_names_in_") else None)
         X, y, classes, counts = _binary_data(X, y)
         positive_label = self.positive_label
         positive_index = 1
@@ -488,7 +494,10 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
                         or not np.array_equal(_label_values(selector.classes_), _label_values(classes))
                         or not np.array_equal(selector.class_counts_, counts)):
                     raise ValueError("Prepared screening does not match this training fold or estimator.")
-                X_selected = selector.transform(X)
+                X_selected = selector.transform(X if named_selector_X is None else named_selector_X)
+            # Global pandas output can wrap the selector result. The internal
+            # factorization and subsequent projections use positional values.
+            X_selected = np.asarray(X_selected)
             selected_features = selector.get_support(indices=True)
         screen_seconds = time.perf_counter() - stage
         if isinstance(self.n_components, bool) or not isinstance(self.n_components, Integral) or not 1 <= self.n_components <= min(X_selected.shape):
@@ -503,6 +512,8 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
             decomposition = FeatureSPA(
                 n_components=self.n_components, nnls_max_iter=self.max_iter,
                 **projection_settings)
+        # The head is fitted and queried on positional component coordinates.
+        decomposition.set_output(transform="default")
         stage = time.perf_counter()
         if self.solver == "spa":
             # Calling fit_transform here would already project training data.
@@ -523,7 +534,7 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
             classifier = KNeighborsClassifier(n_neighbors=self.n_neighbors, weights=self.weights)
             if self.knn_normalization == "sd":
                 classifier = Pipeline([
-                    ("scale", StandardScaler(with_mean=False)),
+                    ("scale", StandardScaler(with_mean=False).set_output(transform="default")),
                     ("knn", classifier),
                 ])
             classifier.fit(W, y)
@@ -531,7 +542,7 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
             classifier_n_iter = None
         elif self.classifier == "logistic":
             classifier = Pipeline([
-                ("scale", StandardScaler()),
+                ("scale", StandardScaler().set_output(transform="default")),
                 ("logistic", LogisticRegression(
                     C=self.logistic_C, solver="lbfgs", max_iter=self.logistic_max_iter,
                     tol=self.logistic_tol, class_weight=self.logistic_class_weight,
@@ -557,6 +568,12 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
         self.positive_label_ = classes[positive_index]
         self.positive_class_index_ = positive_index
         self.selector_ = selector
+        if selector is not None and hasattr(self, "feature_names_in_"):
+            # The public selector consumes the same raw columns as this model.
+            # A fold cache may retain the supplied selector for another fit.
+            if selector is prepared_selector:
+                self.selector_ = copy(selector)
+            self.selector_.feature_names_in_ = self.feature_names_in_.copy()
         self.decomposition_ = decomposition
         self.classifier_ = classifier
         self.knn_normalization_ = self.knn_normalization if self.classifier == "knn" else None
@@ -623,6 +640,7 @@ class NMFClassifier(ClassifierMixin, TransformerMixin, BaseEstimator):
                 decomposition = copy(decomposition)
             if isinstance(decomposition, FeatureSPA):
                 decomposition.set_params(**projection_settings)
+            _check_input_features(self, X, reset=False)
             X = _nonnegative_array(X)
             if X.shape[1] != self.n_features_in_:
                 raise ValueError(

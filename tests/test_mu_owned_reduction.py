@@ -44,13 +44,16 @@ def pair():
 def observe_reduction():
     """Observe real code without replacing a callable used by admission."""
     owned = mu._owned_log_sum.__code__
+    fallback = mu._log_sum.__code__
     scalar = mu._log_cross_reference.__code__
     rows = []
     previous = sys.getprofile()
 
     def profile(frame, event, result):
-        if event == "return" and frame.f_code is owned:
-            rows.append(("owned", "fast" if "out" in frame.f_locals else "fallback"))
+        if event == "call" and frame.f_code is owned:
+            rows.append(("owned",))
+        elif event == "call" and frame.f_code is fallback:
+            rows.append(("fallback",))
         elif event == "call" and frame.f_code is scalar:
             rows.append(("scalar", frame.f_locals["left"].tobytes(),
                          frame.f_locals["right"].tobytes()))
@@ -117,14 +120,17 @@ def test_qualified_owned_reduction_matches_scipy_bits(case):
         products.fill(float(2 ** 60))
     elif case == "negative-bound":
         products.fill(-float(2 ** 60))
-    expected = mu._log_sum(products.copy(), axis=2)
+    original = products.copy()
+    expected = mu._log_sum(original, axis=2)
     with np.errstate(all="raise"):
         policy = np.geterr()
         with observe_reduction() as observed:
             actual = mu._owned_log_sum(products)
         assert np.geterr() == policy
     same_bytes(actual, expected)
-    assert observed == [("owned", "fast")]
+    assert observed == [("owned",)]
+    # Every fixture here distinguishes in-place reduction from an untouched workspace.
+    assert products.tobytes() != original.tobytes()
 
 
 @pytest.mark.parametrize("kind", ["view", "readonly", "F", "float32", "subclass",
@@ -160,7 +166,7 @@ def test_unowned_or_unsupported_products_decline_without_mutation(kind):
         with observe_reduction() as observed:
             actual = mu._owned_log_sum(products)
     same_bytes(actual, expected)
-    assert observed == [("owned", "fallback")]
+    assert observed == [("owned",), ("fallback",)]
     assert (products.tobytes(), products.strides, products.flags.writeable) == before
 
 
@@ -264,8 +270,9 @@ def test_optional_implementation_policy_declines_without_disabling_results(reaso
         else:
             # Reach the source policy even on an otherwise unqualified stack.
             # These temporary constructor inputs never install an admitted path.
-            local.setattr(scipy, "__version__", contract["required_scipy"])
-            local.setattr(np, "__version__", contract["required_numpy"])
+            numpy_version, scipy_version = contract["qualified_numpy_scipy_pairs"][0]
+            local.setattr(np, "__version__", numpy_version)
+            local.setattr(scipy, "__version__", scipy_version)
             if reason == "source":
                 local.setattr(Path, "read_bytes", lambda self: b"unqualified implementation source\n")
             else:
@@ -279,6 +286,123 @@ def test_optional_implementation_policy_declines_without_disabling_results(reaso
     before = products.tobytes()
     same_bytes(reducer(products), mu._log_sum(products, axis=2))
     assert products.tobytes() == before
+
+
+@pytest.mark.parametrize(("versions", "qualified"), [
+    (("2.5.4", "1.18.1"), True), (("2.5.2", "1.18.0"), True),
+    (("2.5.4", "1.18.0"), False), (("2.5.2", "1.18.1"), False),
+])
+def test_numerical_versions_admit_only_exact_pairs(versions, qualified, monkeypatch):
+    def unavailable(path):
+        if not qualified:
+            pytest.fail(f"Unqualified pair tried to read {path}")
+        raise OSError("Optional source is unavailable")
+
+    with monkeypatch.context() as local:
+        local.setattr(np, "__version__", versions[0])
+        local.setattr(scipy, "__version__", versions[1])
+        local.setattr(Path, "read_bytes", unavailable)
+        reducer, compatible = mu._make_owned_log_sum()
+    contract = reducer.implementation_contract
+    assert contract["qualified_numpy_scipy_pairs"] == (("2.5.4", "1.18.1"), ("2.5.2", "1.18.0"))
+    assert (contract["numpy"], contract["scipy"]) == versions
+    assert (contract["required_numpy"], contract["required_scipy"]) == (
+        versions if qualified else (None, None))
+    assert not compatible()
+    if qualified:
+        assert contract["reason"].startswith("optional implementation unavailable")
+    else:
+        assert contract["reason"] == "unqualified numerical version"
+
+
+@pytest.mark.parametrize("when", ["before_capture", "after_capture"])
+@pytest.mark.parametrize(("namespace", "name"), [
+    *(("xp", name) for name in ("exp", "sign", "abs", "squeeze", "max", "astype",
+                                "sum", "log", "isfinite", "where", "isdtype", "log1p")),
+    *(("implementation", name) for name in ("logsumexp", "_logsumexp",
+      "_elements_and_indices_with_max_real", "array_namespace", "xp_promote", "xp_size")),
+    ("extra", "at"), ("extra", "atleast_nd"), ("at", "__init__"), ("at", "__getitem__"),
+    ("at", "set"), ("np", "errstate"), ("np", "sign"),
+])
+def test_direct_scipy_reduction_callbacks_are_preserved(namespace, name, when, monkeypatch):
+    require_fast_route()
+    from scipy.special import _logsumexp as implementation
+    from scipy._external.array_api_compat import numpy as xp
+
+    owner = {"implementation": implementation, "xp": xp, "extra": implementation.xpx,
+             "at": implementation.xpx.at, "np": np}[namespace]
+    marker = RuntimeError(f"observed {namespace}.{name}")
+    def observed(*args, **kwargs):
+        raise marker
+
+    products = np.array([[[-1., -2., -3., -4.]]])
+    before = products.tobytes()
+    with monkeypatch.context() as local:
+        local.setattr(owner, name, observed)
+        if name == "logsumexp":
+            # Simulate the public import still referring to the same modified binding.
+            local.setattr(mu, "logsumexp", observed)
+        if when == "before_capture":
+            reducer, compatible = mu._make_owned_log_sum()
+        else:
+            reducer, compatible = mu._owned_log_sum, mu._owned_log_sum_compatible
+        assert not compatible()
+        with pytest.raises(RuntimeError) as reference:
+            mu._log_sum(products, axis=2)
+        with pytest.raises(RuntimeError) as actual:
+            reducer(products)
+        assert reference.value is actual.value is marker
+        assert products.tobytes() == before
+    assert mu._owned_log_sum_compatible()
+
+
+@pytest.mark.parametrize("name", ["inf", "nan"])
+@pytest.mark.parametrize("when", ["before_capture", "after_capture"])
+def test_indexed_update_scalars_decline_before_mutation(name, when, monkeypatch):
+    require_fast_route()
+    from scipy._external.array_api_compat import numpy as xp
+
+    products = np.array([[[-1., -2., -3.]]])
+    before = products.tobytes()
+    with monkeypatch.context() as local:
+        local.setattr(xp, name, 0.)
+        if when == "before_capture":
+            reducer, compatible = mu._make_owned_log_sum()
+        else:
+            reducer, compatible = mu._owned_log_sum, mu._owned_log_sum_compatible
+        assert not compatible()
+        expected = mu._log_sum(products, axis=2)
+        actual = reducer(products)
+        same_bytes(actual, expected)
+        assert not np.shares_memory(actual, products) and products.tobytes() == before
+
+
+@pytest.mark.parametrize("target", ["private_body", "indexed_set", "maximum_default"])
+def test_preexisting_edits_to_original_scipy_functions_decline(target, monkeypatch):
+    require_fast_route()
+    from scipy.special import _logsumexp as implementation
+
+    def observed(*args, **kwargs):
+        raise RuntimeError("edited SciPy function")
+
+    products = np.array([[[-1., -2., -3.]]])
+    before = products.tobytes()
+    with monkeypatch.context() as local:
+        if target == "maximum_default":
+            local.setattr(implementation._elements_and_indices_with_max_real, "__kwdefaults__", {"axis": 0})
+        else:
+            function = implementation._logsumexp if target == "private_body" else implementation.xpx.at.set
+            local.setattr(function, "__code__", observed.__code__)
+        reducer, compatible = mu._make_owned_log_sum()
+        assert not compatible()
+        if target == "maximum_default":
+            same_bytes(reducer(products), mu._log_sum(products, axis=2))
+        else:
+            for operation in (lambda: mu._log_sum(products, axis=2), lambda: reducer(products)):
+                with pytest.raises(RuntimeError, match="edited SciPy function"):
+                    operation()
+        assert products.tobytes() == before
+    assert mu._owned_log_sum_compatible()
 
 
 def test_owned_workspace_fpe_replays_untouched_operands(monkeypatch):

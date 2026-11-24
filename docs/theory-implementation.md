@@ -32,12 +32,12 @@ restricted procedure.
 
 The four-solver development comparison selected SPA under its accuracy/time rule
 with absolute screening fixed. Its recorded status is `selected_for_audit`.
-This empirical selection leaves separability unverified. [Four-solver results](nmf-solver-comparison.md#development-results)
+This empirical selection leaves separability unverified. [Four-solver results](../research/nmf-solver-comparison.md#development-results)
 
 The official-test phase of the original CelebA default-selection protocol remains
 unfinished. A separate October 12 study evaluated projected SPA coordinates
-on an official test partition. [Original protocol status](celeba-default-results.md)
-and [October 12 results](validation.md#october-12-official-partition-evaluation)
+on an official test partition. [Original protocol status](../research/celeba-default-results.md)
+and [October 12 results](../research/validation.md#october-12-official-partition-evaluation)
 
 | Result | What it establishes | Application to the package |
 | --- | --- | --- |
@@ -197,7 +197,7 @@ The original simulation combines clipped high-variance background columns with
 lower-variance class-shifted signal columns. Background features that survive
 screening can occupy the available anchors at small rank. Empirical CV ranges
 from particular draws are observations, not distribution-wide bounds on every
-finite sample. The [October 20 diagnostic](wang-simulation-validation.md#october-20-anchor-and-information-diagnostic)
+finite sample. The [October 20 diagnostic](../research/wang-simulation-validation.md#october-20-anchor-and-information-diagnostic)
 documents representation loss despite full signal retention, together with
 cases where rank expansion or coordinate scaling is insufficient.
 
@@ -414,7 +414,7 @@ screened SPA with logistic regression improved mean balanced accuracy over
 screened SPA with KNN on both attributes. Screening-only logistic regression
 scored higher still. These are comparisons of the complete tuned procedures.
 A classifier-specific bound for the logistic error term remains open.
-[Matched CelebA results](wang-real-data-validation.md#completed-independently-retuned-results)
+[Matched CelebA results](../research/wang-real-data-validation.md#completed-independently-retuned-results)
 
 Absolute screening is therefore preferred for methodological/theoretical alignment
 when accuracy is close. General bounds can assess different solvers under

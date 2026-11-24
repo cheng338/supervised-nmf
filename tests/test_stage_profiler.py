@@ -1,11 +1,13 @@
 """Stage reporting follows the classifier's resolved training-coordinate policy."""
 
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
 import unittest
 from unittest.mock import patch
 import warnings
 
+from joblib import effective_n_jobs, parallel_config
 import numpy as np
 from sklearn.base import clone
 from sklearn.decomposition import NMF, PCA
@@ -68,6 +70,42 @@ class StageProfilerTests(unittest.TestCase):
             reference={} if reference is None else reference, sample_ids=self.ids,
         )
 
+    def test_serial_profile_limits_inherited_workers_and_restores_context(self):
+        model = KNeighborsClassifier(n_neighbors=3)
+        reference, _ = self.reference(model)
+        workers = []
+        original = KNeighborsClassifier.predict_proba
+        between_phases = []
+        diagnostics = profiler._diagnostics
+
+        def observe_diagnostics(fitted):
+            between_phases.append(datetime.now(timezone.utc).isoformat())
+            return diagnostics(fitted)
+
+        def observe(fitted, *args, **kwargs):
+            workers.append(effective_n_jobs(fitted.n_jobs))
+            return original(fitted, *args, **kwargs)
+
+        with parallel_config(backend="threading", n_jobs=2):
+            with (patch.object(KNeighborsClassifier, "predict_proba", observe),
+                  patch.object(profiler, "_diagnostics", observe_diagnostics)):
+                record = self.profile(model, reference)
+            self.assertEqual(effective_n_jobs(None), 2)
+        self.assertTrue(workers)
+        self.assertEqual(set(workers), {1})
+        self.assert_exact_predictions(record, reference)
+        for phase, key in (("fit_execution", "total_fit_seconds"), ("prediction_execution", "prediction_seconds")):
+            self.assertEqual(record[phase]["application_workers"], 1)
+            self.assertEqual(record[phase]["native_threads"], 1)
+            self.assertEqual(record[phase]["seconds"], record["timing"][key])
+        self.assertLessEqual(record["fit_execution"]["finished_utc"], between_phases[0])
+        self.assertLessEqual(between_phases[0], record["prediction_execution"]["started_utc"])
+
+    def test_profile_rejects_explicit_parallel_workers_before_fitting(self):
+        for model in (self.model(projection_workers=2), KNeighborsClassifier(n_jobs=2)):
+            with self.subTest(model=model), self.assertRaises(RuntimeError):
+                self.profile(model)
+
     def reference(self, model):
         fitted = clone(model)
         with warnings.catch_warnings(record=True) as caught:
@@ -125,6 +163,8 @@ class StageProfilerTests(unittest.TestCase):
                 self.assertEqual(record["error_type"], "ValueError")
                 self.assertIn("n_components", record["error"])
                 self.assertIsNone(record["evaluation"])
+                self.assertEqual(record["fit_execution"]["seconds"], record["timing"]["total_fit_seconds"])
+                self.assertNotIn("prediction_execution", record)
                 self.assert_unreached(
                     record, "decomposition_fit_seconds", "classifier_fit_seconds",
                     "decomposition_projection_seconds", "classifier_prediction_seconds",

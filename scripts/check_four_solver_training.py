@@ -22,7 +22,7 @@ from sklearn.pipeline import Pipeline
 from threadpoolctl import threadpool_limits
 
 import fashion_mnist_study as study
-from supervised_nmf.evaluation import _jsonable, _warning_records, write_json
+from supervised_nmf.evaluation import _jsonable, _timing_study_lock, _warning_records, write_json
 
 
 def check(output):
@@ -49,7 +49,6 @@ def check(output):
                 warnings.simplefilter("always")
                 try:
                     model.fit(X, y)
-                    record["fit_seconds"] = time.perf_counter() - start
                     if isinstance(model, Pipeline):
                         factor = model.named_steps["nmf"]
                         W = model.named_steps["knn"]._fit_X
@@ -86,4 +85,6 @@ def check(output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "runs" / "four-solvers-audit" / "training-smoke.json")
-    raise SystemExit(0 if check(parser.parse_args().output) else 1)
+    args = parser.parse_args()
+    with _timing_study_lock():
+        raise SystemExit(0 if check(args.output) else 1)

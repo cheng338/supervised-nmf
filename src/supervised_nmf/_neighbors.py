@@ -4,13 +4,19 @@ Author: Chang Cheng. This private adapter preserves the public estimator's
 decision on uncertain batches; it never moves a voting threshold to break a tie.
 """
 
+import sys
 import time
 import warnings
-from numbers import Integral
+from abc import ABCMeta
+from functools import lru_cache
+from importlib.machinery import ModuleSpec, SourceFileLoader
+from numbers import Integral, Real
+from pathlib import Path
+from types import CodeType, FunctionType, GetSetDescriptorType
 
 import numpy as np
 from sklearn.neighbors import KNeighborsClassifier, KDTree, BallTree
-from sklearn import __version__ as _SKLEARN_VERSION
+from sklearn import __version__ as _SKLEARN_VERSION, get_config
 
 from ._labels import _label_values
 
@@ -21,12 +27,30 @@ except ImportError:
     _FULL_MEMBERSHIP_EUCLIDEAN = None
 
 
-# Full-membership checks require these original callable objects.
-# Replaced selected-query/decision methods must retain the ordinary fallback.
-_FULL_MEMBERSHIP_METHODS = tuple(
-    (name, getattr(KNeighborsClassifier, name))
-    for name in ("kneighbors", "predict", "predict_proba")
-)
+_QUERY_METHODS = frozenset(("kneighbors", "predict", "predict_proba", "_kneighbors_reduce_func"))
+_VOTE_FUNCTIONS = frozenset(("_mode", "weighted_mode", "_get_weights", "_adjusted_metric",
+                             "check_is_fitted", "validate_data", "_num_samples", "_check_precomputed",
+                             "get_tags"))
+_QUERY_DEFAULTS = {
+    "KNeighborsMixin.kneighbors": (None, None, True),
+    "ArgKmin.compute": ("euclidean", None, None, None, False),
+    "ArgKminClassMode.compute": ("euclidean", None, None, None),
+    "_mode": (0,),
+    "_adjusted_metric": (None,),
+    "check_is_fitted": (None,),
+    "validate_data": ("no_validation", "no_validation", True, False, False),
+    "Logger.__init__": (3, None),
+    "ParallelBackendBase.__init__": (None, None),
+    "ParallelBackendBase.configure": (1, None, None, None),
+    "ThreadingBackend.configure": (1, None),
+}
+_QUERY_KEYWORDS = {"weighted_mode": {"axis": 0}, "check_is_fitted": {"msg": None, "all_or_any": all},
+                   "gen_even_slices": {"n_samples": None}}
+_SLICE_WRAPPER = "validate_params.<locals>.decorator.<locals>.wrapper"
+_TREE_JOBLIB_METHODS = ("__init__", "__call__", "_initialize_backend", "_reset_run_tracking",
+                        "_get_sequential_output", "_get_batch_size", "print_progress")
+_TREE_CLASS_METADATA = {"__module__", "__doc__", "__firstlineno__", "__static_attributes__"}
+_SKLEARN_PARALLEL_FIELDS = _TREE_CLASS_METADATA | {"__call__"}
 _FULL_MEMBERSHIP_TREES = {
     "kd_tree": (KDTree, KDTree.query, KDTree.__getstate__),
     "ball_tree": (BallTree, BallTree.query, BallTree.__getstate__),
@@ -39,8 +63,14 @@ _FULL_MEMBERSHIP_TREES = {
 from joblib import __version__ as _JOBLIB_CALLBACK_VERSION
 from joblib import parallel as _callback_parallel
 from sklearn.neighbors import _base as _callback_neighbors_base
+from sklearn import utils as _sklearn_utils
+from sklearn.utils import parallel as _tree_parallel
 
 _CALLBACK_MISSING = object()
+# The classifier can retain the generator after the optional utils re-export
+# disappears. Its native prediction remains available in that configuration.
+_tree_slices = vars(_sklearn_utils).get(
+    "gen_even_slices", vars(_callback_neighbors_base).get("gen_even_slices", _CALLBACK_MISSING))
 
 
 def _callback_static(owner, name):
@@ -50,11 +80,7 @@ def _callback_static(owner, name):
     return _CALLBACK_MISSING
 
 
-_CALLBACK_JOBLIB_FUNCTIONS = tuple(
-    (name, getattr(_callback_parallel, name, None))
-    for name in ("effective_n_jobs", "get_active_backend", "_get_active_backend", "_get_config_param")
-)
-_CALLBACK_EFFECTIVE = getattr(_callback_parallel, "effective_n_jobs", None)
+_CALLBACK_JOBLIB_FUNCTIONS = ("effective_n_jobs", "get_active_backend", "_get_active_backend", "_get_config_param")
 _CALLBACK_LOCAL = getattr(_callback_parallel, "_backend", None)
 _CALLBACK_DEFAULTS = getattr(_callback_parallel, "default_parallel_config", None)
 _CALLBACK_DEFAULT_KEYS = ("backend", "n_jobs", "prefer", "require", "verbose")
@@ -68,24 +94,606 @@ for _name in ("SequentialBackend", "ThreadingBackend", "LokyBackend", "Multiproc
     _owner = getattr(_callback_parallel, _name, None)
     if isinstance(_owner, type):
         _CALLBACK_STOCK[_owner] = tuple(_callback_static(_owner, name) for name in _CALLBACK_CLASS_FIELDS)
-_CALLBACK_TAG_CHAIN = tuple(
-    (owner, owner.__dict__.get("__sklearn_tags__", _CALLBACK_MISSING))
-    for owner in KNeighborsClassifier.__mro__
-)
+_TREE_BACKEND_CONFIGURES = tuple((owner, _callback_static(owner, "configure")) for owner in _CALLBACK_STOCK)
 
 
-def _native_callback_context(model):
+def _plain_tree_dispatch():
+    """Recognize stock Joblib tree dispatch without invoking backend factories."""
+    if (vars(_callback_neighbors_base).get("Parallel") is not vars(_tree_parallel).get("Parallel", _CALLBACK_MISSING)
+            or vars(_callback_neighbors_base).get("delayed") is not vars(_tree_parallel).get("delayed", _CALLBACK_MISSING)
+            or _CALLBACK_LOCAL is None or type(_CALLBACK_DEFAULTS) is not dict
+            or getattr(_callback_parallel, "_backend", None) is not _CALLBACK_LOCAL
+            or getattr(_callback_parallel, "default_parallel_config", None) is not _CALLBACK_DEFAULTS
+            or getattr(_CALLBACK_LOCAL, "config", _CALLBACK_DEFAULTS) is not _CALLBACK_DEFAULTS):
+        return False
+    # Parallel(prefer="threads") can construct both the default and threading
+    # backends. A registered factory may have observable effects at construction.
+    registry = getattr(_callback_parallel, "BACKENDS", None)
+    default = getattr(_callback_parallel, "DEFAULT_BACKEND", None)
+    threaded = getattr(_callback_parallel, "DEFAULT_THREAD_BACKEND", None)
+    if (type(registry) is not dict or type(default) is not str or default not in {"loky", "threading"}
+            or type(threaded) is not str or threaded != "threading"):
+        return False
+    # Another thread can register a backend while predictions are running.
+    registry = registry.copy()
+    if any(type(name) is not str for name in registry):
+        return False
+    providers = vars(_callback_parallel)
+    threading_backend, loky_backend = registry.get("threading"), registry.get("loky")
+    return (threading_backend is not None and threading_backend is providers.get("ThreadingBackend")
+            and (default == "threading" or
+                 (loky_backend is not None and loky_backend is providers.get("LokyBackend"))))
+
+
+def _older_serial_brute(model):
+    """Admit the separately qualified older pair only in its stock serial brute domain."""
+    state = object.__getattribute__(model, "__dict__")
+    jobs, method = state.get("n_jobs"), state.get("_fit_method")
+    if (not (jobs is None or (type(jobs) is int and jobs == 1))
+            or type(method) is not str or method != "brute"
+            or _tree_slices is _CALLBACK_MISSING
+            or vars(_sklearn_utils).get("gen_even_slices", _CALLBACK_MISSING) is not _tree_slices
+            or vars(_callback_neighbors_base).get("gen_even_slices") is not _tree_slices
+            or not _plain_tree_dispatch()
+            or not all(_callback_static(owner, "configure") is configure
+                       for owner, configure in _TREE_BACKEND_CONFIGURES)):
+        return False
+    # The existing native callback guard checks stock Joblib resolvers,
+    # backend methods and default sentinels for n_jobs=None. Under ordinary
+    # defaults, stock effective_n_jobs(None) resolves to one.
+    config = get_config()
+    return (config.get("enable_cython_pairwise_dist") is True
+            and config.get("array_api_dispatch") is False
+            and config.get("assume_finite") is False)
+
+
+@lru_cache(maxsize=12)
+def _installed_query_code(module):
+    """Read installed query definitions without executing a module or a custom loader."""
+    namespace = vars(module)
+    spec = namespace.get("__spec__")
+    filename = namespace.get("__file__")
+    if type(spec) is not ModuleSpec or type(filename) is not str:
+        return {}
+    origin = vars(spec).get("origin")
+    if type(origin) is not str or origin != filename:
+        return {}
+    try:
+        path = Path(filename)
+        if not path.is_absolute() or path.suffix != ".py" or not path.is_file():
+            return {}
+        loader = namespace.get("__loader__")
+        loader_path = vars(loader).get("path") if type(loader) is SourceFileLoader else None
+        if type(loader_path) is str and loader_path == filename:
+            # A standard loader instance can also have per-instance hooks.
+            # Reuse the normal bytecode cache without invoking those hooks.
+            code = SourceFileLoader(module.__name__, filename).get_code(module.__name__)
+        else:
+            # Profilers and import hooks can wrap an ordinary source loader.
+            # Read its declared file directly without calling the wrapper.
+            code = compile(path.read_bytes(), filename, "exec", dont_inherit=True)
+        definitions = [item for item in code.co_consts if type(item) is CodeType]
+        names = _QUERY_METHODS | {"compute", "valid_metrics", "is_usable_for", "__sklearn_tags__",
+                                  "_get_tags", "_more_tags", *_TREE_JOBLIB_METHODS,
+                                  "with_config", "with_config_and_warning_filters",
+                                  "configure", "effective_n_jobs", "compute_batch_size"}
+        methods = {method.co_qualname: method for owner in definitions for method in owner.co_consts
+                   if type(method) is CodeType and method.co_name in names}
+        functions = _VOTE_FUNCTIONS | {"effective_n_jobs", "get_active_backend", "_get_active_backend",
+                                       "_get_config_param", "get_config", "delayed", "gen_even_slices",
+                                       "validate_params", "_with_config", "_with_config_and_warning_filters",
+                                       "_get_threadlocal_config", "config_context", "set_config", "memstr_to_bytes"}
+        methods.update((item.co_name, item) for item in definitions if item.co_name in functions)
+        # The slice dispatcher is decorated. Its public callable and its
+        # underlying generator have separate installed definitions.
+        nested = methods.get("validate_params")
+        for name in ("decorator", "wrapper"):
+            if nested is None:
+                break
+            nested = next((item for item in nested.co_consts
+                           if type(item) is CodeType and item.co_name == name), None)
+        if nested is not None:
+            methods[nested.co_qualname] = nested
+        return methods
+    except (ImportError, OSError, EOFError, AttributeError, TypeError, ValueError, SyntaxError):
+        return {}
+
+
+_QUERY_BINDINGS = {}
+
+
+def _capture_query_function(function, module, name, slots, functions):
+    if (type(function) is not FunctionType or function.__globals__ is not vars(module)
+            or function.__code__ != _installed_query_code(module).get(name)):
+        return False
+    defaults, expected = function.__defaults__, _QUERY_DEFAULTS.get(name)
+    if name == "set_config":
+        expected = (None,) * function.__code__.co_argcount
+    if expected is None:
+        if defaults is not None:
+            return False
+    elif (type(defaults) is not tuple or len(defaults) != len(expected)
+          or any(type(value) is not type(want) or value != want for value, want in zip(defaults, expected))):
+        return False
+    keywords, expected = function.__kwdefaults__, _QUERY_KEYWORDS.get(name)
+    if name == "config_context":
+        code = function.__code__
+        expected = dict.fromkeys(code.co_varnames[code.co_argcount:code.co_argcount + code.co_kwonlyargcount])
+    if expected is None:
+        if keywords is not None:
+            return False
+    else:
+        if (type(keywords) is not dict or len(keywords) != len(expected)
+                or any(keywords.get(key, _CALLBACK_MISSING) is not value for key, value in expected.items())):
+            return False
+        slots.extend((keywords, key, value) for key, value in expected.items())
+    functions.append((function, function.__code__, defaults, keywords))
+    return True
+
+
+def _stock_tree_state(state):
+    classes, constraint_cell, wrapper, raw, interval_type = state
+    wrapper_fields, raw_fields = vars(wrapper), vars(raw)
+    for namespace, allowed in classes:
+        if any(type(key) is not str for key in namespace) or not namespace.keys() <= allowed:
+            return False
+    if (type(wrapper_fields) is not dict or type(raw_fields) is not dict
+            or any(type(key) is not str for ns in (wrapper_fields, raw_fields) for key in ns)
+            or wrapper_fields.get("__wrapped__") is not raw
+            or any(name in raw_fields for name in ("__signature__", "__wrapped__", "__text_signature__"))):
+        return False
+    constraints = constraint_cell.cell_contents
+    if (type(constraints) is not dict or any(type(key) is not str for key in constraints)
+            or constraints.keys() != {"n", "n_packs", "n_samples"}):
+        return False
+    for name, choices in constraints.items():
+        optional = name == "n_samples"
+        if (type(choices) is not list or len(choices) != 1 + optional
+                or (optional and choices[1] is not None) or type(choices[0]) is not interval_type):
+            return False
+        fields = object.__getattribute__(choices[0], "__dict__")
+        if (type(fields) is not dict or any(type(key) is not str for key in fields)
+                or fields.keys() != {"type", "left", "right", "closed", "hidden"}
+                or fields["type"] is not Integral or fields["hidden"] is not False
+                or type(fields["left"]) is not int or fields["left"] != 1 or fields["right"] is not None
+                or type(fields["closed"]) is not str or fields["closed"] != "left"):
+            return False
+    return True
+
+
+def _capture_dispatch_methods(module, class_name, owner, names, slots, functions):
+    """Capture a dispatcher class and its installed method definitions."""
+    if type(owner) is not type or vars(module).get(class_name) is not owner:
+        return False
+    slots.append((vars(module), class_name, owner))
+    namespace = vars(owner)
+    for name in names:
+        method = namespace.get(name)
+        if not _capture_query_function(method, module, class_name + "." + name, slots, functions):
+            return False
+        slots.append((namespace, name, method))
+    return True
+
+
+def _capture_serial_backends(slots, functions, hierarchies, cells):
+    """Recognize the backend methods called by an ordinary one-worker tree query."""
+    from joblib import _parallel_backends as backends
+
+    module = vars(backends)
+    installed = _installed_query_code(backends)
+    base, pool, auto = (module[name] for name in ("ParallelBackendBase", "PoolManagerMixin", "AutoBatchingMixin"))
+    # Lookup on the concrete class and each mixin matters: a subclass can
+    # override an inherited method before the adapter first sees the backend.
+    route = (
+        ("ParallelBackendBase", (object,), ("__init__", "configure", "compute_batch_size")),
+        ("PoolManagerMixin", (object,), ("__init__", "effective_n_jobs")),
+        ("AutoBatchingMixin", (object,), ("__init__",)),
+        ("LokyBackend", (auto, base), ("__init__", "effective_n_jobs")),
+        ("ThreadingBackend", (pool, base), ("__init__", "configure", "effective_n_jobs")),
+        ("SequentialBackend", (base,), ("__init__", "configure", "effective_n_jobs", "compute_batch_size")),
+        ("FallbackToBackend", (Exception,), ("__init__",)),
+    )
+    for class_name, bases, methods in route:
+        owner = module[class_name]
+        metaclass = ABCMeta if class_name == "ParallelBackendBase" or any(parent is base for parent in bases) else type
+        if type(owner) is not metaclass or owner.__bases__ != bases:
+            return False
+        slots.append((module, class_name, owner))
+        if class_name in ("LokyBackend", "ThreadingBackend", "SequentialBackend", "FallbackToBackend"):
+            if vars(_callback_parallel).get(class_name) is not owner:
+                return False
+            slots.append((vars(_callback_parallel), class_name, owner))
+        hierarchies.append((owner, owner.__mro__))
+        namespace = vars(owner)
+        for name in methods:
+            descriptor = namespace.get(name, _CALLBACK_MISSING)
+            key = class_name + "." + name
+            if key in installed:
+                if not _capture_query_function(descriptor, backends, key, slots, functions):
+                    return False
+                if descriptor.__code__.co_freevars == ("__class__",):
+                    cells.append((descriptor.__closure__[0], owner))
+            elif descriptor is not _CALLBACK_MISSING:
+                return False
+            slots.append((namespace, name, descriptor))
+        # Construction, thread preference, and the fallback exception use
+        # ordinary attribute access. A descriptor here could select a pool.
+        for name in ("__new__", "__getattribute__", "__getattr__", "__setattr__", "__delattr__", "__del__",
+                     "uses_threads", "supports_sharedmem", "nesting_level"):
+            expected = _CALLBACK_MISSING
+            if (name in ("uses_threads", "supports_sharedmem")
+                    and class_name in ("ThreadingBackend", "SequentialBackend")):
+                expected = True
+            elif name == "nesting_level" and owner is base:
+                expected = None
+            if namespace.get(name, _CALLBACK_MISSING) is not expected:
+                return False
+            slots.append((namespace, name, expected))
+    return True
+
+
+def _capture_parallel_delegates(owner, slots, functions, hierarchies, cells):
+    # These are the inherited constructor, the super().__call__ target and its
+    # ordinary serial dispatch methods. Recognize their installed code before caching.
+    from joblib import logger as joblib_logger
+
+    config = vars(_callback_parallel).get("default_parallel_config")
+    logger = vars(_callback_parallel).get("Logger")
+    if (type(owner) is not type or type(config) is not dict or type(logger) is not type
+            or len(owner.__mro__) != 3 or owner.__mro__[1] is not logger or owner.__mro__[2] is not object
+            or not _capture_dispatch_methods(joblib_logger, "Logger", logger, ("__init__",), slots, functions)):
+        return False
+    hierarchies.append((owner, owner.__mro__))
+    # Construction and assignment rely on object's native special methods.
+    for ancestor in (owner, logger):
+        for name in ("__new__", "__getattribute__", "__getattr__", "__setattr__", "__delattr__", "__del__"):
+            if name in vars(ancestor):
+                return False
+            slots.append((vars(ancestor), name, _CALLBACK_MISSING))
+    ns = vars(owner)
+    for name in _TREE_JOBLIB_METHODS:
+        fn = ns.get(name)
+        key = "Parallel." + name
+        if name != "__init__":
+            if not _capture_query_function(fn, _callback_parallel, key, slots, functions):
+                return False
+        else:
+            if (type(fn) is not FunctionType or fn.__globals__ is not vars(_callback_parallel)
+                    or fn.__code__ != _installed_query_code(_callback_parallel).get(key)
+                    or fn.__kwdefaults__ is not None or fn.__code__.co_freevars != ("__class__",)):
+                return False
+            parameters = fn.__code__.co_varnames[1:fn.__code__.co_argcount]
+            literals = {"return_as": "list", "timeout": None, "pre_dispatch": "2 * n_jobs", "batch_size": "auto"}
+            defaults = fn.__defaults__
+            if type(defaults) is not tuple or len(defaults) != len(parameters):
+                return False
+            for field, value in zip(parameters, defaults):
+                if field in literals:
+                    if type(value) is not type(literals[field]) or value != literals[field]:
+                        return False
+                elif config.get(field, _CALLBACK_MISSING) is value:
+                    slots.append((config, field, value))
+                else:
+                    return False
+            cells.append((fn.__closure__[0], owner))
+            functions.append((fn, fn.__code__, defaults, None))
+        slots.append((ns, name, fn))
+    return True
+
+
+def _capture_tree_bindings(slots, functions, hierarchies, cells):
+    """Recognize the three direct callables in the installed tree query expression."""
+    import contextlib
+    import joblib
+    from joblib import disk
+    from sklearn import _config, utils
+    from sklearn.utils import _chunking, _param_validation
+
+    caller = vars(_callback_neighbors_base)
+    for provider, name, aliases in (
+        (_tree_parallel, "delayed", (caller,)),
+        (_tree_parallel, "Parallel", (caller,)),
+        (_chunking, "gen_even_slices", (vars(utils), caller)),
+    ):
+        namespace = vars(provider)
+        target = namespace.get(name)
+        if target is None or any(alias.get(name) is not target for alias in aliases):
+            return False
+        slots.extend((owner, name, target) for owner in (namespace, *aliases))
+
+    for source, name, aliases in (
+        (_config, "get_config", (_tree_parallel, _param_validation)),
+        (_config, "_get_threadlocal_config", ()), (_config, "set_config", ()),
+        (disk, "memstr_to_bytes", (_callback_parallel,)),
+    ):
+        target = vars(source).get(name)
+        if (not _capture_query_function(target, source, name, slots, functions)
+                or any(vars(module).get(name) is not target for module in aliases)):
+            return False
+        slots.extend((vars(module), name, target) for module in (source, *aliases))
+    # The emitted task and the slice validator enter the same sklearn context
+    # through contextlib's ordinary wrapper, which calls its captured generator.
+    context = vars(_config).get("config_context")
+    helper = next((code for code in contextlib.contextmanager.__code__.co_consts
+                   if type(code) is CodeType and code.co_name == "helper"), None)
+    if (type(context) is not FunctionType or context.__globals__ is not vars(contextlib)
+            or context.__code__ is not helper or context.__code__.co_freevars != ("func",)
+            or context.__defaults__ is not None or context.__kwdefaults__ is not None):
+        return False
+    raw = context.__closure__[0].cell_contents
+    if not _capture_query_function(raw, _config, "config_context", slots, functions):
+        return False
+    for module in (_config, _tree_parallel, _param_validation):
+        if vars(module).get("config_context") is not context:
+            return False
+        slots.append((vars(module), "config_context", context))
+    functions.append((context, helper, None, None))
+    cells.append((context.__closure__[0], raw))
+    if (not _capture_serial_backends(slots, functions, hierarchies, cells)
+            or not _capture_query_function(caller["delayed"], _tree_parallel, "delayed", slots, functions)):
+        return False
+    # delayed emits a callable task. Parallel attaches configuration to it and
+    # Joblib invokes it with the selected width and return_distance flag.
+    provider = vars(_tree_parallel)
+    task = provider.get("_FuncWrapper")
+    # Earlier sklearn releases only propagated the configuration to the task.
+    config_method = ("with_config_and_warning_filters"
+                     if "_with_config_and_warning_filters" in _installed_query_code(_tree_parallel) else "with_config")
+    task_methods = ("__init__", config_method, "__call__")
+    helper_name = "_" + config_method
+    attach = provider.get(helper_name)
+    if (type(task) is not type or task.__base__ is not object
+            or not _capture_dispatch_methods(_tree_parallel, "_FuncWrapper", task, task_methods, slots, functions)
+            or not _capture_query_function(attach, _tree_parallel, helper_name, slots, functions)):
+        return False
+    slots.append((provider, helper_name, attach))
+    hierarchies.append((task, task.__mro__))
+    task_namespace = vars(task)
+    for name in ("__dict__", "__weakref__"):
+        descriptor = task_namespace.get(name)
+        if (type(descriptor) is not GetSetDescriptorType or descriptor.__objclass__ is not task
+                or descriptor.__name__ != name):
+            return False
+        slots.append((task_namespace, name, descriptor))
+    parallel = caller["Parallel"]
+    if (type(parallel) is not type or len(parallel.__bases__) != 1
+            or parallel.__base__ is not vars(_callback_parallel).get("Parallel")
+            or parallel.__base__ is not vars(joblib).get("Parallel")
+            or not _capture_parallel_delegates(parallel.__base__, slots, functions, hierarchies, cells)):
+        return False
+    slots.extend((vars(module), "Parallel", parallel.__base__) for module in (joblib, _callback_parallel))
+    namespace = vars(parallel)
+    call = namespace.get("__call__")
+    if not _capture_query_function(call, _tree_parallel, "Parallel.__call__", slots, functions):
+        return False
+    hierarchies.append((parallel, parallel.__mro__))
+    slots.append((namespace, "__call__", call))
+    cells.append((call.__closure__[call.__code__.co_freevars.index("__class__")], parallel))
+
+    slices = caller["gen_even_slices"]
+    if not _capture_query_function(slices, _param_validation, _SLICE_WRAPPER, slots, functions):
+        return False
+    wrapper_fields = vars(slices)
+    if type(wrapper_fields) is not dict or any(type(key) is not str for key in wrapper_fields):
+        return False
+    raw = wrapper_fields.get("__wrapped__")
+    if not _capture_query_function(raw, _chunking, "gen_even_slices", slots, functions):
+        return False
+    # functools.wraps exposes metadata; the actual call uses the closure.
+    if slices.__code__.co_freevars != ("func", "parameter_constraints", "prefer_skip_nested_validation"):
+        return False
+    generator, constraints, prefer_skip = slices.__closure__
+    cells.extend(((generator, raw), (prefer_skip, True)))
+    task_fields = _TREE_CLASS_METADATA | {"__dict__", "__weakref__", *task_methods}
+    classes = ((namespace, _SKLEARN_PARALLEL_FIELDS), (task_namespace, task_fields))
+    state = classes, constraints, slices, raw, vars(_param_validation)["Interval"]
+    if all(cell.cell_contents is value for cell, value in cells) and _stock_tree_state(state):
+        return state
+    return False
+
+
+def _capture_callback_bindings(slots, functions):
+    # Validate hooks against the installed definitions. An import-time snapshot
+    # alone can capture a callback a profiler or application already installed.
+    for owner in KNeighborsClassifier.__mro__:
+        if not owner.__module__.startswith("sklearn."):
+            continue
+        module = sys.modules[owner.__module__]
+        code = _installed_query_code(module)
+        names = ("__sklearn_tags__",)
+        if _SKLEARN_VERSION.startswith("1.6."):
+            names += ("_get_tags", "_more_tags")
+        for name in names:
+            namespace = vars(owner)
+            function = namespace.get(name, _CALLBACK_MISSING)
+            key = owner.__name__ + "." + name
+            if function is not _CALLBACK_MISSING or key in code:
+                if not _capture_query_function(function, module, key, slots, functions):
+                    return False
+            slots.append((namespace, name, function))
+        if "__sklearn_is_fitted__" in vars(owner):
+            return False
+        slots.append((vars(owner), "__sklearn_is_fitted__", _CALLBACK_MISSING))
+
+    for name in _CALLBACK_JOBLIB_FUNCTIONS:
+        namespace = vars(_callback_parallel)
+        function = namespace.get(name)
+        if (type(function) is not FunctionType or function.__globals__ is not namespace
+                or function.__code__ != _installed_query_code(_callback_parallel).get(name)
+                or function.__kwdefaults__ is not None):
+            return False
+        defaults = function.__defaults__
+        if name == "effective_n_jobs":
+            if (type(defaults) is not tuple or len(defaults) != 1
+                    or type(defaults[0]) is not int or defaults[0] != -1
+                    or vars(_callback_neighbors_base).get(name) is not function):
+                return False
+            slots.append((vars(_callback_neighbors_base), name, function))
+        elif name == "_get_config_param":
+            if defaults is not None:
+                return False
+        elif (type(defaults) is not tuple or len(defaults) != 3 or any(
+                value is not _CALLBACK_SENTINELS.get(key)
+                for value, key in zip(defaults, ("prefer", "require", "verbose")))):
+            return False
+        slots.append((namespace, name, function))
+        functions.append((function, function.__code__, defaults, None))
+    return True
+
+
+def _capture_query_bindings(brute):
+    """Capture raw lookup slots only after comparing them with the installed definitions."""
+    from sklearn.neighbors import _classification
+    from sklearn.utils import _tags, arrayfuncs, extmath, fixes, validation
+
+    if vars(_classification).get("KNeighborsClassifier") is not KNeighborsClassifier:
+        return None
+    methods = [(KNeighborsClassifier, _callback_neighbors_base, "KNeighborsMixin", "kneighbors"),
+               (KNeighborsClassifier, _callback_neighbors_base, "KNeighborsMixin", "_kneighbors_reduce_func"),
+               (KNeighborsClassifier, _classification, "KNeighborsClassifier", "predict"),
+               (KNeighborsClassifier, _classification, "KNeighborsClassifier", "predict_proba")]
+    slots, functions = [], []
+    if not _capture_callback_bindings(slots, functions):
+        return None
+    hierarchies = [(KNeighborsClassifier, KNeighborsClassifier.__mro__)]
+    cells = []
+    tree_state = None if brute else _capture_tree_bindings(slots, functions, hierarchies, cells)
+    if not brute and not tree_state:
+        return None
+    # These are the validation and voting functions that the public classifier
+    # calls directly. Reuse can omit them even when its three methods are stock.
+    neighbors_base = _callback_neighbors_base
+    for module, names, aliases in (
+        (fixes, ("_mode",), (_classification,)),
+        (extmath, ("weighted_mode",), (_classification,)),
+        (neighbors_base, ("_get_weights", "_check_precomputed"), (_classification,)),
+        (_classification, ("_adjusted_metric",), ()),
+        (validation, ("_num_samples",), (_classification,)),
+        (validation, ("check_is_fitted", "validate_data"), (_classification, neighbors_base)),
+        (_tags, ("get_tags",), (neighbors_base,)),
+        (arrayfuncs, ("_all_with_any_reduction_axis_1",), (_classification,)),
+    ):
+        for name in names:
+            function = vars(module).get(name)
+            if module is arrayfuncs:
+                if (type(function) is not type(vars(arrayfuncs).get("min_pos"))
+                        or type(function).__name__ != "fused_cython_function"
+                        or function.__name__ != name
+                        or function.__module__ not in (module.__name__, type(function).__module__)):
+                    return None
+            elif not _capture_query_function(function, module, name, slots, functions):
+                return None
+            for owner in (module, *aliases):
+                namespace = vars(owner)
+                if namespace.get(name) is not function:
+                    return None
+                slots.append((namespace, name, function))
+    if brute:
+        from sklearn.metrics._pairwise_distances_reduction import _argkmin, _argkmin_classmode, _dispatcher
+        from sklearn import _config
+
+        if (vars(_dispatcher).get("get_config") is not get_config
+                or not _capture_query_function(get_config, _config, "get_config", slots, functions)):
+            return None
+        slots.append((vars(_dispatcher), "get_config", get_config))
+
+        base = vars(_dispatcher).get("BaseDistancesReductionDispatcher")
+        if type(base) is not type:
+            return None
+        slots.append((vars(_dispatcher), "BaseDistancesReductionDispatcher", base))
+        for host, name, extension in ((_callback_neighbors_base, "ArgKmin", _argkmin),
+                                      (_classification, "ArgKminClassMode", _argkmin_classmode)):
+            dispatch = vars(_dispatcher).get(name)
+            if (type(dispatch) is not type or dispatch.__bases__ != (base,)
+                    or vars(host).get(name) is not dispatch):
+                return None
+            hierarchies.append((dispatch, dispatch.__mro__))
+            slots.extend(((vars(host), name, dispatch), (vars(_dispatcher), name, dispatch)))
+            # The Python dispatcher calls these dtype-specific extension types
+            # directly. Py_TPFLAGS_IMMUTABLETYPE guarantees their compute
+            # descriptors cannot be rebound on the class.
+            for suffix in ("32", "64"):
+                kernel_name = name + suffix
+                kernel = vars(extension).get(kernel_name)
+                if (type(kernel) is not type or not (kernel.__flags__ & (1 << 8))
+                        or kernel.__name__ != kernel_name or kernel.__module__ != extension.__name__
+                        or type(vars(kernel).get("compute")) is not classmethod
+                        or vars(_dispatcher).get(kernel_name) is not kernel):
+                    return None
+                slots.append((vars(_dispatcher), kernel_name, kernel))
+            metrics_owner = name if name == "ArgKminClassMode" else "BaseDistancesReductionDispatcher"
+            methods.extend(((dispatch, _dispatcher, name, "compute"),
+                            (dispatch, _dispatcher, "BaseDistancesReductionDispatcher", "is_usable_for"),
+                            (dispatch, _dispatcher, metrics_owner, "valid_metrics")))
+
+    for receiver, module, owner_name, name in methods:
+        owner = vars(module).get(owner_name)
+        for ancestor in receiver.__mro__:
+            namespace = vars(ancestor)
+            descriptor = namespace.get(name, _CALLBACK_MISSING)
+            slots.append((namespace, name, descriptor))
+            if ancestor is owner:
+                break
+            if descriptor is not _CALLBACK_MISSING:
+                return None
+        else:
+            return None
+        function = descriptor
+        if receiver is not KNeighborsClassifier:
+            if type(descriptor) is not classmethod:
+                return None
+            function = descriptor.__func__
+        qualified_name = owner_name + "." + name
+        if not _capture_query_function(function, module, qualified_name, slots, functions):
+            return None
+    return slots, functions, hierarchies, cells, tree_state
+
+
+def _native_query_methods(model, shared_model):
+    """Recheck live public and dispatcher bindings before sharing any selected-k query."""
+    if type(model) is not KNeighborsClassifier or type(shared_model) is not KNeighborsClassifier:
+        return False
+    state, shared_state = vars(model), vars(shared_model)
+    backend, shared_backend = state.get("_fit_method"), shared_state.get("_fit_method")
+    if (type(backend) is not str or type(shared_backend) is not str or backend != shared_backend
+            or any(name in state or name in shared_state for name in _QUERY_METHODS)):
+        return False
+    brute = backend == "brute"
+    bindings = _QUERY_BINDINGS.get(brute)
+    if bindings is None:
+        try:
+            bindings = _capture_query_bindings(brute)
+        except (ImportError, AttributeError, IndexError, KeyError, RuntimeError, TypeError, ValueError):
+            return False
+        if bindings is None:
+            # A pre-import override may be restored between predictions.
+            return False
+        _QUERY_BINDINGS[brute] = bindings
+    slots, functions, hierarchies, cells, tree_state = bindings
+    try:
+        if (any(cell.cell_contents is not value for cell, value in cells)
+                or (tree_state is not None and not _stock_tree_state(tree_state))):
+            return False
+    except (IndexError, KeyError, RuntimeError, ValueError):  # emptied cell or concurrently changed state
+        return False
+    return (all(owner.__mro__ is mro for owner, mro in hierarchies)
+            and all(namespace.get(name, _CALLBACK_MISSING) is value for namespace, name, value in slots)
+            and all(function.__code__ is code and function.__defaults__ is defaults
+                    and function.__kwdefaults__ is keywords
+                    for function, code, defaults, keywords in functions))
+
+
+def _native_callback_context(model, *, full_membership=True, verified_serial_tree=False):
     """Permit proof only when omitted native calls contain no user callbacks."""
     try:
-        if (type(model) is not KNeighborsClassifier or _JOBLIB_CALLBACK_VERSION != "1.6.0"
-                or _CALLBACK_EFFECTIVE is None
-                or _callback_neighbors_base.effective_n_jobs is not _CALLBACK_EFFECTIVE
+        if (type(model) is not KNeighborsClassifier
+                or vars(_callback_neighbors_base).get("effective_n_jobs") is not _callback_parallel.effective_n_jobs
                 or "__sklearn_tags__" in model.__dict__
                 or "__sklearn_is_fitted__" in model.__dict__):
             return False
-        for owner, method in _CALLBACK_TAG_CHAIN:
-            if (owner.__dict__.get("__sklearn_tags__", _CALLBACK_MISSING) is not method
-                    or "__sklearn_is_fitted__" in owner.__dict__):
+        if full_membership:
+            pair = (_SKLEARN_VERSION, _JOBLIB_CALLBACK_VERSION)
+            if pair != ("1.9.1", "1.6.0") and (pair != ("1.9.0", "1.5.3") or not _older_serial_brute(model)):
                 return False
         jobs = model.n_jobs
         if type(jobs) is int and jobs == 1:
@@ -97,9 +705,6 @@ def _native_callback_context(model):
                 or _callback_parallel.default_parallel_config is not _CALLBACK_DEFAULTS
                 or type(_CALLBACK_DEFAULTS) is not dict):
             return False
-        for name, function in _CALLBACK_JOBLIB_FUNCTIONS:
-            if function is None or getattr(_callback_parallel, name, None) is not function:
-                return False
         config = getattr(_CALLBACK_LOCAL, "config", _CALLBACK_DEFAULTS)
         if type(config) is not dict:
             return False
@@ -123,6 +728,10 @@ def _native_callback_context(model):
             if not (jobs is None or (type(jobs) is int and jobs != 0)):
                 return False
         backend = current["backend"]
+        if verified_serial_tree and backend is None:
+            # The tree binding check has positively identified the current
+            # backend methods, including ones restored after package import.
+            return True
         if backend is None:
             registry = _callback_parallel.BACKENDS
             name = _callback_parallel.DEFAULT_BACKEND
@@ -162,6 +771,17 @@ def _native_callback_context(model):
         return False
 
 
+def _is_integer_index(value):
+    # NumPy durations register as Integral and can compare equal to integers.
+    return isinstance(value, Integral) and not isinstance(value, (bool, np.bool_, np.timedelta64))
+
+
+def _has_euclidean_metric(model):
+    metric = getattr(model, "effective_metric_", None)
+    params = getattr(model, "effective_metric_params_", None)
+    return type(metric) is str and metric == "euclidean" and type(params) is dict and not params
+
+
 class _KNNQueryReuse:
     """Share neighbor order only among fitted heads with identical training data.
 
@@ -172,17 +792,22 @@ class _KNNQueryReuse:
     Private fitted-state use is deliberately confined to this adapter.
     """
 
-    def __init__(self, models, query, *, _study_call_contract=None):
+    def __init__(self, models, query, *, _study_call_contract=None, _head_fit_input=None,
+                 _query_values=None, _native_input_validation=False):
         self.models = models
         self.query = query
+        # Only the study can identify the array it just passed to every head's fit.
+        self._fresh_kd_coordinates = _head_fit_input if type(_head_fit_input) is np.ndarray else None
         # Sparse matrices deliberately reject len(); their unsupported path
         # must still reach the ordinary public estimator.
-        self.query_rows = query.shape[0] if hasattr(query, "shape") else len(query)
+        values = query if _query_values is None else _query_values
+        self.query_rows = values.shape[0] if hasattr(values, "shape") else len(values)
         self.groups = []
         self.by_k = {}
         self.query_seconds = 0.0
         for k, model in models.items():
-            reason = self._unsupported(model, query)
+            reason = ("native_pipeline_input_validation" if _native_input_validation
+                      else self._unsupported(k, model, query))
             if reason is not None:
                 self.by_k[k] = (None, reason)
                 continue
@@ -201,15 +826,16 @@ class _KNNQueryReuse:
             self._install_study_contract(_study_call_contract)
 
     @staticmethod
-    def _unsupported(model, query):
+    def _unsupported(k, model, query):
         if type(model) is not KNeighborsClassifier:
             return "unsupported_estimator"
-        if not isinstance(model.weights, str) or model.weights not in {"uniform", "distance"}:
+        weights = getattr(model, "weights", None)
+        if type(weights) is not str or weights not in {"uniform", "distance"}:
             return "callable_or_unsupported_weights"
-        if getattr(model, "_fit_method", None) not in {"brute", "kd_tree", "ball_tree"}:
+        method = getattr(model, "_fit_method", None)
+        if type(method) is not str or method not in {"brute", "kd_tree", "ball_tree"}:
             return "unknown_neighbor_backend"
-        if (getattr(model, "effective_metric_", None) != "euclidean"
-                or getattr(model, "effective_metric_params_", None)):
+        if not _has_euclidean_metric(model):
             return "non_euclidean_metric"
         train = getattr(model, "_fit_X", None)
         classes = getattr(model, "classes_", None)
@@ -223,9 +849,10 @@ class _KNNQueryReuse:
                 or len(encoded) != len(train) or query.shape[1] != train.shape[1]
                 or not len(query)):
             return "unsupported_fitted_state_or_array"
-        if (not isinstance(model.n_neighbors, Integral) or isinstance(model.n_neighbors, bool)
-                or not 1 <= model.n_neighbors <= len(train)):
+        if not _is_integer_index(model.n_neighbors) or not 1 <= model.n_neighbors <= len(train):
             return "unsupported_neighbor_count"
+        if not _is_integer_index(k) or k != model.n_neighbors:
+            return "neighbor_key_mismatch"
         return None
 
     @staticmethod
@@ -328,12 +955,58 @@ class _KNNQueryReuse:
         """Return predictions (or probabilities), diagnostics and shared warnings."""
         model = self.models[k]
         group, reason = self.by_k[k]
+        # Dictionary lookup can match integer keys to booleans or floats.
+        # Such a lookup value cannot safely index a neighbor array.
+        if type(k) is not int and not _is_integer_index(k):
+            group, reason = None, "neighbor_key_mismatch"
         study_plan = self._study_plan_for_call(
             group, k, probabilities, decision_threshold, positive_index)
         metadata = {"accelerated": False, "shared_query_attempted": False,
                     "public_fallback_query_rows": self.query_rows}
         if group is None or (len(group["ks"]) == 1 and study_plan is None):
             metadata["reason"] = reason or "single_head_backend"
+            return self._public(model, probabilities), metadata, []
+        if decision_threshold is not None:
+            if not _is_integer_index(positive_index) or not 0 <= positive_index < len(model.classes_):
+                raise IndexError("decision_threshold requires a valid positive class index.")
+            if not isinstance(decision_threshold, Real) or isinstance(decision_threshold, np.timedelta64):
+                raise TypeError("decision_threshold must be a real scalar.")
+        if model._fit_method == "ball_tree":
+            # Rounded pruning can depend on query width. Even a one-leaf or
+            # full-width search runs the selected head's Joblib callbacks.
+            metadata["reason"] = "selected_width_ball_tree"
+            return self._public(model, probabilities), metadata, []
+        shared = group["model"]
+        if model._fit_method == "kd_tree":
+            # A worker pool can schedule batches and run completion callbacks
+            # for each selected query. Only the serial path is qualified.
+            jobs = (vars(model).get("n_jobs"), vars(shared).get("n_jobs"))
+            if (any(value is not None and (type(value) is not int or value != 1) for value in jobs)
+                    or not _plain_tree_dispatch() or "query" in vars(KDTree)
+                    or any(type(getattr(head, "_tree", None)) is not KDTree or "query" in getattr(head._tree, "__dict__", {})
+                           for head in (model, shared))):
+                metadata["reason"] = "selected_width_kd_tree_dispatch"
+                return self._public(model, probabilities), metadata, []
+            # Group members share _fit_X by identity. A prebuilt index can use
+            # a different metric or different pruning bounds for those coordinates.
+            if self._fresh_kd_coordinates is not model._fit_X:
+                metadata["reason"] = "unverified_kd_tree_geometry"
+                return self._public(model, probabilities), metadata, []
+        if not _native_query_methods(model, shared):
+            metadata["reason"] = "changed_neighbor_method"
+            return self._public(model, probabilities), metadata, []
+        serial_tree = model._fit_method == "kd_tree"
+        if (not _native_callback_context(model, full_membership=study_plan is not None, verified_serial_tree=serial_tree)
+                or (shared is not model and not _native_callback_context(
+                    shared, full_membership=study_plan is not None, verified_serial_tree=serial_tree))):
+            metadata["reason"] = "changed_neighbor_callback_context"
+            return self._public(model, probabilities), metadata, []
+        if model._fit_method == "brute" and (
+                get_config().get("enable_cython_pairwise_dist") is not True
+                or self.query.dtype != model._fit_X.dtype or not model._fit_X.flags.c_contiguous):
+            # Chunked brute can execute Joblib tasks and the selected head's
+            # reduction callback at a different width, even with n_jobs=1.
+            metadata["reason"] = "selected_width_chunked_brute"
             return self._public(model, probabilities), metadata, []
         planned_full_votes = None
         if study_plan is None:
@@ -371,10 +1044,7 @@ class _KNNQueryReuse:
         threshold_is_valid = (
             decision_threshold is None
             or (type(decision_threshold) is float
-                and 0.0 <= decision_threshold <= 1.0
-                and isinstance(positive_index, Integral)
-                and not isinstance(positive_index, bool)
-                and 0 <= positive_index < len(model.classes_)))
+                and 0.0 <= decision_threshold <= 1.0))
         if (k < len(model._fit_X) and threshold_is_valid
                 and np.geterr() == {"divide": "warn", "over": "warn",
                                     "under": "ignore", "invalid": "warn"}):
@@ -562,7 +1232,7 @@ class _KNNQueryReuse:
             return None
         if (type(k) is not int or type(probabilities) is not bool
                 or type(model.weights) is not str or model.weights != "uniform"
-                or not threshold_is_valid or _SKLEARN_VERSION != "1.9.1"
+                or not threshold_is_valid
                 or type(model.metric) is not str
                 or model.metric not in {"euclidean", "l2", "minkowski"}
                 or not (type(model.p) is int or type(model.p) is float)
@@ -587,10 +1257,8 @@ class _KNNQueryReuse:
                               "under": "ignore", "invalid": "warn"}
                     or np.geterrcall() is not None):
                 return None
-            for name, original in _FULL_MEMBERSHIP_METHODS:
-                if (name in model.__dict__
-                        or getattr(getattr(model, name), "__func__", None) is not original):
-                    return None
+            if not _native_query_methods(model, model):
+                return None
             backend = model._fit_method
             if type(backend) is not str:
                 return None
@@ -666,6 +1334,8 @@ class _KNNQueryReuse:
             count = max(smaller) + 1 if smaller else 1
             if count >= n:
                 return
+            if not _native_query_methods(full, full):
+                return
             for key, model in self.models.items():
                 if (type(model) is not KNeighborsClassifier
                         or type(model.n_neighbors) is not int or model.n_neighbors != key
@@ -679,12 +1349,9 @@ class _KNNQueryReuse:
                         or type(model._fit_method) is not str
                         or type(model.classes_) is not np.ndarray
                         or model.classes_.dtype.kind not in "biufUS"
+                        or not _QUERY_METHODS.isdisjoint(vars(model))
                         or not _native_callback_context(model)):
                     return
-                for name, original in _FULL_MEMBERSHIP_METHODS:
-                    if (name in model.__dict__
-                            or getattr(getattr(model, name), "__func__", None) is not original):
-                        return
                 if model._fit_method != "brute":
                     tree_spec = _FULL_MEMBERSHIP_TREES.get(model._fit_method)
                     tree = model._tree

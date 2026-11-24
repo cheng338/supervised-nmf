@@ -1,11 +1,15 @@
 """Bounded rank policy, leakage boundaries and checkpoint checks."""
 
+from fractions import Fraction
+from numbers import Integral
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
 import numpy as np
+from sklearn import config_context
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.decomposition import PCA
 from sklearn.model_selection import ParameterGrid
 from sklearn.neighbors import KNeighborsClassifier
@@ -15,6 +19,58 @@ from supervised_nmf import NMFClassifier
 from supervised_nmf.search import calibration_rank_search
 from supervised_nmf.study import calibration_knn_grid
 from supervised_nmf.validation import build_cv_folds
+
+
+@Integral.register
+class _DisplayRank(Fraction):
+    """A cloneable integer whose display deliberately hides its value."""
+
+    def __new__(cls, value, denominator=1):
+        rank = super().__new__(cls, value, denominator)
+        if rank.denominator != 1:
+            raise ValueError("Expected an integer")
+        rank._value = value
+        return rank
+
+    def get_params(self, deep=True):
+        return {"value": self._value}
+
+    def __index__(self):
+        return self.numerator
+
+    def __repr__(self):
+        return "Declared rank"
+
+
+class _IndexOnlyRank(_DisplayRank):
+    def __int__(self):
+        raise NotImplementedError("Use the index protocol")
+
+
+class _IntOnlyRank(_DisplayRank):
+    __index__ = None
+
+
+class _UnusableRank(_IntOnlyRank):
+    def __int__(self):
+        raise NotImplementedError("No integer conversion")
+
+
+class _ConflictingRank(_DisplayRank):
+    def __int__(self):
+        return self.numerator + 1
+
+
+class _UnrelatedTransformer(TransformerMixin, BaseEstimator):
+    def __init__(self, n_components=1):
+        self.n_components = n_components
+
+    def fit(self, X, y=None):
+        self.n_features_in_ = X.shape[1]
+        return self
+
+    def transform(self, X):
+        return X
 
 
 class RankSearchTests(unittest.TestCase):
@@ -215,6 +271,15 @@ class RankSearchTests(unittest.TestCase):
                 self.run_stub({1: .6, 2: .7}, **options)
         self.assertEqual(self.calls, [])
 
+    def test_durations_are_rejected_as_ranks_and_search_limits(self):
+        for duration in (np.timedelta64(3, "ns"), np.timedelta64(3, "D")):
+            for options in ({"grid": {"n_components": [duration]}},
+                            {"max_rank": duration}, {"max_expansions": duration}):
+                with self.subTest(options=options), self.assertRaises(ValueError):
+                    self.run_stub({}, **options)
+        self.assertEqual(self.calls, [])
+        self.assertFalse((Path(self.directory.name) / "default").exists())
+
     def test_real_search_matches_its_explicit_candidates_and_resumes(self):
         estimator = Pipeline([("pca", PCA(svd_solver="full", random_state=3)),
                               ("knn", KNeighborsClassifier())])
@@ -236,6 +301,219 @@ class RankSearchTests(unittest.TestCase):
         self.assertEqual(resumed["new_representation_fits"], 0)
         self.assertGreater(resumed["reused_representation_folds"], 0)
         self.assertEqual(resumed["tuning_seconds"], result["tuning_seconds"])
+
+
+class RankCoordinateTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.X = np.tile([[0., 1., .2], [4., 0., .4]], (8, 1))
+        self.y = np.tile([0, 1], 8)
+        self.pipeline = Pipeline([("rep", PCA(svd_solver="full", random_state=17)),
+                                  ("knn", KNeighborsClassifier(n_neighbors=1, algorithm="brute"))])
+        self.rank = "rep__n_components"
+
+    def run_grid(self, function, grid, directory):
+        return function(self.pipeline, grid, self.X, self.y, cv=2, seed=17,
+                        checkpoint_dir=Path(self.directory.name) / directory)
+
+    def assert_fitted_width(self, stage, candidate, width):
+        dimensions = {row["key"]: row["representation_shape"][1] for row in stage["representation_folds"]
+                      if row["status"] == "valid"}
+        self.assertEqual([dimensions[fold["shared_representation_key"]] for fold in candidate["folds"]],
+                         [width, width])
+
+    def test_equal_displays_preserve_exact_ranks_ties_and_completed_resume(self):
+        ranks = [1, 2, 2**53, 2**53 + 1, 2**1100]
+        grid = {self.rank: [_DisplayRank(value) for value in ranks]}
+        report = self.run_grid(calibration_rank_search, grid, "tied")
+        self.assertEqual(report["selected_candidate_index"], 0)
+        self.assertEqual(report["selected_parameters"], {self.rank: "Declared rank"})
+        self.assertEqual(report["stop_reason"], "winner_below_upper_rank_boundary")
+        self.assertEqual([r["mean_score"] for r in report["candidates"]], [1., 1., None, None, None])
+        for rank, candidate in zip(ranks[:2], report["candidates"][:2]):
+            self.assert_fitted_width(report["stages"][0], candidate, rank)
+        for result in (report, report["stages"][0]):
+            self.assertEqual(result["refinement"]["parameters"][self.rank],
+                             {"status": "lower_boundary_requires_expansion_or_constraint",
+                              "selected": 1, "values": ranks})
+        resumed = self.run_grid(calibration_rank_search, grid, "tied")
+        self.assertEqual(resumed["refinement"], report["refinement"])
+        self.assertEqual(resumed["new_representation_fits"], 0)
+        self.assertGreater(resumed["reused_representation_folds"], 0)
+        changed = {self.rank: [_DisplayRank(value) for value in [1, 3, *ranks[2:]]]}
+        with self.assertRaisesRegex(ValueError, "incompatible"):
+            self.run_grid(calibration_rank_search, changed, "tied")
+
+    def test_unqualified_upper_rank_is_included_in_the_refinement(self):
+        grid = {self.rank: [_DisplayRank(1), _DisplayRank(9)]}
+        report = self.run_grid(calibration_rank_search, grid, "upper")
+        self.assertFalse(report["search_complete"])
+        self.assertEqual(report["stop_reason"], "unqualified_upper_rank_candidates")
+        self.assertEqual(report["refinement"]["parameters"][self.rank]["values"], [1, 9])
+
+    def test_expansion_keeps_the_initial_bounds_of_the_other_pca_step(self):
+        estimator = Pipeline([("first", PCA(svd_solver="full", random_state=17)),
+                              *self.pipeline.steps])
+        secondary = "first__n_components"
+        grid = {secondary: [_DisplayRank(2), _DisplayRank(3), _DisplayRank(9)], self.rank: [1]}
+        directory = Path(self.directory.name) / "two-pca"
+        # The second component separates the classes. Each validation point
+        # has a training twin, and both halves have identical covariance.
+        X = np.tile([[-5., -1., 0.], [-5., 1., 0.], [5., -1., 0.], [5., 1., 0.]], (4, 1))
+        first, second = np.split(np.arange(len(X)), 2)
+        options = dict(cv=2, seed=17, folds=[(first, second), (second, first)], max_expansions=1,
+                       rank_parameter=self.rank, checkpoint_dir=directory)
+        report = calibration_rank_search(estimator, grid, X, self.y, **options)
+        self.assertEqual(report["expansions_performed"], 1)
+        initial, expanded = report["stages"]
+        self.assertEqual([row["valid"] for row in initial["candidates"]], [True, True, False])
+        self.assertGreater(expanded["selected_mean_score"], initial["selected_mean_score"])
+        self.assertEqual(report["candidates"][report["selected_candidate_index"]]["stage"], 1)
+        self.assertEqual(report["selected_parameters"][secondary], "Declared rank")
+        root = report["refinement"]["parameters"]
+        self.assertEqual(root[secondary], {"status": "lower_boundary_requires_expansion_or_constraint",
+                                           "selected": 2, "values": [2, 3, 9]})
+        self.assertEqual(root[secondary], initial["refinement"]["parameters"][secondary])
+        self.assertEqual(expanded["refinement"]["parameters"][secondary]["status"],
+                         "single_value_requires_exploration")
+        self.assertEqual(root[self.rank]["values"], [1, 2])
+        resumed = calibration_rank_search(estimator, grid, X, self.y, **options)
+        self.assertEqual(resumed["refinement"], report["refinement"])
+        self.assertEqual(resumed["new_representation_fits"], 0)
+
+    def test_final_report_preserves_mixed_owners_of_a_secondary_rank(self):
+        pca = PCA(svd_solver="full", random_state=17)
+        estimator = Pipeline([("first", pca), *self.pipeline.steps])
+        secondary = "first__n_components"
+        grid = [{secondary: [2], self.rank: [1]},
+                {"first": [_UnrelatedTransformer()], secondary: [3], self.rank: [1]}]
+        report = calibration_rank_search(estimator, grid, self.X, self.y, cv=2, seed=17,
+                                         max_expansions=1, rank_parameter=self.rank,
+                                         checkpoint_dir=Path(self.directory.name) / "mixed-secondary")
+        self.assertEqual(report["expansions_performed"], 1)
+        self.assertEqual([row["valid"] for row in report["stages"][0]["candidates"]], [True, True])
+        self.assertEqual(report["refinement"]["parameters"][secondary], {"status": "categorical", "selected": 2})
+
+    def test_index_only_and_int_only_ranks_keep_pca_fit_behavior(self):
+        for name, rank, qualified in (("index", _IndexOnlyRank(2), True), ("int", _IntOnlyRank(2), False)):
+            with self.subTest(protocol=name):
+                report = self.run_grid(calibration_rank_search, {self.rank: [1, rank]}, name)
+                self.assertEqual([r["valid"] for r in report["candidates"]], [True, qualified])
+                self.assertEqual(report["refinement"]["parameters"][self.rank]["values"], [1, 2])
+                self.assertEqual(report["search_complete"], qualified)
+                self.assertEqual(report["stop_reason"], "winner_below_upper_rank_boundary" if qualified
+                                 else "unqualified_upper_rank_candidates")
+                if qualified:
+                    self.assert_fitted_width(report["stages"][0], report["candidates"][1], 2)
+
+    def test_unusable_and_conflicting_counts_leave_shared_grid_results_intact(self):
+        for name, rank, qualified in (("unusable", _UnusableRank(2), False),
+                                      ("conflicting", _ConflictingRank(2), True)):
+            with self.subTest(protocol=name):
+                grid = {self.rank: [rank, 1]}
+                report = self.run_grid(calibration_knn_grid, grid, name)
+                self.assertEqual([r["valid"] for r in report["candidates"]], [qualified, True])
+                entry = report["refinement"]["parameters"][self.rank]
+                if qualified:
+                    self.assert_fitted_width(report, report["candidates"][0], 2)
+                    self.assertEqual(entry, {"status": "categorical", "selected": "Declared rank"})
+                else:
+                    self.assertEqual(entry, {"status": "single_value_requires_exploration", "selected": 1})
+                with self.assertRaises(ValueError):
+                    self.run_grid(calibration_rank_search, grid, "bounded-" + name)
+                self.assertFalse((Path(self.directory.name) / ("bounded-" + name)).exists())
+
+    def test_selected_longdouble_pca_fraction_and_adjacent_bounds_are_exact(self):
+        lower = np.longdouble("0.5")
+        upper = np.nextafter(lower, np.longdouble(1))
+        grid = {self.rank: [upper, lower, 1]}
+
+        def exact(value):
+            if isinstance(value, dict):
+                return Fraction(int(value["significand"])) * Fraction(2) ** value["exponent"]
+            return Fraction(value)
+
+        # Some sklearn versions reject longdouble fractions at parameter
+        # validation. PCA's full solver can fit them when that check is skipped.
+        for skip in (False, True):
+            with self.subTest(skip_parameter_validation=skip), config_context(skip_parameter_validation=skip):
+                report = self.run_grid(calibration_knn_grid, grid, f"fractions-{skip}")
+                scores = [r["mean_score"] for r in report["candidates"]]
+                entry = report["refinement"]["parameters"][self.rank]
+                selected = report["selected_parameters"][self.rank]
+                self.assertEqual(entry["selected"], selected)
+                self.assertEqual([exact(v) for v in entry["values"]],
+                                 [Fraction(*lower.as_integer_ratio()), Fraction(*upper.as_integer_ratio()), 1])
+                if skip or scores[0] is not None:
+                    self.assertEqual(scores, [1., 1., 1.])
+                    self.assertEqual(selected["__supervised_nmf_scalar__"], "longdouble-v1")
+                    self.assertEqual(exact(selected), Fraction(*upper.as_integer_ratio()))
+                    self.assertEqual(entry["status"], "interior_interval_requires_refinement")
+                else:
+                    self.assertEqual(scores, [None, None, 1.])
+                    self.assertEqual(selected, 1)
+                    self.assertEqual(entry["status"], "upper_boundary_requires_expansion_or_constraint")
+
+    def test_integral_longdouble_bound_survives_publication_and_resume(self):
+        exponent = min(15000, int(np.finfo(np.longdouble).maxexp) - 1)
+        bound = np.ldexp(np.longdouble(1), exponent)
+        grid = {self.rank: [1, bound]}
+        first = self.run_grid(calibration_knn_grid, grid, "large-float")
+        self.assertEqual([row["valid"] for row in first["candidates"]], [True, False])
+        entry = first["refinement"]["parameters"][self.rank]
+        self.assertEqual(entry["status"], "lower_boundary_requires_expansion_or_constraint")
+        self.assertEqual(entry["selected"], 1)
+        low, high = entry["values"]
+        self.assertEqual(low, 1)
+        if isinstance(high, dict):
+            self.assertEqual(high, {"__supervised_nmf_scalar__": "longdouble-v1",
+                                    "significand": "1", "exponent": exponent})
+        else:
+            self.assertEqual(int(high), 2**exponent)
+        same = self.run_grid(calibration_knn_grid, grid, "large-float")
+        self.assertEqual(same["refinement"], first["refinement"])
+        self.assertEqual(same["new_representation_fits"], 0)
+        self.assertGreater(same["reused_representation_folds"], 0)
+
+    def test_failed_nonfinite_dimensions_do_not_supply_numeric_rank_bounds(self):
+        grid = {self.rank: [_DisplayRank(1), 0.5, None, float("nan"), float("inf")]}
+        report = self.run_grid(calibration_knn_grid, grid, "fractional")
+        self.assertEqual([r["valid"] for r in report["candidates"]], [True, True, True, False, False])
+        self.assertEqual(report["refinement"]["parameters"][self.rank],
+                         {"status": "upper_boundary_requires_expansion_or_constraint", "selected": 1,
+                          "values": [0.5, 1], "includes_none": True})
+
+    def test_mixed_step_owners_keep_a_categorical_axis_and_reject_expansion(self):
+        pca = self.pipeline.named_steps["rep"]
+        declarations = [{"rep": [pca], self.rank: [1]},
+                        {"rep": [_UnrelatedTransformer()], self.rank: [2]}]
+        for order, first_two in enumerate((declarations, declarations[::-1])):
+            grid = [*first_two, {"rep": [pca], self.rank: [2**1100]}]
+            with self.subTest(order=order):
+                report = self.run_grid(calibration_knn_grid, grid, f"shared-{order}")
+                self.assertEqual([r["valid"] for r in report["candidates"]], [True, True, False])
+                self.assertEqual(report["refinement"]["parameters"][self.rank],
+                                 {"status": "categorical", "selected": first_two[0][self.rank][0]})
+                with self.assertRaisesRegex(TypeError, "Rank expansion"):
+                    self.run_grid(calibration_rank_search, grid, f"bounded-{order}")
+                self.assertFalse((Path(self.directory.name) / f"bounded-{order}").exists())
+
+    def test_resume_checks_sklearn_parameter_validation_before_reusing_folds(self):
+        for search, ranks in ((calibration_knn_grid, [np.longdouble("0.5"), 1]),
+                              (calibration_rank_search, [1, 2])):
+            with self.subTest(search=search.__name__):
+                grid = {self.rank: ranks}
+                with config_context(skip_parameter_validation=False):
+                    initial = self.run_grid(search, grid, search.__name__)
+                    same = self.run_grid(search, grid, search.__name__)
+                self.assertEqual(initial["selected_parameters"], same["selected_parameters"])
+                self.assertEqual([(row["valid"], row["mean_score"]) for row in initial["candidates"]],
+                                 [(row["valid"], row["mean_score"]) for row in same["candidates"]])
+                self.assertEqual(same["new_representation_fits"], 0)
+                self.assertGreater(same["reused_representation_folds"], 0)
+                with config_context(skip_parameter_validation=True), self.assertRaisesRegex(ValueError, "incompatible"):
+                    self.run_grid(search, grid, search.__name__)
 
 
 if __name__ == "__main__":

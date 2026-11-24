@@ -6,9 +6,11 @@ where ordinary numerical results are required and optional publication is absent
 """
 from contextlib import contextmanager
 import json
+import os
 import pickle
 import sys
 import tempfile
+import weakref
 
 import numpy as np
 import pytest
@@ -18,7 +20,8 @@ from joblib.externals.loky import get_reusable_executor
 
 from supervised_nmf import _projection
 from tests._prepared_qr_support import (
-    assert_coordinates, fixed_model, observed_calls, problem, qr_state, reference,
+    assert_coordinates, assert_worker_binding, fixed_model, observed_calls,
+    fail_large_qr_payload_view, parent_inventory_under_limit, problem, qr_state, reference,
 )
 
 
@@ -52,20 +55,23 @@ def checked(model, rows, known):
 
 
 @contextmanager
-def executor_calls():
-    """Observe the actual backend return; never substitute an executor."""
-    code = MemmappingExecutor.get_memmapping_executor.__func__.__code__
+def executor_calls(monkeypatch):
+    """Record whether each factory call returns the same live executor."""
+    factory = MemmappingExecutor.get_memmapping_executor.__func__
+    first = None
     records = []
-    previous = sys.getprofile()
-    assert previous is None
-    def observe(frame, event, value):
-        if event == "return" and frame.f_code is code and value is not None:
-            records.append((id(value), bool(frame.f_locals["executor_is_reused"])))
-    sys.setprofile(observe)
-    try:
+
+    def observe(cls, *args, **kwargs):
+        nonlocal first
+        executor = factory(cls, *args, **kwargs)
+        if first is None:
+            first = weakref.ref(executor)
+        records.append(first() is executor)
+        return executor
+
+    with monkeypatch.context() as patch:
+        patch.setattr(MemmappingExecutor, "get_memmapping_executor", classmethod(observe))
         yield records
-    finally:
-        sys.setprofile(previous)
 
 
 def test_cold_one_wave_then_multiwave_and_warm_one_wave(
@@ -74,31 +80,27 @@ def test_cold_one_wave_then_multiwave_and_warm_one_wave(
     model = fixed_model(owner, workers=2)
     receipt_directory = str(tmp_path / "children")
     (tmp_path / "children").mkdir()
+    # Exercise a different ambient limit while taking the parent snapshot.
+    # The payload below must still match the snapshot at the model's limit.
+    native = _projection._controller
+    with native.limit(limits=2):
+        ambient = native.info()
+        parent_inventory = parent_inventory_under_limit(model)
+        assert native.info() == ambient
     def observed_shared_block(*args, **kwargs):
         # This local by-value wrapper imports the untouched function in the
         # actual child. It does not replace the required _project_block anchor.
-        import inspect
         import json
         import os
-        import sys
         import tempfile
-        from supervised_nmf import _nnls as q, _projection as p
-        code = inspect.unwrap(q._QR_ORIGINAL_QR).__code__
-        previous = sys.getprofile()
-        assert previous is None
-        calls = []
-        def observe(frame, event, value):
-            if event == "call" and frame.f_code is code:
-                calls.append(True)
-        try:
-            sys.setprofile(observe)
+        from supervised_nmf import _projection as p
+        from tests._prepared_qr_support import observed_worker_binding
+        with observed_worker_binding(args[-1], parent_inventory) as record:
             answer = p._project_shared_block(*args, **kwargs)
-        finally:
-            sys.setprofile(previous)
         fd, path = tempfile.mkstemp(prefix="block-", suffix=".json",
                                     dir=receipt_directory)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(dict(rows=len(args[1]), qr_calls=len(calls)), stream)
+            json.dump(dict(rows=len(args[1]), pid=os.getpid(), **record), stream)
         return answer
     monkeypatch.setattr(_projection, "_project_shared_block", observed_shared_block)
     assert_coordinates(reference(owner, rows[:512]), known[:512])
@@ -120,7 +122,28 @@ def test_cold_one_wave_then_multiwave_and_warm_one_wave(
     receipts = [json.loads(path.read_text())
                 for path in (tmp_path / "children").glob("*.json")]
     assert len(receipts) == 5 * int(process_resources)
-    assert all(row == dict(rows=256, qr_calls=0) for row in receipts)
+    for row in receipts:
+        assert row["rows"] == 256 and row["pid"] != os.getpid()
+        assert_worker_binding(row)
+
+
+@pytest.mark.parametrize("qr_state", ["cold"], indirect=True)
+def test_process_only_calls_do_not_warm_a_declined_parent(process_resources):
+    owner, rows, known = problem(rows=768)
+    model = fixed_model(owner, workers=2)
+    first_publish = process_resources and sys.platform == "linux"
+    for step in range(2):
+        with observed_calls() as calls:
+            checked(model, rows, known)
+        assert calls["qr"] == calls["publish"] == int(step == 0 and first_publish)
+        assert (entry(owner) is not None) is first_publish
+        assert (_projection._controller is not None) is first_publish
+    # A small ordinary serial call initializes the parent on every platform.
+    checked(model, rows[:1], known[:1])
+    with observed_calls() as calls:
+        checked(model, rows, known)
+    assert calls["qr"] == calls["publish"] == int(process_resources and not first_publish)
+    assert (entry(owner) is not None) is process_resources
 
 
 def test_mixed_models_keep_original_mapping_threshold_and_executor(
@@ -135,15 +158,14 @@ def test_mixed_models_keep_original_mapping_threshold_and_executor(
         dispatches.append(dict(kwargs))
         return original(*args, **kwargs)
     monkeypatch.setattr(_projection, "Parallel", parallel)
-    with executor_calls() as executions:
+    with executor_calls(monkeypatch) as executions:
         for index in (0, 1, 2, 0):
             owner, rows, known = (first, second, small)[index]
             checked(models[index], rows, known)
     assert len(dispatches) == len(executions) == 4
     assert all(row["n_jobs"] == 2 and row["max_nbytes"] == "1M"
                and row["mmap_mode"] == "r" for row in dispatches)
-    assert len({identity for identity, _ in executions}) == 1
-    assert all(reused for _, reused in executions[1:])
+    assert all(executions)
     assert (entry(first[0]) is not None) is process_resources
     assert (entry(second[0]) is not None) is process_resources
     assert entry(small[0]) is None
@@ -154,20 +176,9 @@ def test_optional_payload_storage_failure_falls_back_and_can_retry(
     # At rank 32 this exceeds 1 MiB and exercises the retained array-view path.
     owner, rows, known = problem(features=4097, rows=768)
     model = fixed_model(owner, workers=2)
-    original = np.frombuffer
-    payload_code = _projection._QRPrepared._transport_payload.__code__
-    failures = []
-    def frombuffer(*args, **kwargs):
-        caller = sys._getframe(1)
-        if (caller.f_code.co_name == "<genexpr>" and caller.f_back is not None
-                and caller.f_back.f_code is payload_code):
-            failures.append(True)
-            raise MemoryError("optional prepared payload storage")
-        return original(*args, **kwargs)
-    with monkeypatch.context() as patch:
-        patch.setattr(np, "frombuffer", frombuffer)
+    with fail_large_qr_payload_view(monkeypatch) as failures:
         checked(model, rows, known)
-    assert len(failures) == int(process_resources)
+    assert failures == ([owner.nbytes] if process_resources else [])
     assert entry(owner) is None
     checked(model, rows, known)
     assert (entry(owner) is not None) is process_resources

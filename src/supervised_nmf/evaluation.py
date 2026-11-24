@@ -7,28 +7,42 @@ The reports deliberately leave refinement and package-default decisions open.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from dataclasses import dataclass
+from collections import deque
+from collections.abc import Callable
+from contextlib import contextmanager, ExitStack, nullcontext
+from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import partial
 import errno
+import fnmatch
 import hashlib
 import importlib.metadata
+from importlib.machinery import SOURCE_SUFFIXES
 from inspect import getattr_static
 import json
 import math
+from numbers import Integral
 import os
 from pathlib import Path
 import platform
 import re
+import sys
 import time
 from types import FunctionType, MethodType
 import uuid
 import warnings
 
 import numpy as np
+from joblib import effective_n_jobs, parallel_config
+from joblib.parallel import get_active_backend
+from sklearn import get_config
 from sklearn.base import clone
+from sklearn.compose import ColumnTransformer
+from sklearn.decomposition import NMF, PCA
 from sklearn.dummy import DummyClassifier
 from sklearn.exceptions import ConvergenceWarning
+from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score, average_precision_score, balanced_accuracy_score,
@@ -37,20 +51,24 @@ from sklearn.metrics import (
 from sklearn.model_selection import ParameterGrid
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.svm import LinearSVC
 from sklearn.utils.validation import check_is_fitted, check_random_state
 from threadpoolctl import threadpool_info, threadpool_limits
 
 from .classifier import (NMFClassifier, _capture_projection, _record_warnings, _uses_projection_diagnostics,
                          _knn_probabilities_preserve_labels)
+from .decomposition import FeatureSPA
 from ._calibration import _score_fields, _score_predictions, _validate_scoring
-from ._identity import configuration_identity, implementation_sources
+from ._feature_names import _input_feature_names, _named_frame_backend, _named_matrix
+from ._identity import _share_calibration_observation, _source_bytes, configuration_identity, implementation_sources
 from ._labels import _check_labeled_data, _label_values, _validate_class_label, _validate_class_labels
+from ._neighbors import _is_integer_index
 from ._search_diagnostics import mark_inactive_refinement, screening_grid_diagnostics
-from .screening import _clear_fitted_attributes
+from .screening import BinaryScreening, _clear_fitted_attributes
 from .validation import (
     _NATIVE_ID_TYPES, _exact_metadata_promotion, _native_float_key_set, _metadata_keys, _metadata_overlap,
-    _validate_metadata_snapshot, _validated_unique_metadata,
+    _rank_count, _validate_metadata_snapshot, _validated_unique_metadata,
     _validate_refit, _validate_threads, build_cv_folds, validate_metadata,
 )
 
@@ -252,7 +270,12 @@ def save_data_manifest(path, manifest):
 
 
 def data_fingerprint(X, y):
-    """Hash data values, ordering, shape, and dtype without publishing raw data."""
+    """Hash values, ordering, shape, dtype and recognized ordered column names."""
+    feature_names = _input_feature_names(X)
+    return _data_fingerprint(X, y, feature_names)
+
+
+def _data_fingerprint(X, y, feature_names):
     arrays = np.asarray(X), np.asarray(y)
     _validate_class_labels(y, arrays[1])
     digest = hashlib.sha256()
@@ -264,19 +287,145 @@ def data_fingerprint(X, y):
         else:
             contiguous = np.ascontiguousarray(array)
             digest.update(memoryview(contiguous).cast("B"))
+    value_digest = digest.hexdigest()
+    if feature_names is None:
+        return value_digest
+    return _digest(["ordered-feature-names-v2", value_digest, _schema_digest(feature_names)])
+
+
+def _schema_digest(names):
+    if names is None:
+        return None
+    # JSON escaping alone conflates an astral code point with the two literal
+    # Python surrogate code points that spell its UTF-16 encoding.
+    digest = hashlib.sha256()
+    for name in names:
+        encoded = str.encode(name, "utf-8", errors="surrogatepass")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
     return digest.hexdigest()
 
 
+def _check_matching_columns(expected, observed):
+    # NumPy can strip trailing NULs when it infers a string dtype for a tuple.
+    if expected is not None and observed is not None and tuple(expected) != tuple(observed):
+        raise ValueError("Feature names must match the training columns in the same order.")
+
+
+def _active_steps(model):
+    return [step for _, step in model.steps if step is not None
+            and not (type(step) is str and step == "passthrough")]
+
+
+def _has_input_override(model):
+    return any(name in getattr(model, "__dict__", {}) for name in (
+        "fit", "fit_transform", "transform", "predict", "predict_proba",
+        "decision_function", "predict_with_probabilities", "predict_with_decision_function",
+        "kneighbors"))
+
+
+def _numeric_schema_estimator(model, *, fitted=False):
+    """Can the raw consumer accept a canonical numeric table without changing callbacks?"""
+    if model is None:
+        return True
+    if type(model) is str:
+        return model in ("drop", "passthrough")
+    if _has_input_override(model):
+        return False
+    if type(model) is SimpleImputer:
+        return type(model.strategy) is str
+    if type(model) is Pipeline:
+        steps = _active_steps(model)
+        if not steps or not _numeric_schema_estimator(steps[0], fitted=fitted):
+            return False
+        # An ordinary numeric transform returns the same positional matrix to
+        # downstream estimators and callbacks, including unlisted stock heads.
+        # A named output can expose its changed column labels to a callback.
+        if len(steps) == 1:
+            return True
+        first = steps[0]
+        output = getattr(first, "_sklearn_output_config", {}).get("transform", get_config()["transform_output"])
+        return ((type(first) is not Pipeline and output == "default")
+                or all(_numeric_schema_estimator(step, fitted=fitted) for step in steps[1:]))
+    if type(model) is ColumnTransformer:
+        # ColumnTransformer resolves a callable to its chosen columns during
+        # fit. Transform uses those stored columns and does not call it again.
+        if fitted and any(_has_pipeline_input_override(step) for _, step, _ in getattr(model, "transformers_", ())):
+            return False
+        return (_numeric_schema_estimator(model.remainder, fitted=fitted)
+                and all((fitted or not callable(columns)) and _numeric_schema_estimator(step, fitted=fitted)
+                        for _, step, columns in model.transformers))
+    return type(model) in (NMFClassifier, BinaryScreening, FeatureSPA, NMF, PCA, StandardScaler, MinMaxScaler,
+                           KNeighborsClassifier, LogisticRegression, LinearSVC,
+                           _TrackedLogisticRegression, _TrackedLinearSVC, DummyClassifier)
+
+
+def _fitted_input_names(model):
+    # Pipeline's public property proxies steps[0], which may simply pass
+    # through X. The first active stage owns the raw input's actual schema.
+    while isinstance(model, Pipeline):
+        model = next(iter(_active_steps(model)), None)
+    return getattr(model, "feature_names_in_", None)
+
+
+def _has_named_pipeline_stage(model):
+    if isinstance(model, ColumnTransformer):
+        # A fitted selector can require a DataFrame even when all its output
+        # and the downstream classifier's input are positional.
+        return getattr(model, "feature_names_in_", None) is not None
+    if not isinstance(model, Pipeline):
+        return False
+    steps = _active_steps(model)
+    # A schema on the first raw consumer is checked explicitly. Look for
+    # additional names that can only be checked after actual transformation.
+    return bool(steps) and (_has_named_pipeline_stage(steps[0]) or any(
+        _fitted_input_names(step) is not None or _has_named_pipeline_stage(step) for step in steps[1:]))
+
+
+def _has_pipeline_input_override(model):
+    if _has_input_override(model):
+        return True
+    if type(model) is ColumnTransformer:
+        return any(_has_pipeline_input_override(step) for _, step, _ in getattr(model, "transformers_", ()))
+    if not isinstance(model, Pipeline):
+        return False
+    if any(getattr_static(type(model), name, None) is not getattr_static(Pipeline, name, None)
+           for name in ("predict", "predict_proba", "decision_function")):
+        return True
+    return any(_has_pipeline_input_override(step) for step in _active_steps(model))
+
+
 def provenance(threads=1):
-    """Record software, hardware, source, and requested native thread limits."""
+    """Record software, hardware, package code, and requested native thread limits.
+
+    The source digest map includes adjacent bytecode modules when their
+    Python source is absent. Ordinary interpreter cache directories are ignored.
+    """
     versions = {}
     for package in ("numpy", "scipy", "scikit-learn", "threadpoolctl", "joblib", "Pillow"):
         try:
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
             versions[package] = None
-    source_hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-                     for p in sorted(Path(__file__).parent.glob("*.py"))}
+    # Path.glob suppresses directory errors, which could admit an empty source identity.
+    module_file = Path(__file__)
+    package_dir = module_file.parent
+    entries = os.listdir(package_dir)
+    names = [name for suffix in SOURCE_SUFFIXES for name in fnmatch.filter(entries, "*" + suffix)]
+    bytecode = fnmatch.filter(entries, "*.pyc")
+    if bytecode:
+        # Only an exact source spelling establishes shadowing on a
+        # case-sensitive directory, including such directories on Windows.
+        source_names = set(names)
+        names.extend(name for name in bytecode
+                     if package_dir / name == module_file
+                     or not any(name[:-4] + suffix in source_names for suffix in SOURCE_SUFFIXES))
+    sources = sorted(package_dir / name for name in names)
+    suffix = os.path.normcase(module_file.suffix)
+    if (suffix in SOURCE_SUFFIXES or suffix == ".pyc") and module_file.name not in names:
+        if not any(module_file.samefile(path) for path in sources):
+            raise FileNotFoundError(errno.ENOENT, "Running module is missing from the package source manifest", module_file)
+    source_hashes = {p.name: hashlib.sha256(_source_bytes(p)).hexdigest() for p in sources}
     return {"python": platform.python_version(), "platform": platform.platform(),
             "processor": platform.processor(), "logical_cpus": os.cpu_count(),
             "conda_environment": os.environ.get("CONDA_DEFAULT_ENV"),
@@ -417,31 +566,151 @@ def support_recovery(estimator, signal_support):
             "exact_support_recovered": bool(np.array_equal(retained, truth))}
 
 
+def _stock_split_rng(rng):
+    return (type(rng) is np.random.RandomState and any(type(rng._bit_generator) is stock for stock in
+            (np.random.MT19937, np.random.PCG64, np.random.PCG64DXSM, np.random.Philox, np.random.SFC64)))
+
+
+def _private_split_rng(seed):
+    return _stock_split_rng(seed) and seed._bit_generator is not np.random.get_bit_generator()
+
+
+def _uses_global_rng(estimator, candidates, limits):
+    if "ambient fit RNG" in limits:
+        # Even if cloning isolates each fitted estimator, it copies the state
+        # at that fold's position in the process stream. Callbacks can retain
+        # the original object and advance it directly.
+        return True
+    if "implicit RNG" not in limits:
+        return False
+    cls = type(estimator)
+    if cls is not DummyClassifier and cls is not NMFClassifier:
+        # Recognize the exact public class if it was already imported.
+        tree = sys.modules.get("sklearn.tree")
+        if tree is None or cls is not vars(tree).get("ExtraTreeClassifier"):
+            return True
+    # Exempt only ordinary configurations whose stock fit and prediction paths
+    # do not consult the ambient RNG. A grid can replace individual settings.
+    parameters = vars(estimator)
+    for options in (parameters, *candidates):
+        if any(type(key) is not str or key not in parameters or
+               (value is not None and not any(type(value) is kind for kind in (int, float, bool, str)))
+               for key, value in options.items()):
+            return True
+    if all(type(p.get("random_state", estimator.random_state)) is int for p in candidates):
+        return False
+    if cls is not DummyClassifier and cls is not NMFClassifier:
+        return True
+    if type(estimator) is DummyClassifier:
+        return any(p.get("strategy", estimator.strategy) not in ("most_frequent", "prior", "constant")
+                   for p in candidates)
+    return any(p.get("solver", estimator.solver) != "spa" or
+               p.get("classifier", estimator.classifier) != "knn" for p in candidates)
+
+
+def _ambient_mt_token():
+    """Identify the legacy, nonspawning NumPy singleton without advancing it."""
+    engine = np.random.get_bit_generator()
+    if type(engine) is not np.random.MT19937:
+        return None
+    if getattr(engine, "seed_seq", getattr(engine, "_seed_seq", 1)) is not None:
+        return None
+    _, keys, position, cached, gaussian = np.random.get_state()
+    token = hashlib.sha256(keys.astype("<u4", copy=False).tobytes())
+    token.update(position.to_bytes(4, "little"))
+    token.update(bytes([cached]))
+    token.update(np.asarray(gaussian, dtype="<f8").tobytes())
+    return token.hexdigest()
+
+
+def _output_library_version(name):
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _named_input_identity():
+    backend = _named_frame_backend()
+    return {"container": backend.__name__, "version": backend.__version__}
+
+
+def _check_transform_output(expected):
+    if get_config()["transform_output"] != expected:
+        raise ValueError("Scikit-learn transform output changed during the search or comparison.")
+
+
 def _search_identity(estimator, candidates, X, y, cv, seed, threads, refit=True,
-                     *, groups=None, folds=None, data_ids=None, scoring="accuracy", _environment=None):
+                     *, groups=None, folds=None, data_ids=None, scoring="accuracy",
+                     _environment=None, _observation=None, _split_limits=None, _fit_rng_dependencies=None,
+                     _feature_names=None):
     environment = _initialized_provenance(threads) if _environment is None else _environment(threads)
     runtime_keys = ("user_api", "internal_api", "prefix", "filepath", "version", "threading_layer", "architecture")
     numerical_runtime = sorted([{key: library.get(key) for key in runtime_keys}
                                 for library in environment["threadpools"]],
                                key=lambda library: library.get("filepath") or "")
-    return {"identity_schema": 2,
+    nonstandard_text = [] if _observation is not None else None
+    feature_names = _input_feature_names(X) if _feature_names is None else _feature_names
+    transform_output = get_config()["transform_output"]
+    output_libraries = {transform_output} if transform_output in ("pandas", "polars") else set()
+    identity = {"identity_schema": 2,
             "estimator": f"{type(estimator).__module__}.{type(estimator).__qualname__}",
             # Candidate reports retain display descriptions. Keep those out of
             # identity: repr may omit parameters or contain process addresses.
-            "data_sha256": data_fingerprint(X, y),
-            "structural_configuration": configuration_identity({"estimator": estimator,
-                                                                "candidates": candidates}),
-            "implementation_source": implementation_sources(estimator, candidates),
+            "data_sha256": _data_fingerprint(X, y, feature_names),
+            "structural_configuration": configuration_identity({"estimator": estimator, "candidates": candidates},
+                                                              _nonstandard_text=nonstandard_text,
+                                                              _split_limits=_split_limits, _split_seed=seed,
+                                                              _fit_rng_dependencies=_fit_rng_dependencies,
+                                                              _output_libraries=output_libraries),
+            "implementation_source": implementation_sources(estimator, candidates, _observation=_observation,
+                                                             _nonstandard_text=nonstandard_text, _split_seed=seed),
             "cv": cv, "seed": seed, "threads": threads, "refit": refit,
+            "sklearn_skip_parameter_validation": get_config()["skip_parameter_validation"],
+            "sklearn_transform_output": transform_output,
             "scoring": _validate_scoring(scoring),
             "groups": _jsonable(groups), "folds": _jsonable(folds), "data_ids": _jsonable(data_ids),
             "python": environment["python"], "platform": environment["platform"],
             "numerical_runtime": numerical_runtime,
             "software": environment["versions"],
             "source_sha256": environment["source_sha256"]}
+    if feature_names is not None:
+        identity["named_input"] = _named_input_identity()
+    if output_libraries:
+        identity["output_library_versions"] = {name: _output_library_version(name)
+                                              for name in sorted(output_libraries)}
+    if _observation is not None and not nonstandard_text:
+        _share_calibration_observation(identity["structural_configuration"], _observation)
+    return identity
 
 
-def refinement_diagnostics(candidates, selected_params):
+def _rank_coordinate(value):
+    """Return an exact comparable coordinate when the setting supplies one."""
+    if type(value) is _LONGDOUBLE_SCALAR_TYPE:
+        return _metadata_keys([value])[0] if np.isfinite(value) else None
+    try:
+        if _is_integer_index(value):
+            return _rank_count(value)
+        if isinstance(value, (float, np.floating)):
+            number = float(value)
+            return number if math.isfinite(number) else None
+    except (MemoryError, RecursionError):
+        raise
+    except Exception:
+        # Advisory bounds must not discard a completed fit when the parameter's
+        # own conversion method refuses to provide a numerical coordinate.
+        return None
+    return None
+
+
+def _wide_builtin_integer(value):
+    """Recognize stock integers outside binary64's consecutive integer range."""
+    cls = type(value)
+    return ((cls is int or cls is np.int64 or cls is np.uint64 or cls is np.longlong or cls is np.ulonglong)
+            and int(value).bit_length() > 53)
+
+
+def refinement_diagnostics(candidates, selected_params, *, _rank_coordinates=None):
     """Flag range boundaries and interior intervals; this is not completed tuning."""
     if selected_params is None:
         return {"status": "pending_valid_candidate", "parameters": {}}
@@ -449,36 +718,295 @@ def refinement_diagnostics(candidates, selected_params):
     boolean_types = (bool, np.bool_)
     output = {}
     for parameter, selected in selected_params.items():
-        values = [c[parameter] for c in candidates if parameter in c]
-        if isinstance(selected, numeric_types) and not isinstance(selected, boolean_types):
-            includes_none = any(value is None for value in values)
-            values = sorted(set(float(v) for v in values
-                                if isinstance(v, numeric_types)
-                                and not isinstance(v, boolean_types)))
-            if len(values) < 2:
-                output[parameter] = {"status": "single_value_requires_exploration", "selected": selected}
-            else:
-                location = values.index(float(selected))
-                status = ("lower_boundary_requires_expansion_or_constraint" if location == 0
-                          else "upper_boundary_requires_expansion_or_constraint" if location == len(values) - 1
-                          else "interior_interval_requires_refinement")
-                output[parameter] = {"status": status, "selected": selected, "values": values}
-            if includes_none:
-                output[parameter]["includes_none"] = True
+        if _rank_coordinates and parameter in _rank_coordinates:
+            axis = _rank_coordinates[parameter]
+            if axis is None or (coordinate := _rank_coordinate(axis[1])) is None:
+                output[parameter] = {"status": "categorical", "selected": selected}
+                continue
+            declared, chosen = axis
+            selected = coordinate if _is_integer_index(chosen) else chosen
+            includes_none = any(value is None for value in declared)
+            bounds = {}
+            for value in declared:
+                point = coordinate if value is chosen else _rank_coordinate(value)
+                if point is None:
+                    continue
+                if type(value) is _LONGDOUBLE_SCALAR_TYPE and type(point) is not float:
+                    # Keep wide integers and fractions in the compact extended-float encoding.
+                    display = value
+                elif type(point) is int:
+                    display = point if point.bit_length() > 53 else float(point)
+                else:
+                    display = point
+                bounds.setdefault(point, display)
+            points = sorted(bounds)
+            values = [bounds[p] for p in points]
+            if len(values) > 1:
+                location = points.index(coordinate)
         else:
-            output[parameter] = {"status": "categorical", "selected": selected}
+            values = [c[parameter] for c in candidates if parameter in c]
+            if not isinstance(selected, numeric_types) or isinstance(selected, boolean_types):
+                output[parameter] = {"status": "categorical", "selected": selected}
+                continue
+            includes_none = any(value is None for value in values)
+            values = sorted(set(int(v) if _wide_builtin_integer(v) else float(v) for v in values
+                                if isinstance(v, numeric_types) and not isinstance(v, boolean_types)))
+            if len(values) > 1:
+                location = values.index(int(selected) if _wide_builtin_integer(selected) else float(selected))
+        if len(values) < 2:
+            output[parameter] = {"status": "single_value_requires_exploration", "selected": selected}
+        else:
+            status = ("lower_boundary_requires_expansion_or_constraint" if location == 0
+                      else "upper_boundary_requires_expansion_or_constraint" if location == len(values) - 1
+                      else "interior_interval_requires_refinement")
+            output[parameter] = {"status": status, "selected": selected, "values": values}
+        if includes_none:
+            output[parameter]["includes_none"] = True
     return {"status": "pending_refinement_and_replication", "parameters": output}
+
+
+class CalibrationFallbackWarning(UserWarning):
+    """A calibration search substituted a training-majority classifier."""
 
 
 @dataclass
 class CalibrationResult:
     estimator: object
     report: dict
+    # Positional fits keep their source labels, or an empty tuple for unnamed input.
+    _positional_input_columns: tuple | None = field(default=None, repr=False, compare=False)
+
+
+@dataclass
+class _ComparisonRecovery:
+    unverified_prefix: bool
+    loaded_checkpoint: bool = False
+    serial_final: bool = False
+    batch: _ComparisonBatch | None = None
+    refit: Callable[[], CalibrationResult] | None = None
+
+
+@dataclass
+class _ComparisonBatch:
+    locks: ExitStack
+    pending: deque[Callable[[], None]]
+    root: Path | None = None
+    studies: dict = field(default_factory=dict)
+    evaluations: dict = field(default_factory=dict)
+    checks: list = field(default_factory=list)
+    closed: bool = False
+
+    def declare(self, root, directories):
+        self.root = Path(root).resolve()
+        self.studies = {Path(d).resolve().relative_to(self.root).as_posix(): {} for d in directories}
+        seal = self.root / "comparison-cv-closed.json"
+        if not seal.exists():
+            if (self.root / "replications.json").exists() or any(
+                    _has_serial_finals(self.root / key) for key in self.studies):
+                raise ValueError("Existing comparison folds are incompatible or lack their closed CV record.")
+            return
+        envelope = json.loads(seal.read_bytes())
+        saved = envelope["studies"]
+        if envelope.get("sha256") != _digest(saved) or set(saved) != set(self.studies):
+            raise ValueError("The serial comparison CV seal is incompatible with these study directories.")
+        # Inspect all replications, including those processed later in the
+        # launcher, before any partition, CV checkpoint or evaluation write.
+        for key, pins in saved.items():
+            directory = self.root / key
+            evaluations = self.evaluations[key] = {}
+            if pins:
+                _check_sealed_partition(directory, pins)
+            for name, pin in pins.items():
+                path = directory / f"{name}-cv.json"
+                if not path.is_file():
+                    raise ValueError(f"Missing or changed CV checkpoint for {name} after final admission.")
+                self.locks.enter_context(_checkpoint_file(path))
+                report = json.loads(path.read_bytes())
+                if _cv_pin(report) != pin["cv"]:
+                    raise ValueError(f"Missing or changed CV checkpoint for {name} after final admission.")
+                evaluation_path = directory / f"{name}-evaluation.json"
+                if evaluation_path.exists():
+                    record = json.loads(evaluation_path.read_bytes())
+                    if (not isinstance(record, dict) or report["state"] != "completed"
+                            or record.get("model") != name or record.get("fold_plan_sha256") != pin["partition"]
+                            or record.get("cv_checkpoint_sha256") != report["checkpoint_sha256"]
+                            or record.get("evaluation_sha256") != _digest({
+                                k: v for k, v in record.items() if k != "evaluation_sha256"})):
+                        raise ValueError(f"Serial evaluation failed its checkpoint or integrity check: {evaluation_path}")
+                    evaluations[name] = record
+        self.studies = saved
+        self.closed = True
+
+    def register(self, directory, models):
+        if self.root is None:
+            self.declare(directory, [directory])
+        key = directory.resolve().relative_to(self.root).as_posix()
+        if key not in self.studies or (self.closed and set(models) != set(self.studies[key])):
+            raise ValueError("Existing comparison folds are incompatible with these methods or directories.")
+        return self.studies[key], self.evaluations.get(key, {})
+
+def _cv_pin(report):
+    if report.get("checkpoint_sha256") != _digest({k: v for k, v in report.items() if k != "checkpoint_sha256"}):
+        raise ValueError("The sealed CV checkpoint failed its integrity check.")
+    folds = set(range(len(report["folds"])))
+    if not folds or any(len(c["folds"]) != len(folds) or {f["fold"] for f in c["folds"]} != folds
+                        for c in report["candidates"]):
+        raise ValueError("The sealed CV checkpoint has incomplete folds.")
+    return _digest({key: report.get(key) for key in (
+        "fingerprint", "folds", "candidates", "cv_timing", "tuning_seconds", "tuning_seconds_complete",
+        "active_threadpools", "global_rng_prefix_changed", "resume_eligible")})
+
+
+def _check_sealed_partition(directory, pins):
+    plan = directory / "comparison-folds.json"
+    receipt = directory / "comparison-folds-receipt.json"
+    if plan.is_file() and receipt.is_file():
+        payload = json.loads(plan.read_bytes())
+        checksum = payload.pop("sha256", None)
+        if (checksum == _digest(payload) and json.loads(receipt.read_bytes()) == {"fold_plan_sha256": checksum}
+                and all(pin["partition"] == checksum for pin in pins.values())):
+            return
+    raise ValueError("The sealed comparison fold plan or its receipt is missing or changed.")
+
+
+def _has_serial_finals(directory):
+    if ((directory / "comparison.json").exists() or (directory / "comparison-cv-closed.json").exists()
+            or any(directory.glob("*-evaluation.json"))):
+        return True
+    for path in directory.glob("*-cv.json"):
+        report = json.loads(path.read_bytes())
+        if report.get("final_fit_attempts") or report.get("state") in {"refitting", "completed"}:
+            return True
+    return False
+
+
+@contextmanager
+def _serial_comparison_batch(*, _host_reserved=False, root=None, directories=()):
+    """Finish CV for every submitted comparison before consuming its final calls."""
+    with ExitStack() as locks:
+        if not _host_reserved:
+            locks.enter_context(_timing_study_lock())
+        batch = _ComparisonBatch(locks, deque())
+        if root is not None:
+            batch.declare(root, directories)
+        yield batch
+        for check in batch.checks:
+            check()
+        if not batch.closed and batch.pending:
+            write_json(batch.root / "comparison-cv-closed.json",
+                       {"studies": batch.studies, "sha256": _digest(batch.studies)})
+        while batch.pending:
+            batch.pending.popleft()()
+
+
+def _cv_joblib_settings():
+    backend, jobs = get_active_backend()
+    return {"backend": f"{type(backend).__module__}.{type(backend).__qualname__}",
+            "requested_n_jobs": jobs, "effective_n_jobs": effective_n_jobs(None),
+            "inner_max_num_threads": getattr(backend, "inner_max_num_threads", None)}
+
+
+class _SerialTimingError(RuntimeError):
+    """The requested serial measurements cannot be established."""
+
+
+@contextmanager
+def _serial_timing_phase(record):
+    """Record the process, effective numerical limits and measured call interval."""
+    record["verified"] = False
+    with ExitStack() as limits:
+        try:
+            limits.enter_context(parallel_config(n_jobs=1))
+            limits.enter_context(threadpool_limits(limits=1))
+            pools = threadpool_info()
+            workers = effective_n_jobs(None)
+        except Exception as error:
+            raise _SerialTimingError("Could not establish the serial timing limits.") from error
+        if not pools:
+            raise _SerialTimingError("No native thread pool was visible for the serial timing check.")
+        if any(pool["num_threads"] != 1 for pool in pools):
+            raise _SerialTimingError("A native thread pool did not accept the serial timing limit.")
+        if workers != 1:
+            raise _SerialTimingError("Joblib did not accept the serial timing limit.")
+        record.update(application_workers=workers, native_threads=1, threadpools=pools,
+                      host=platform.node(), pid=os.getpid(),
+                      started_utc=datetime.now(timezone.utc).isoformat())
+        elapsed = None
+
+        def finish():
+            nonlocal elapsed
+            if elapsed is None:
+                elapsed = time.perf_counter() - start
+                record.update(seconds=elapsed, finished_utc=datetime.now(timezone.utc).isoformat())
+            return elapsed
+
+        start = time.perf_counter()
+        try:
+            yield finish
+        finally:
+            finish()
+            # Failed attempts are published too. Check late-loaded libraries
+            # before a model exception can be treated as a scientific failure.
+            try:
+                final_pools = threadpool_info()
+            except Exception as error:
+                raise _SerialTimingError("Could not verify the final native thread limits.") from error
+            if final_pools != pools:
+                record["final_threadpools"] = final_pools
+            if not final_pools or any(pool["num_threads"] != 1 for pool in final_pools):
+                raise _SerialTimingError("The final native thread limits could not be confirmed.")
+            record["verified"] = True
+
+
+def _serial_worker_overrides(model):
+    # None inherits the Joblib context. Recent sklearn releases also expose
+    # a string sentinel for deprecated n_jobs parameters that have no effect.
+    try:
+        return {name: 1 for name, value in model.get_params().items()
+                if name.rsplit("__", 1)[-1] in {"n_jobs", "projection_workers", "projection_native_threads"}
+                and isinstance(value, Integral) and value != 1}
+    except Exception as error:
+        raise _SerialTimingError("Could not inspect the estimator's worker settings.") from error
+
+
+def _check_serial_workers(model):
+    overrides = _serial_worker_overrides(model)
+    if overrides:
+        raise _SerialTimingError(f"Serial timing requires one worker and one native thread for {', '.join(overrides)}.")
+
+
+def _private_input(array):
+    """Copy input for an independent call, preserving table metadata or array flags."""
+    if not isinstance(array, np.ndarray):
+        return deepcopy(array)
+    private = array.copy(order="K")
+    if not array.flags.writeable:
+        private.flags.writeable = False
+    return private
+
+
+def _serial_comparison_fit(model, X, y, attempt):
+    # Change only the final clone. Explicit worker options take precedence
+    # over an outer Joblib context and the native threadpool controller.
+    overrides = _serial_worker_overrides(model)
+    if overrides:
+        try:
+            model = model.set_params(**overrides)
+        except Exception as error:
+            raise _SerialTimingError("Could not set the estimator's serial timing parameters.") from error
+        _check_serial_workers(model)
+    # A transformer can change its input even on a failed fit. Every retry
+    # and subsequent method starts with the same training values as its CV.
+    X, y = _private_input(X), _private_input(y)
+    attempt["fit_timing"] = {"worker_parameter_overrides": overrides}
+    with _serial_timing_phase(attempt["fit_timing"]):
+        return model.fit(X, y)
 
 
 def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
                        threads=1, checkpoint_path=None, refit=True,
-                       groups=None, folds=None, data_ids=None, scoring="accuracy"):
+                       groups=None, folds=None, data_ids=None, scoring="accuracy",
+                       _comparison_recovery=None):
     """Calibrate on training data with complete, resumable per-fold records.
 
     Defaults are five folds, seed zero and one native numerical thread.
@@ -499,8 +1027,9 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
     Both fit and held-out-fold prediction warnings are retained. Convergence
     warnings invalidate that candidate. If a numerically valid CV winner fails
     full-training refit, try the next valid candidate and retain every attempt.
-    If none can be fitted, a training-only majority-class fallback is returned
-    with ``is_fallback=True``. It is never presented as the requested method.
+    If no candidate qualifies, a standalone search emits
+    ``CalibrationFallbackWarning`` and returns a training-majority classifier
+    with ``report["is_fallback"]`` set to True.
     With ``refit=False``, only CV is performed and the returned estimator is
     None. This supports staged tuning without intermediate full-data fits.
     Supply one subject ID per row in ``groups`` for group-disjoint CV, or pass
@@ -510,6 +1039,11 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
     The latter preserves the historical selection objective. Choose the
     objective before tuning; it never switches automatically with class
     proportions and does not change the estimator's decision rule.
+    For named tables, the selected refit reports its input container. Known
+    numeric estimators and stock pipelines receive validated numeric values
+    with the ordered column names. Custom estimators and nonstandard pipelines
+    receive positional arrays, as in an array-based search. Supply columns
+    in training order when predicting with those returned estimators.
     Explicitly gridded inactive screening parameters produce a warning and
     report diagnostics; selection modes and candidate grids remain unchanged.
 
@@ -519,36 +1053,110 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
     ``.<filename>.lock`` marker persists after release and must not be removed
     or replaced. Its presence alone does not mean the checkpoint is busy.
     With ``checkpoint_path=None``, no checkpoint files or locks are created.
+
+    Keep callable parameters fixed across fits. For a random transformation,
+    give its estimator an integer seed, learn the map in fit, and reuse that
+    map in transform. A restart skips the draws belonging to completed folds.
+    At fold publication, a checkpoint records the first observed change to
+    configuration structure or a captured NumPy RNG. The current run can
+    finish. Reusing marked folds for fitting requires a fresh search, even
+    for a bookkeeping-only change. To read a compatible completed CV-only
+    report, reconstruct the estimator and grid as they were at entry. A callback
+    instance mutated by an earlier call can fail the fingerprint check. A change
+    confined to the final refit leaves clean folds available for another refit
+    from the original configuration.
+
+    The entry fingerprint includes the contents of ordinary NumPy arrays and
+    scalars. The fold check also observes supported RNG states, captured record
+    scalar flags and the contents of their supported backing arrays. For other
+    non-object arrays it observes dtype and shape. Same-dtype edits
+    to numbers, fixed-width strings, dates and non-object structured values
+    can escape detection when array shape is preserved. The check can also miss
+    equal-length byte replacements, mutable globals and state shared across models.
     """
     threads = _validate_threads(threads)
     refit = _validate_refit(refit)
     scoring = _validate_scoring(scoring)
     raw_y = y
+    feature_names = _input_feature_names(X)
     X, y, original_y = _check_labeled_data(X, y)
     classes, counts = np.unique(y, return_counts=True)
     _validate_class_labels(raw_y, y, classes=classes)
     groups = validate_metadata(groups, len(y), name="groups")
     data_ids = validate_metadata(data_ids, len(y), name="data_ids", unique=True)
+    split_state = None
+    if _private_split_rng(seed):
+        split_state = _digest(configuration_identity(seed.get_state(legacy=False)))
     folds = build_cv_folds(X, y, cv=cv, seed=seed, groups=groups, folds=folds)
     cv = len(folds)
     candidates = list(ParameterGrid(param_grid))
     if not candidates:
         raise ValueError("At least one parameter candidate is required.")
+    entry_observation = [] if checkpoint_path is not None else None
+    split_limits = []
     identity = _search_identity(estimator, candidates, X, original_y, cv, seed, threads, refit=refit,
-                                groups=groups, folds=folds, data_ids=data_ids, scoring=scoring)
+                                groups=groups, folds=folds, data_ids=data_ids, scoring=scoring,
+                                _observation=entry_observation, _split_limits=split_limits,
+                                _feature_names=feature_names)
     if type(estimator) is NMFClassifier:
         y = original_y
     # Identity must validate custom cloning before diagnostics clone anything.
     screening_diagnostics = screening_grid_diagnostics(estimator, candidates)
+    uses_global = _uses_global_rng(estimator, candidates, split_limits)
+    ambient_entry = _ambient_mt_token() if uses_global else None
+    if uses_global:
+        identity["global_rng_entry"] = ambient_entry
+    if (split_state is not None and "unverified fit RNG" not in split_limits
+            and (not uses_global or ambient_entry is not None)):
+        identity["seed"] = split_state
+        identity["split_seed_kind"] = "numpy.random.RandomState"
+    if _comparison_recovery is not None and _comparison_recovery.unverified_prefix:
+        identity["unverified_comparison_prefix"] = True
+    serial_final = _comparison_recovery is not None and _comparison_recovery.serial_final
+    if serial_final:
+        identity["serial_final"] = True
+        identity["cv_joblib"] = _cv_joblib_settings()
     fingerprint = _digest(identity)
-    with _checkpoint_file(checkpoint_path) as path:
-        if path is not None and path.exists():
+    writer = _checkpoint_file(checkpoint_path)
+    closed_cv = serial_final and _comparison_recovery.batch.closed
+    if serial_final:
+        # Retain writer ownership over the gap between this CV and its refit.
+        writer = nullcontext(Path(checkpoint_path) if closed_cv else _comparison_recovery.batch.locks.enter_context(writer))
+    with writer as path:
+        loaded_checkpoint = path is not None and path.exists()
+        if closed_cv and not loaded_checkpoint:
+            raise ValueError("Missing CV checkpoint after final admission.")
+        if _comparison_recovery is not None:
+            _comparison_recovery.loaded_checkpoint = loaded_checkpoint
+        if loaded_checkpoint:
+            if _comparison_recovery is not None and _comparison_recovery.unverified_prefix:
+                raise ValueError("Cannot reuse folds after an unverifiable comparison RNG prefix.")
             report = json.loads(path.read_text(encoding="utf-8"))
             if report.get("fingerprint") != fingerprint:
                 raise ValueError("Checkpoint is incompatible with these data, settings, software, or source.")
             saved_digest = report.get("checkpoint_sha256")
             if saved_digest != _digest({k: v for k, v in report.items() if k != "checkpoint_sha256"}):
                 raise ValueError("Checkpoint content failed its integrity check.")
+            if "unverified scalar owner" in split_limits:
+                raise ValueError("Cannot verify the backing storage of a captured NumPy scalar in this checkpoint.")
+            if "unverified fit RNG" in split_limits:
+                raise ValueError("Checkpoint reuse requires an estimator random state with verifiable clone behavior.")
+            if uses_global and ambient_entry is None:
+                raise ValueError("Checkpoint cannot identify the estimator's global random state; use an integer estimator seed.")
+            if uses_global and report.get("global_rng_prefix_changed"):
+                if not refit and report.get("state") == "cv_completed":
+                    return CalibrationResult(None, report)
+                # After the last saved fold, a scalar grid needs only score aggregation.
+                complete = set(range(cv))
+                if (refit or any({f["fold"] for f in c["folds"]} != complete for c in report["candidates"])
+                        or any(type(k) is not str or
+                               (v is not None and not any(type(v) is t for t in (int, float, bool, str)))
+                               for p in candidates for k,v in p.items())):
+                    raise ValueError("Checkpoint cannot reproduce the estimator's global random state; use an integer estimator seed.")
+            if report.get("resume_eligible") is False:
+                if not refit and report.get("state") == "cv_completed":
+                    return CalibrationResult(None, report)
+                raise ValueError("Checkpoint is ineligible for resume. " + report["resume_ineligibility_reason"])
         else:
             report = {"schema_version": 2, "author": "Chang Cheng", "fingerprint": fingerprint,
                       "scoring": scoring, "screening_diagnostics": screening_diagnostics,
@@ -561,70 +1169,152 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
                       "tuning_seconds": 0.0, "final_fit_seconds": 0.0, "final_fit_attempts": []}
         previous_seconds = report["tuning_seconds"]
         start = time.perf_counter()
+        cv_interval = None
+        if serial_final and not closed_cv:
+            report.setdefault("tuning_seconds_complete", True)
+            for interval in report.get("cv_timing", []):
+                if interval.get("state") == "running":
+                    interval["state"] = "unknown_after_last_checkpoint"
+                    report["tuning_seconds_complete"] = False
 
         def checkpoint():
             if path is not None:
                 report["checkpoint_sha256"] = _digest({k: v for k, v in report.items() if k != "checkpoint_sha256"})
                 write_json(path, report)
 
+        def record_cv_elapsed():
+            elapsed = time.perf_counter() - start
+            report["tuning_seconds"] = previous_seconds + elapsed
+            if cv_interval is not None:
+                cv_interval.update(seconds=elapsed, finished_utc=datetime.now(timezone.utc).isoformat())
+
+        @contextmanager
+        def cv_work():
+            if cv_interval is None:
+                yield
+                return
+            checkpoint()  # A process death may leave only the measured subtotal at this boundary.
+            try:
+                yield
+            except BaseException as error:
+                cv_interval.update(state="interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "failed",
+                                   error_type=type(error).__name__)
+                # Interrupted user code can advance RNGs or captured parameters
+                # even though this fold did not produce a reusable score.
+                if ambient_entry is not None and _ambient_mt_token() != ambient_entry:
+                    report["global_rng_prefix_changed"] = True
+                if entry_observation is not None and check_configuration(after_fold=True):
+                    report.update(resume_eligible=False, resume_ineligibility_reason=(
+                        "Estimator or candidate configuration changed during interrupted calibration."))
+                raise
+            else:
+                cv_interval["state"] = "completed"
+            finally:
+                record_cv_elapsed()
+                checkpoint()
+
         previous_files = {}
 
-        def check_implementation_source():
-            sources = implementation_sources(estimator, candidates, _previous_files=previous_files)
+        def check_configuration(*, after_fold=False):
+            """Check source on every call and report observed drift at fold publication."""
+            if path is not None:
+                _check_transform_output(identity["sklearn_transform_output"])
+            if (path is not None and
+                    get_config()["skip_parameter_validation"] != identity["sklearn_skip_parameter_validation"]):
+                raise ValueError("Scikit-learn parameter validation changed during calibration.")
+            observation = [] if after_fold and entry_observation is not None else None
+            sources = implementation_sources(estimator, candidates, _previous_files=previous_files,
+                                             _observation=observation, _split_seed=seed)
             if sources != identity["implementation_source"]:
                 raise ValueError("Estimator implementation source changed during calibration.")
+            return observation is not None and observation != entry_observation
 
-        report["state"] = "calibrating"
-        checkpoint()
+        if not closed_cv:
+            report["state"] = "calibrating"
+            checkpoint()
         with threadpool_limits(limits=threads):
-            report["active_threadpools"] = threadpool_info()
-            for params, candidate in zip(candidates, report["candidates"]):
-                completed = {f["fold"] for f in candidate["folds"]}
-                for fold, (training, validation) in enumerate(folds):
-                    if fold in completed:
-                        continue
-                    check_implementation_source()
-                    record = {"fold": fold, "fit_seconds": 0.0, "prediction_seconds": 0.0}
-                    fitted = None
-                    projection = None
-                    with warnings.catch_warnings(record=True) as caught:
-                        warnings.simplefilter("always")
-                        try:
-                            # Grid entries may themselves be estimators. Clone them
-                            # too so replacement steps cannot retain another fold's
-                            # fitted state or mutate the caller's candidate objects.
-                            fitted = clone(estimator).set_params(**clone(params, safe=False))
-                            fit_start = time.perf_counter()
+            remaining_folds = any(len(c["folds"]) < cv for c in report["candidates"])
+            if closed_cv and remaining_folds:
+                raise ValueError("The closed serial comparison requires all original CV folds.")
+            if not serial_final or remaining_folds:
+                report["active_threadpools"] = threadpool_info()
+            if serial_final and remaining_folds:
+                cv_interval = {"state": "running", "seconds": 0.0, "joblib": identity["cv_joblib"], "native_threads": threads,
+                               "threadpools": report["active_threadpools"], "host": platform.node(),
+                               "pid": os.getpid(), "started_utc": datetime.now(timezone.utc).isoformat()}
+                report.setdefault("cv_timing", []).append(cv_interval)
+                cv_interval["finished_utc"] = cv_interval["started_utc"]
+                start = time.perf_counter()
+            with cv_work():
+                for params, candidate in zip(candidates, report["candidates"]):
+                    completed = {f["fold"] for f in candidate["folds"]}
+                    for fold, (training, validation) in enumerate(folds):
+                        if fold in completed:
+                            continue
+                        check_configuration()
+                        record = {"fold": fold, "fit_seconds": 0.0, "prediction_seconds": 0.0}
+                        fitted = None
+                        projection = None
+                        with warnings.catch_warnings(record=True) as caught:
+                            warnings.simplefilter("always")
                             try:
-                                fitted.fit(X[training], y[training])
-                            finally:
-                                record["fit_seconds"] = time.perf_counter() - fit_start
-                            inference_start = time.perf_counter()
-                            try:
-                                with _capture_projection(fitted) as projection:
-                                    predictions = fitted.predict(X[validation])
-                            finally:
-                                record["prediction_seconds"] = time.perf_counter() - inference_start
-                            score = _score_predictions(scoring, y[validation], predictions)
-                            record.update(_score_fields(scoring, score))
-                            record["status"] = "nonconverged" if _nonconverged(fitted, caught, projection) else "valid"
-                        except Exception as error:
-                            record.update(status="failed", error_type=type(error).__name__, error=str(error))
-                    record["warnings"] = _warning_records(caught)
-                    check_implementation_source()
-                    if fitted is not None:
-                        record["diagnostics"] = _diagnostics(fitted, projection)
-                    candidate["folds"].append(record)
-                    report["tuning_seconds"] = previous_seconds + time.perf_counter() - start
-                    checkpoint()
-                valid = len(candidate["folds"]) == cv and all(f["status"] == "valid" for f in candidate["folds"])
-                scores = [f["score"] for f in candidate["folds"]] if valid else []
-                candidate["valid"] = valid
-                candidate.update(_score_fields(scoring, float(np.mean(scores)) if valid else None, mean=True))
-                candidate["fold_score_std"] = float(np.std(scores, ddof=1)) if valid else None
-                candidate["invalid_fold_count"] = sum(f["status"] != "valid" for f in candidate["folds"])
-                checkpoint()
-            report["tuning_seconds"] = previous_seconds + time.perf_counter() - start
+                                # Grid entries may themselves be estimators. Clone them
+                                # too so replacement steps cannot retain another fold's
+                                # fitted state or mutate the caller's candidate objects.
+                                fitted = clone(estimator).set_params(**clone(params, safe=False))
+                                names = feature_names if feature_names is not None and _numeric_schema_estimator(fitted) else None
+                                fit_start = time.perf_counter()
+                                try:
+                                    fitted.fit(_named_matrix(X[training], names), y[training])
+                                finally:
+                                    record["fit_seconds"] = time.perf_counter() - fit_start
+                                inference_start = time.perf_counter()
+                                try:
+                                    with _capture_projection(fitted) as projection:
+                                        predictions = fitted.predict(_named_matrix(X[validation], names))
+                                finally:
+                                    record["prediction_seconds"] = time.perf_counter() - inference_start
+                                score = _score_predictions(scoring, y[validation], predictions)
+                                record.update(_score_fields(scoring, score))
+                                record["status"] = "nonconverged" if _nonconverged(fitted, caught, projection) else "valid"
+                            except Exception as error:
+                                record.update(status="failed", error_type=type(error).__name__, error=str(error))
+                        record["warnings"] = _warning_records(caught)
+                        if entry_observation is None:
+                            check_configuration()
+                        if fitted is not None:
+                            record["diagnostics"] = _diagnostics(fitted, projection)
+                        # Diagnostics may call user code. Observe after they finish,
+                        # immediately before publishing this fold and its marker.
+                        if entry_observation is not None and check_configuration(after_fold=True):
+                            index = candidate["index"]
+                            report.update(
+                                resume_eligible=False,
+                                resume_ineligibility_candidate_index=index,
+                                resume_ineligibility_fold=fold,
+                                resume_ineligibility_reason=(
+                                    "Estimator or candidate configuration changed during calibration "
+                                    f"(candidate {index}, fold {fold}). Repeat the entire search using a new "
+                                    "checkpoint path or comparison output directory."
+                                ),
+                            )
+                            entry_observation = None
+                        if (path is not None and ambient_entry is not None and not report.get("global_rng_prefix_changed")
+                                and _ambient_mt_token() != ambient_entry):
+                            report["global_rng_prefix_changed"] = True
+                        candidate["folds"].append(record)
+                        record_cv_elapsed()
+                        checkpoint()
+                    valid = len(candidate["folds"]) == cv and all(f["status"] == "valid" for f in candidate["folds"])
+                    scores = [f["score"] for f in candidate["folds"]] if valid else []
+                    candidate["valid"] = valid
+                    candidate.update(_score_fields(scoring, float(np.mean(scores)) if valid else None, mean=True))
+                    candidate["fold_score_std"] = float(np.std(scores, ddof=1)) if valid else None
+                    candidate["invalid_fold_count"] = sum(f["status"] != "valid" for f in candidate["folds"])
+                    if not closed_cv:
+                        checkpoint()
+            if not serial_final:
+                record_cv_elapsed()
             ranked = sorted((c for c in report["candidates"] if c["valid"]),
                             key=lambda c: (-c["mean_score"], c["index"]))
             if not refit:
@@ -639,50 +1329,146 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
                                   screening_diagnostics, None if selected is None else selected["index"]))
                 checkpoint()
                 return CalibrationResult(None, report)
-            selected = None
-            fitted = None
-            report["state"] = "refitting"
-            checkpoint()
-            for candidate in ranked:
-                check_implementation_source()
-                attempt = {"candidate_index": candidate["index"], "parameters": candidate["parameters"]}
-                attempt_start = time.perf_counter()
-                with warnings.catch_warnings(record=True) as caught:
-                    warnings.simplefilter("always")
+
+            def fit_selected():
+                cost_field = "cumulative_final_fit_seconds" if serial_final else "final_fit_seconds"
+                if serial_final:
+                    report.setdefault(cost_field, 0.0)
+                    report.setdefault("cumulative_final_fit_seconds_complete", True)
+                    pending = report.pop("pending_final_fit", None)
+                    if pending is not None:
+                        pending.update(status="interrupted_before_publication",
+                                       seconds=pending.get("fit_timing", {}).get("seconds"))
+                        if pending["seconds"] is None:
+                            report["cumulative_final_fit_seconds_complete"] = False
+                        else:
+                            report[cost_field] += pending["seconds"]
+                        report["final_fit_attempts"].append(pending)
+
+                def measured_fit(model, labels, attempt, names):
+                    pending = report["pending_final_fit"] = dict(attempt, entered_utc=datetime.now(timezone.utc).isoformat())
+                    checkpoint()
                     try:
-                        parameters = clone(candidates[candidate["index"]], safe=False)
-                        model = clone(estimator).set_params(**parameters).fit(X, y)
-                        attempt["diagnostics"] = _diagnostics(model)
-                        attempt["status"] = "nonconverged" if _nonconverged(model, caught) else "valid"
-                        if attempt["status"] == "valid":
-                            fitted, selected = model, candidate
-                    except Exception as error:
-                        attempt.update(status="failed", error_type=type(error).__name__, error=str(error))
-                attempt["warnings"] = _warning_records(caught)
-                check_implementation_source()
-                attempt["seconds"] = time.perf_counter() - attempt_start
-                report["final_fit_seconds"] += attempt["seconds"]
-                report["final_fit_attempts"].append(attempt)
+                        return _serial_comparison_fit(model, _named_matrix(X, names), labels, attempt)
+                    except BaseException as error:
+                        if isinstance(error, _SerialTimingError) or not isinstance(error, Exception):
+                            receipt = attempt.get("fit_timing", {})
+                            if "started_utc" in receipt:
+                                status = "timing_verification_failed" if isinstance(error, _SerialTimingError) else "interrupted"
+                                seconds = receipt.get("seconds")
+                                attempt.update(status=status, error_type=type(error).__name__, error=str(error), seconds=seconds)
+                                if seconds is None:
+                                    report["cumulative_final_fit_seconds_complete"] = False
+                                else:
+                                    report[cost_field] += seconds
+                                report["final_fit_attempts"].append(attempt)
+                            elif not isinstance(error, Exception):
+                                attempt.update(status="interrupted_before_fit", error_type=type(error).__name__, seconds=None)
+                                report["final_fit_attempts"].append(attempt)
+                            report.pop("pending_final_fit")
+                        raise
+                    finally:
+                        # Preserve a completed measured call even if the worker
+                        # dies while collecting diagnostics before publishing it.
+                        if attempt.get("fit_timing", {}).get("verified"):
+                            pending["fit_timing"] = attempt["fit_timing"]
+                        checkpoint()
+
+                selected = None
+                fitted = None
+                report["state"] = "refitting"
                 checkpoint()
-                if fitted is not None:
-                    break
-            if fitted is None:
-                fallback_start = time.perf_counter()
-                fitted = DummyClassifier(strategy="most_frequent").fit(X, _label_values(y))
-                seconds = time.perf_counter() - fallback_start
-                report["final_fit_seconds"] += seconds
-                report["final_fit_attempts"].append({"status": "fallback", "seconds": seconds,
-                                                    "reason": "No candidate passed all folds and final refit."})
-        report.update(state="completed", is_fallback=selected is None,
-                      selected_candidate_index=None if selected is None else selected["index"],
-                      selected_parameters=None if selected is None else selected["parameters"],
-                      selected_mean_score=None if selected is None else selected["mean_score"],
-                      tuning_complete=False, defaults_frozen=False,
-                      refinement=mark_inactive_refinement(
-                          refinement_diagnostics(candidates, None if selected is None else selected["parameters"]),
-                          screening_diagnostics, None if selected is None else selected["index"]))
-        checkpoint()
-        return CalibrationResult(fitted, report)
+                for candidate in ranked:
+                    check_configuration()
+                    attempt = {"candidate_index": candidate["index"], "parameters": candidate["parameters"]}
+                    attempt_start = time.perf_counter()
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter("always")
+                        try:
+                            parameters = clone(candidates[candidate["index"]], safe=False)
+                            model = clone(estimator).set_params(**parameters)
+                            names = feature_names if feature_names is not None and _numeric_schema_estimator(model) else None
+                            if feature_names is not None:
+                                attempt["input_container"] = "named_numeric_frame" if names is not None else "positional_array"
+                            if serial_final:
+                                model = measured_fit(model, y, attempt, names)
+                            else:
+                                model = model.fit(_named_matrix(X, names), y)
+                            attempt["diagnostics"] = _diagnostics(model)
+                            attempt["status"] = "nonconverged" if _nonconverged(model, caught) else "valid"
+                            if attempt["status"] == "valid":
+                                fitted, selected = model, candidate
+                        except Exception as error:
+                            if serial_final and isinstance(error, _SerialTimingError):
+                                raise
+                            attempt.update(status="failed", error_type=type(error).__name__, error=str(error))
+                    attempt["warnings"] = _warning_records(caught)
+                    check_configuration()
+                    attempt["seconds"] = (attempt.get("fit_timing", {}).get("seconds") if serial_final
+                                          else time.perf_counter() - attempt_start)
+                    if attempt["seconds"] is not None:
+                        report[cost_field] += attempt["seconds"]
+                    report["final_fit_attempts"].append(attempt)
+                    report.pop("pending_final_fit", None)
+                    checkpoint()
+                    if fitted is not None:
+                        break
+                if fitted is None:
+                    fallback_start = time.perf_counter()
+                    fitted = DummyClassifier(strategy="most_frequent")
+                    attempt = {"status": "fallback", "reason": "No candidate passed all folds and final refit."}
+                    if feature_names is not None:
+                        attempt["input_container"] = "named_numeric_frame"
+                    if serial_final:
+                        measured_fit(fitted, _label_values(y), attempt, feature_names)
+                        attempt["seconds"] = attempt["fit_timing"]["seconds"]
+                    else:
+                        fitted = fitted.fit(_named_matrix(X, feature_names), _label_values(y))
+                        attempt["seconds"] = time.perf_counter() - fallback_start
+                    report[cost_field] += attempt["seconds"]
+                    report["final_fit_attempts"].append(attempt)
+                    report.pop("pending_final_fit", None)
+                if serial_final:
+                    report["final_fit_seconds"] = attempt["seconds"]
+                return fitted, selected
+
+            def complete(fitted, selected):
+                positional_columns = () if feature_names is None else None
+                if feature_names is not None:
+                    container = report["final_fit_attempts"][-1]["input_container"]
+                    report["refit_input_container"] = container
+                    if container == "positional_array":
+                        positional_columns = tuple(feature_names)
+                        report["refit_evaluation_schema"] = "calibration"
+                    else:
+                        report["refit_evaluation_schema"] = "native"
+                report.update(state="completed", is_fallback=selected is None,
+                              selected_candidate_index=None if selected is None else selected["index"],
+                              selected_parameters=None if selected is None else selected["parameters"],
+                              selected_mean_score=None if selected is None else selected["mean_score"],
+                              tuning_complete=False, defaults_frozen=False,
+                              refinement=mark_inactive_refinement(
+                                  refinement_diagnostics(candidates, None if selected is None else selected["parameters"]),
+                                  screening_diagnostics, None if selected is None else selected["index"]))
+                checkpoint()
+                return CalibrationResult(fitted, report, positional_columns)
+
+            if serial_final:
+                _comparison_recovery.refit = lambda: complete(*fit_selected())
+                if not closed_cv:
+                    report["state"] = "cv_completed"
+                    checkpoint()
+                return CalibrationResult(None, report)
+            fitted, selected = fit_selected()
+        result = complete(fitted, selected)
+    if _comparison_recovery is None and result.report["is_fallback"]:
+        warnings.warn(
+            "No calibration candidate passed every fold and the full-training refit. "
+            "Using a training-majority fallback (DummyClassifier). "
+            "See report['candidates'] and report['final_fit_attempts'] for details.",
+            CalibrationFallbackWarning, stacklevel=2,
+        )
+    return result
 
 
 def _unique_native_groups(values, *, return_inverse=False):
@@ -941,8 +1727,14 @@ def _evaluation_svc_can_reuse(head):
 
 def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
                         groups=None, train_sample_ids=None, train_groups=None,
-                        train_y=None, min_class_support=10, min_groups=5):
-    """Evaluate a fitted classifier without fitting or threshold selection.
+                        train_y=None, min_class_support=10, min_groups=5, _serial_timing=None):
+    """Evaluate a fitted classifier or the fitted model in a CalibrationResult.
+
+    Passing the result retains the input column order for custom classifiers
+    fitted on positional arrays. With unnamed training input, evaluation uses
+    validation columns by position. Use that result with its original fit.
+    If its calibration report flags a majority fallback, the evaluation report
+    carries ``is_fallback=True``. A bare fitted estimator has no such provenance.
 
     Optional ``train_y`` defines a training-only majority reference. Subject IDs
     in ``groups`` provide subject counts; with ``train_groups`` they also enforce
@@ -969,6 +1761,23 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
     before prediction or native-runtime initialization.
     """
     threads = _validate_threads(threads)
+    positional_names = None
+    calibration_metadata = {}
+    if isinstance(estimator, CalibrationResult):
+        if estimator.report.get("is_fallback") is True:
+            calibration_metadata["is_fallback"] = True
+        positional_names = estimator._positional_input_columns
+        estimator = estimator.estimator
+        if estimator is None:
+            raise ValueError("The calibration result has no fitted estimator.")
+    feature_names = _input_feature_names(X)
+    if feature_names is not None:
+        if positional_names is None:
+            original_table = X
+            expected_names = _fitted_input_names(estimator)
+            _check_matching_columns(expected_names, feature_names)
+        elif positional_names:
+            _check_matching_columns(positional_names, feature_names)
     raw_y = y
     X, y, original_y = _check_labeled_data(X, y)
     _validate_class_labels(raw_y, y)
@@ -984,8 +1793,39 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
         train_groups=train_groups, train_y=train_y, min_class_support=min_class_support,
         min_groups=min_groups)
     positive = classes[1]
+    source_X = X
+    if feature_names is not None and positional_names is None:
+        if _numeric_schema_estimator(estimator, fitted=True):
+            X = _named_matrix(X, feature_names)
+        elif expected_names is not None or _has_named_pipeline_stage(estimator):
+            # Custom consumers can observe the original index and dtypes,
+            # including through a transformer configured for table output.
+            # A downstream stage may also own names created by a transform.
+            if not _has_pipeline_input_override(estimator):
+                X = original_table
+            elif expected_names is None:
+                raise ValueError("Cannot validate raw feature names for this overridden pipeline.")
+        else:
+            raise ValueError("Cannot verify feature names for a positional estimator. "
+                             "Pass its CalibrationResult or an array in training order.")
+    score_X = X
+    if _serial_timing is not None:
+        _check_serial_workers(estimator)
+    # A reconstructed frame may share validated numeric storage. Native table
+    # transforms can also edit the caller's columns, index, or values in place.
+    private_calls = _serial_timing is not None or feature_names is not None
+    if private_calls:
+        X = _private_input(X)
+        # Combined predictions and shared pipelines consume one raw query.
+        # Separate public calls may both contain in-place transformations.
+        if not (_evaluation_pipeline_can_share(estimator) or
+                (type(estimator) is NMFClassifier and
+                 (hasattr(estimator, "predict_with_probabilities") or
+                  hasattr(estimator, "predict_with_decision_function")))):
+            score_X = _private_input(score_X)
     start = time.perf_counter()
-    with (threadpool_limits(limits=threads), warnings.catch_warnings(record=True) as caught,
+    limits = threadpool_limits(limits=threads) if _serial_timing is None else _serial_timing_phase(_serial_timing)
+    with (limits as finish_serial_timing, warnings.catch_warnings(record=True) as caught,
           _capture_projection(estimator) as projection):
         warnings.simplefilter("always")
         try:
@@ -1016,7 +1856,14 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
                     predicted = head.classes_[(margin > 0).astype(np.intp)]
                     prediction_operation = "joint_label_and_margin_prediction_one_projection"
                 else:
-                    predicted = head.predict(projected)
+                    # Projection may itself be stateful. Reuse its exact output
+                    # for both head calls while isolating custom in-place heads.
+                    labels_input = projected
+                    if (private_calls and
+                            (type(head) not in (LogisticRegression, _TrackedLogisticRegression) or
+                             any(name in vars(head) for name in ("predict", "predict_proba", "decision_function")))):
+                        labels_input = _private_input(projected)
+                    predicted = head.predict(labels_input)
                     if hasattr(estimator, "predict_proba"):
                         probability = head.predict_proba(projected)[:, 1]
                         prediction_operation = "joint_label_and_probability_prediction_one_projection"
@@ -1035,13 +1882,15 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
             else:
                 predicted = estimator.predict(X)
                 if hasattr(estimator, "predict_proba"):
-                    probability = estimator.predict_proba(X)[:, 1]
+                    probability = estimator.predict_proba(score_X)[:, 1]
                     prediction_operation = "predict_plus_predict_proba_calls"
                 elif hasattr(estimator, "decision_function"):
-                    margin = estimator.decision_function(X)
+                    margin = estimator.decision_function(score_X)
                     prediction_operation = "predict_plus_decision_function_calls"
                 else:
                     prediction_operation = "predict_only"
+            if _serial_timing is not None:
+                finish_serial_timing()
             if probability is not None and (not np.all(np.isfinite(probability)) or np.any((probability < 0) | (probability > 1))):
                 raise ValueError("Nonfinite or invalid predicted probabilities.")
             if margin is not None:
@@ -1050,12 +1899,15 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
                     raise ValueError("Decision margins must be a finite one-dimensional binary score.")
             predicted = _label_values(_validate_class_labels(predicted))
         except Exception as error:
-            return {"status": "failed", "error_type": type(error).__name__, "error": str(error),
-                    "prediction_seconds": time.perf_counter() - start,
+            if _serial_timing is not None:
+                finish_serial_timing()
+            return {**calibration_metadata, "status": "failed", "error_type": type(error).__name__, "error": str(error),
+                    "prediction_seconds": (time.perf_counter() - start if _serial_timing is None
+                                           else _serial_timing["seconds"]),
                     "warnings": _warning_records(caught), "diagnostics": _diagnostics(estimator, projection),
                     "support_diagnostics": support_diagnostics, "training_majority_reference": majority_reference,
-                    "data_sha256": data_fingerprint(X, original_y)}
-    elapsed = time.perf_counter() - start
+                    "data_sha256": _data_fingerprint(source_X, original_y, feature_names)}
+    elapsed = time.perf_counter() - start if _serial_timing is None else _serial_timing["seconds"]
     precision, recall, f1, support = precision_recall_fscore_support(y, predicted, labels=classes,
                                                                      zero_division=0)
     both_classes = len(np.unique(y)) == 2
@@ -1078,11 +1930,13 @@ def evaluate_classifier(estimator, X, y, *, threads=1, sample_ids=None,
                              for i, label in enumerate(classes)]}
     if not both_classes:
         metrics["undefined_reason"] = "Evaluation split contains only one class; balanced accuracy and ranking metrics omitted."
-    return {"status": "provisional_nonconvergence" if _nonconverged(estimator, caught, projection) else "valid",
+    return {**calibration_metadata,
+            "status": "provisional_nonconvergence" if _nonconverged(estimator, caught, projection) else "valid",
             "metrics": metrics, "prediction_seconds": elapsed, "prediction_operation": prediction_operation,
             "ranking_score_type": score_type,
             "warnings": _warning_records(caught),
-            "diagnostics": _diagnostics(estimator, projection), "data_sha256": data_fingerprint(X, original_y),
+            "diagnostics": _diagnostics(estimator, projection),
+            "data_sha256": _data_fingerprint(source_X, original_y, feature_names),
             "support_diagnostics": support_diagnostics, "training_majority_reference": majority_reference,
             "evaluation_groups": _jsonable(groups),
             "predictions": {"sample_ids": _jsonable(np.arange(len(y)) if sample_ids is None else sample_ids),
@@ -1100,6 +1954,8 @@ def format_evaluation_summary(report):
     """
     evaluation = report.get("evaluation", report)
     lines = [f"Evaluation status: {evaluation.get('status', 'unavailable')}."]
+    if report.get("is_fallback", evaluation.get("is_fallback")):
+        lines.insert(0, "Calibration used a training-majority fallback (DummyClassifier).")
     if "error" in evaluation:
         lines.append(f"Error: {evaluation['error']}")
 
@@ -1171,9 +2027,19 @@ def format_evaluation_summary(report):
     if diagnostics.get("last_transform_error"):
         lines += ["", f"Latest projection error: {diagnostics['last_transform_error']}"]
     lines += ["", "| Timed stage | Seconds |", "| --- | --- |"]
-    for label, value in (("Tuning", report.get("tuning_seconds")),
-                         ("Final fitting (recorded attempts)", report.get("final_fit_seconds")),
-                         ("Prediction", evaluation.get("prediction_seconds"))):
+    if "cumulative_final_fit_seconds" in report:
+        cumulative_label = ("Final fitting (measured subtotal, incomplete)"
+                            if report.get("cumulative_final_fit_seconds_complete") is False
+                            else "Final fitting (all recorded attempts)")
+        fits = [("Final fitting (evaluated model)", report.get("final_fit_seconds")),
+                (cumulative_label, report["cumulative_final_fit_seconds"])]
+        fit_note = "The cumulative fit time includes measured durations for the evaluated fit, earlier refits and unsuccessful attempts."
+    else:
+        fits = [("Final fitting (recorded attempts)", report.get("final_fit_seconds"))]
+        fit_note = "Final fitting can include unsuccessful refit attempts."
+    tuning_label = "Tuning (measured subtotal, incomplete)" if report.get("tuning_seconds_complete") is False else "Tuning"
+    for label, value in [(tuning_label, report.get("tuning_seconds")), *fits,
+                         ("Prediction", evaluation.get("prediction_seconds"))]:
         lines.append(f"| {label} | {number(value)} |")
     fit_times = diagnostics.get("fit_times", {})
     stages = ("screening", "factorization", "training_projection", "classifier", "total")
@@ -1183,12 +2049,28 @@ def format_evaluation_summary(report):
         if label in stages:
             continue
         lines.append(f"| Fit: {label.replace('_', ' ')} | {number(value)} |")
-    lines += ["", "Final fitting can include unsuccessful refit attempts. Fit rows describe the "
+    lines += ["", fit_note + " Fit rows describe the "
               "fitted estimator; its total includes its component stages. Prediction is the measured "
               "evaluation operation. Do not add these overlapping totals or infer total time by "
               "summing stage medians or concurrent worker times. Individual-operation latency "
               "and batch throughput are separate measurements."]
     return "\n".join(lines) + "\n"
+
+
+@contextmanager
+def _timing_study_lock():
+    """Reserve this user and host for one participating timing study, including CV."""
+    # A shared home can span machines. Different environments and output
+    # directories on the same machine must still contend for the same lock.
+    configured = os.environ.get("SUPERVISED_NMF_TIMING_LOCK")
+    if configured is None:
+        marker = Path.home() / f".supervised-nmf-timing-{platform.node().lower()}.lock"
+    else:
+        marker = Path(configured)
+        if not marker.is_absolute():
+            raise ValueError("SUPERVISED_NMF_TIMING_LOCK requires an absolute lock-file path.")
+    with _file_lock(marker, f"Another timing study is active on this host ({marker})."):
+        yield
 
 
 def comparison_models(*, random_state=0, quick=False, max_iter=20000, tol=1e-4,
@@ -1199,7 +2081,7 @@ def comparison_models(*, random_state=0, quick=False, max_iter=20000, tol=1e-4,
 
     Grids are deliberately modest starting grids. Caller-supplied JSON can expand
     them, and diagnostics identify unfinished boundaries/interior refinement.
-    Absolute screening uses |t|, not the F statistic used for percentile ranking.
+    Absolute screening thresholds the computed |t|. Percentile screening ranks it.
     ``classifier='knn'`` preserves the historical method names and grids.
     ``classifier='logistic'`` uses standardized representations and L2 logistic
     regression, with distinct names so both mappings can be combined. Scaling,
@@ -1280,9 +2162,110 @@ def comparison_models(*, random_state=0, quick=False, max_iter=20000, tol=1e-4,
     return models
 
 
+_COMPARISON_NAME = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _uses_skipped_rng(dependencies, skipped):
+    """Identify streams or overlapping buffers retained by a skipped callback."""
+    for value, _ in dependencies:
+        if id(value) in skipped:
+            return True
+        if type(value) is np.ndarray and any(
+            type(previous) is np.ndarray and np.may_share_memory(value, previous)
+            for previous in skipped.values()
+        ):
+            return True
+    return False
+
+
+def _comparison_has_mutable_parameters(configuration):
+    """Check actual estimator and grid values in the already captured identity."""
+    def immutable(value):
+        kind = value["kind"]
+        if kind == "estimator":
+            return all(immutable(setting) for _, setting in value["parameters"]["items"])
+        if kind == "tuple":
+            return all(immutable(item) for item in value["items"])
+        if kind == "numpy_scalar":
+            # A structured scalar can be a writable view into an RNG's pool.
+            dtype = value["dtype"]
+            return dtype["str"][1] not in ("V", "O") and not dtype.get("metadata")
+        return kind in ("none", "bool", "int", "float", "complex", "str", "bytes")
+
+    # The outer dictionaries and candidate list were synthesized for this
+    # search. Only their parameter values can belong to the caller's RNG.
+    entries = {key["value"]: value for key, value in configuration["items"]}
+    return not immutable(entries["estimator"]) or any(
+        not immutable(setting) for candidate in entries["candidates"]["items"]
+        for _, setting in candidate["items"])
+
+
+def _comparison_has_results(directory):
+    # Only files whose names the comparison writer can produce are evidence.
+    for suffix in ("-cv.json", "-evaluation.json"):
+        for path in directory.glob("*" + suffix):
+            if _COMPARISON_NAME.fullmatch(path.name[:-len(suffix)]) and path.is_file():
+                return True
+    summary = directory / "comparison.json"
+    if not summary.exists():
+        return False
+    saved = json.loads(summary.read_text(encoding="utf-8"))
+    return not (isinstance(saved, dict) and saved.get("models") == {}
+                and saved.get("phase") == "development_comparison"
+                and saved.get("fold_plan_sha256") is None)
+
+
+def _comparison_folds(directory, requested, X, y, seed):
+    """Commit a single partition before any model starts calibrating."""
+    path = directory / "comparison-folds.json"
+    receipt = directory / "comparison-folds-receipt.json"
+    # Calibration accepts a one-column target. Leave its usual warning to
+    # calibration itself rather than issuing it once more during split setup.
+    labels = y[:, 0] if y.ndim == 2 and y.shape[1] == 1 else y
+    with _checkpoint_file(path) as path:
+        if path.exists():
+            plan = json.loads(path.read_text(encoding="utf-8"))
+            if (not isinstance(plan, dict) or type(plan.get("schema_version")) is not int
+                    or plan["schema_version"] != 1):
+                raise ValueError("Invalid comparison fold plan.")
+            checksum = plan.pop("sha256", None)
+            if checksum != _digest(plan):
+                raise ValueError("Comparison fold plan failed its integrity check.")
+            if _digest(plan.get("identity")) != _digest(requested):
+                raise ValueError("Existing comparison folds are incompatible; create a new run directory.")
+            validation = plan.get("validation_indices")
+            if not isinstance(validation, list) or len(validation) != requested["cv"]:
+                raise ValueError("Invalid comparison fold plan.")
+            folds = None
+        else:
+            if receipt.exists() or _comparison_has_results(directory):
+                raise ValueError("Existing comparison records lack their fold plan; create a new run directory.")
+            checked_X, checked_y, _ = _check_labeled_data(X, labels)
+            folds = build_cv_folds(checked_X, checked_y, cv=requested["cv"], seed=seed)
+            validation = [valid.tolist() for _, valid in folds]
+            plan = {"schema_version": 1, "identity": requested,
+                    "validation_indices": validation}
+            checksum = _digest(plan)
+            write_json(path, dict(plan, sha256=checksum))
+        # A valid plan copied from another run has a valid *internal* checksum.
+        # Record the committed digest independently, including for partial runs
+        # and callers appending new model names before loading older results.
+        expected_receipt = {"fold_plan_sha256": checksum}
+        if receipt.exists():
+            if json.loads(receipt.read_text(encoding="utf-8")) != expected_receipt:
+                raise ValueError("Comparison fold plan does not match its original receipt.")
+        else:
+            if folds is None and _comparison_has_results(directory):
+                raise ValueError("Existing comparison records lack their fold receipt; create a new run directory.")
+            # A prior call may have committed its plan and stopped here. No
+            # model can start before the receipt is published under this lock.
+            write_json(receipt, expected_receipt)
+    return folds, validation, checksum
+
+
 def run_comparison(models, X_train, y_train, X_validation, y_validation, *,
                    output_dir, seed=0, threads=1, validation_ids=None, signal_support=None,
-                   scoring="accuracy"):
+                   scoring="accuracy", serial_final=False, _batch=None):
     """Save each model independently; resume only exactly compatible results.
 
     Validation is development data, never evidence that defaults are finalized.
@@ -1290,42 +2273,104 @@ def run_comparison(models, X_train, y_train, X_validation, y_validation, *,
     ``scoring`` chooses the common training-CV objective for all methods;
     development evaluation still reports its full set of classification metrics.
 
+    With ``serial_final=True``, all models finish CV before any final fit.
+    CV uses the requested ``threads`` and ambient Joblib configuration, and final
+    fits and held-out predictions run with one Joblib worker and one native
+    thread. The final estimator clone uses one for explicit ``n_jobs``,
+    ``projection_workers`` and ``projection_native_threads`` settings. Other
+    estimators must respect these controls for a comparable timing. Keep
+    competing jobs off the host. The CV checkpoint records the settings,
+    process, native pools and wall-clock interval of each final fit. The
+    evaluation record includes the corresponding prediction evidence.
+    The selected fit time excludes unsuccessful attempts and earlier refits
+    after interruption. The cumulative final fit time includes all attempts.
+    Resume a serial study with its original ordered methods and CV settings.
+
     ``threads`` follows the same integer-count contract as calibration and
     evaluation. The generated-fold ``seed`` follows sklearn's random-state
     contract, including None and RandomState; both controls are checked before
     output creation. Seed preflight does not draw random numbers. Completed
     compatible results retain the existing reuse policy; use a fixed integer
-    seed for reproducible new comparisons.
+    seed for reproducible new comparisons. Each nonempty comparison saves one
+    common partition in comparison-folds.json for all models. Ordinary
+    comparisons also support new models appended on resume. With a split seed of None or a mutable
+    RandomState, later models can produce different results from earlier
+    releases, which drew folds for each model. Keep the partition, its receipt,
+    and the per-model records together. The directory reserves comparison.json
+    and files named <model>-cv.json or <model>-evaluation.json for legal model
+    names. Each call writes comparison.json for the models supplied in that
+    call. Appending only B preserves A's per-model files and lists only B in
+    the summary. Supply both A and B for a combined summary. Finish older
+    jobs with their original source and environment, or start a new comparison
+    in a fresh directory after upgrading.
+
+    Give each model an independent integer seed. Loading an archived model
+    skips its fits and predictions, including any external RNG draws. Models
+    depending on NumPy's global RNG cannot follow a skipped model that
+    may have advanced it. Restoring the partition also skips the splitter's
+    draws, so a model sharing its mutable RNG requires a fresh comparison.
+    A custom RandomState subclass or bit generator can change other inputs
+    during splitting. Comparisons using one must run in a fresh directory.
+    A later model using a stream or overlapping buffer captured by a skipped
+    callback also requires a fresh comparison. A view with an unknown backing
+    object, dtype metadata, and other opaque retained state can hide a shared
+    RNG or buffer on either side of a model boundary. When an earlier model
+    or a mutable splitter could affect that state, the later model's folds
+    and evaluation require a fresh comparison, even if read on their own.
+    Other mutable callback state shared across models can still affect results
+    when appended.
+    A model with unverifiable RNG clone or child-stream behavior can run
+    only when the comparison has executed the split and every preceding model
+    from scratch.
+    An existing compatible evaluation remains readable when
+    its calibration observed a change during a fold. To load it, reconstruct
+    the estimator and grid as they were at calibration entry. A callback
+    instance mutated by an earlier call can fail the fingerprint check.
+    To recreate the fitted estimator after a marked fold, repeat the search
+    in a new comparison output directory.
     """
     threads = _validate_threads(threads)
+    if not isinstance(serial_final, (bool, np.bool_)):
+        raise ValueError("serial_final must be a Boolean.")
+    if serial_final and _batch is None:
+        with _serial_comparison_batch() as batch:
+            return run_comparison(models, X_train, y_train, X_validation, y_validation,
+                                  output_dir=output_dir, seed=seed, threads=threads,
+                                  validation_ids=validation_ids, signal_support=signal_support,
+                                  scoring=scoring, serial_final=True, _batch=batch)
     # Validate the consumed generic seed without drawing from mutable/global RNGs.
     # Keep sklearn's existing None/RandomState contract and the original identity.
-    check_random_state(seed)
+    custom_split = not _stock_split_rng(check_random_state(seed))
     scoring = _validate_scoring(scoring)
     y_train = _validate_class_labels(y_train)
     y_validation = _validate_class_labels(y_validation)
+    transform_output = get_config()["transform_output"]
+    train_names = _input_feature_names(X_train)
+    validation_names = _input_feature_names(X_validation)
+    _check_matching_columns(train_names, validation_names)
+    named_input = _named_input_identity() if train_names is not None or validation_names is not None else None
     output_dir = Path(output_dir)
+    if serial_final:
+        model_pins, saved_evaluations = _batch.register(output_dir, models)
     output_dir.mkdir(parents=True, exist_ok=True)
     results = {}
-    for name, (estimator, grid) in models.items():
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
-            raise ValueError("Model names must contain only letters, digits, underscore or hyphen.")
-        identity = _search_identity(estimator, list(ParameterGrid(grid)), X_train, y_train, 5, seed, threads,
-                                    scoring=scoring)
-        comparison_fingerprint = _digest({"calibration": identity,
-                                          "validation": data_fingerprint(X_validation, y_validation),
-                                          "validation_ids": validation_ids, "signal_support": signal_support})
-        result_path = output_dir / f"{name}-evaluation.json"
-        if result_path.exists():
-            existing = json.loads(result_path.read_text(encoding="utf-8"))
-            if existing.get("comparison_fingerprint") != comparison_fingerprint:
-                raise ValueError(f"Existing {name} results are incompatible; create a new run directory.")
-            results[name] = existing
-            continue
-        calibrated = calibration_search(estimator, grid, X_train, y_train, cv=5, seed=seed,
-                                        threads=threads, checkpoint_path=output_dir / f"{name}-cv.json",
-                                        scoring=scoring)
+    fold_digest = None
+    restored_plan = False
+    independent_split = isinstance(seed, (int, np.integer)) or _private_split_rng(seed)
+    skipped_global_model = False
+    skipped_captures = {}
+    # A noninteger splitter advances an RNG that later opaque state may retain.
+    earlier_retained_state = not isinstance(seed, (int, np.integer))
+    earlier_unverified_state = False
+    loaded_model_checkpoint = False
+    skipped_cv = []
+
+    def publish(name, comparison_fingerprint, result_path, skip_validation, calibrated, recovery):
+        _check_transform_output(transform_output)
+        if serial_final:
+            calibrated = recovery.refit()
         record = {"model": name, "comparison_fingerprint": comparison_fingerprint,
+                  "fold_plan_sha256": fold_digest,
                   "scoring": scoring,
                   "selected_mean_score": calibrated.report["selected_mean_score"],
                   "is_fallback": calibrated.report["is_fallback"],
@@ -1335,23 +2380,226 @@ def run_comparison(models, X_train, y_train, X_validation, y_validation, *,
                   "tuning_complete": False, "defaults_frozen": False,
                   "evaluation_role": "development_validation",
                   "refinement": calibrated.report["refinement"]}
+        if serial_final:
+            record["cumulative_final_fit_seconds"] = calibrated.report["cumulative_final_fit_seconds"]
+            record["cumulative_final_fit_seconds_complete"] = calibrated.report["cumulative_final_fit_seconds_complete"]
+            record["tuning_seconds_complete"] = calibrated.report["tuning_seconds_complete"]
+            record["cv_timing"] = calibrated.report["cv_timing"]
+            attempts = calibrated.report["final_fit_attempts"]
+            record["fit_timing"] = attempts[-1]["fit_timing"]
+            # A killed process may have started fitting before it could save its clock.
+            record["first_final_fit_started_utc"] = next(
+                (a.get("fit_timing", {}).get("started_utc") for a in attempts
+                 if "started_utc" in a.get("fit_timing", {}) or a["status"] == "interrupted_before_publication"), None)
+        if calibrated.report.get("resume_eligible") is False:
+            for field in ("resume_eligible", "resume_ineligibility_candidate_index",
+                          "resume_ineligibility_fold", "resume_ineligibility_reason"):
+                record["calibration_" + field] = calibrated.report[field]
         if signal_support is not None and not record["is_fallback"]:
             record["support_recovery"] = support_recovery(calibrated.estimator, signal_support)
+        if "refit_input_container" in calibrated.report:
+            record["refit_input_container"] = calibrated.report["refit_input_container"]
+            record["refit_evaluation_schema"] = calibrated.report["refit_evaluation_schema"]
+        prediction_options = {}
+        if serial_final:
+            record["prediction_timing"] = {}
+            prediction_options["_serial_timing"] = record["prediction_timing"]
         try:
-            record["evaluation"] = evaluate_classifier(calibrated.estimator, X_validation, y_validation,
-                                                        threads=threads, sample_ids=validation_ids,
-                                                        train_y=y_train)
+            evaluation_model = (calibrated if validation_names is not None and calibrated._positional_input_columns is not None
+                                else calibrated.estimator)
+            record["evaluation"] = evaluate_classifier(evaluation_model, X_validation, y_validation,
+                                                        threads=1 if serial_final else threads,
+                                                        sample_ids=validation_ids, train_y=y_train,
+                                                        **prediction_options)
         except Exception as error:
+            if serial_final and isinstance(error, _SerialTimingError):
+                raise
             record["evaluation"] = {"status": "failed", "error_type": type(error).__name__, "error": str(error)}
+            if serial_final and record["prediction_timing"].get("verified"):
+                record["evaluation"]["prediction_seconds"] = record["prediction_timing"]["seconds"]
+        else:
+            evaluation = record["evaluation"]
+            if record["is_fallback"] and evaluation_model is calibrated and "is_fallback" in evaluation:
+                # Comparison records already carry this calibration flag at the top level.
+                record["evaluation"] = {key: value for key, value in evaluation.items() if key != "is_fallback"}
+        if get_config()["skip_parameter_validation"] != skip_validation:
+            raise ValueError("Scikit-learn parameter validation changed during comparison.")
+        _check_transform_output(transform_output)
+        if serial_final:
+            record["cv_checkpoint_sha256"] = calibrated.report["checkpoint_sha256"]
+            record["evaluation_sha256"] = _digest(record)
         write_json(result_path, record)
         results[name] = record
+
+    def verify_skipped_cv(name, uses_global, retains_state, unverified_state, mutable, rng_dependencies):
+        # A later method's CV also precedes this refit. Its skipped callbacks
+        # or RNG draws can therefore matter in either direction on recovery.
+        for other_name, global_rng, retained, unverified, captures in skipped_cv:
+            if name == other_name:
+                continue
+            if ((global_rng and uses_global) or _uses_skipped_rng(rng_dependencies, captures)
+                    or (unverified and (retains_state or mutable)) or (unverified_state and retained)):
+                raise ValueError("Cannot reproduce a final fit after skipping another model's CV RNG or callback.")
+
+    for name, (estimator, grid) in models.items():
+        if not _COMPARISON_NAME.fullmatch(name):
+            raise ValueError("Model names must contain only letters, digits, underscore or hyphen.")
+        candidates = list(ParameterGrid(grid))
+        rng_limits = []
+        rng_dependencies = []
+        identity = _search_identity(estimator, candidates, X_train, y_train, 5, seed, threads,
+                                    scoring=scoring, _split_limits=rng_limits,
+                                    _fit_rng_dependencies=rng_dependencies)
+        if serial_final:
+            identity["serial_final"] = True
+            identity["cv_joblib"] = _cv_joblib_settings()
+        uses_global = _uses_global_rng(estimator, candidates, rng_limits)
+        # A hidden owner can occur on either side (or both). A bare captured
+        # array, for example, can be a seed pool with no visible Generator.
+        # Record uncertainty during fresh execution as well: a later reader
+        # can omit the predecessor when requesting the saved model alone.
+        unverified_state = ("unverified captured state" in rng_limits or
+                            "unverified fit RNG" in rng_limits)
+        retains_state = unverified_state or uses_global or any(captured for _, captured in rng_dependencies)
+        unverified_prefix = custom_split or (earlier_retained_state and unverified_state)
+        if earlier_unverified_state:
+            unverified_prefix |= retains_state or _comparison_has_mutable_parameters(
+                identity["structural_configuration"])
+        if unverified_prefix:
+            identity["unverified_comparison_prefix"] = True
+        shares_split = "shared split RNG" in rng_limits
+        if shares_split:
+            identity["comparison_shares_split_rng"] = True
+        if uses_global:
+            identity["comparison_global_rng_entry"] = _ambient_mt_token()
+            if not independent_split:
+                # The first model's entry precedes the split. Later entries
+                # follow it, and an equal token at a different boundary does
+                # not establish the same RNG position at the first fit.
+                identity["comparison_first_model"] = not results
+        validation_data = data_fingerprint(X_validation, y_validation)
+        partition_request = _jsonable({key: identity[key] for key in
+                                       ("cv", "seed", "data_sha256", "software", "source_sha256",
+                                        "sklearn_skip_parameter_validation", "sklearn_transform_output")})
+        if named_input is not None:
+            partition_request["validation_feature_names_sha256"] = _schema_digest(validation_names)
+            partition_request["named_input"] = named_input
+        _check_transform_output(transform_output)
+        if serial_final:
+            partition_request["serial_final"] = True
+            partition_request["ordered_models"] = list(models)
+            partition_request["cv_joblib"] = identity["cv_joblib"]
+            partition_request["threads"] = threads
+        if custom_split:
+            partition_request["custom_split_rng"] = True
+        created_plan = False
+        if fold_digest is None:
+            first_request_digest = _digest(partition_request)
+            folds, held_out, fold_digest = _comparison_folds(output_dir, partition_request, X_train, y_train, seed)
+            created_plan = folds is not None
+            restored_plan = folds is None
+        elif _digest(partition_request) != first_request_digest:
+            raise ValueError("Training data or software changed during comparison.")
+        configuration = identity.pop("structural_configuration")
+        comparison_context = _digest({"calibration": identity, "fold_plan_sha256": fold_digest,
+                                      "validation": validation_data, "validation_ids": validation_ids,
+                                      "signal_support": signal_support})
+        result_path = output_dir / f"{name}-evaluation.json"
+        reuse = name in saved_evaluations if serial_final else result_path.exists()
+        cv_path = output_dir / f"{name}-cv.json"
+        saved_model = reuse or cv_path.is_file()
+        if custom_split and (restored_plan or saved_model):
+            raise ValueError("Cannot replay the effects of a custom split RNG from a saved comparison.")
+        if (restored_plan or saved_model or loaded_model_checkpoint) and "unverified scalar owner" in rng_limits:
+            raise ValueError("Cannot verify the backing storage of a captured NumPy scalar in this saved comparison.")
+        if (restored_plan or saved_model or loaded_model_checkpoint) and "unverified fit RNG" in rng_limits:
+            raise ValueError("Cannot verify the fit generator in this saved comparison.")
+        if uses_global and saved_model and identity["comparison_global_rng_entry"] is None:
+            raise ValueError("Cannot verify NumPy global randomness in this comparison.")
+        if restored_plan and shares_split:
+            raise ValueError("Restoring the fold plan skips draws from the model's shared split RNG. "
+                             "Start a new comparison or use independent integer seeds.")
+        if skipped_global_model and uses_global:
+            raise ValueError("An earlier archived model may have advanced the global RNG. "
+                             "Start a new comparison or use an explicit estimator seed.")
+        if skipped_captures and _uses_skipped_rng(rng_dependencies, skipped_captures):
+            raise ValueError("An earlier archived callback may have changed this model's RNG or buffer. "
+                             "Start a new comparison or use independent model seeds.")
+        if unverified_prefix and (restored_plan or saved_model or loaded_model_checkpoint):
+            raise ValueError("Cannot verify the independence of captured state and another model's RNG.")
+        if restored_plan and uses_global:
+            if not independent_split and (not reuse or results):
+                raise ValueError("Restoring the fold plan skips draws that may advance the global RNG. "
+                                 "Start a new comparison or use an independent split seed.")
+            if not saved_model and not results:
+                raise ValueError("Cannot verify global RNG state for a new model appended to a saved comparison. "
+                                 "Start a new comparison or use an explicit estimator seed.")
+        if reuse:
+            if created_plan:
+                # A concurrent caller published this model after our initial
+                # directory check. Compare its configuration after our split.
+                configuration = configuration_identity({"estimator": estimator, "candidates": candidates})
+        else:
+            if folds is None:
+                # The released splitter orders training rows by original index.
+                rows = np.arange(len(y_train))
+                folds = [(np.setdiff1d(rows, valid), valid) for valid in held_out]
+            cv_seed = repr(seed) if _private_split_rng(seed) else seed
+            if shares_split:
+                # Explicit folds bypass the splitter in calibration. Bind the
+                # original ownership to the CV record for a later partial read.
+                cv_seed = {"shared_split_rng": repr(seed)}
+            recovery = _ComparisonRecovery(unverified_prefix, serial_final=serial_final, batch=_batch)
+            calibrated = calibration_search(estimator, grid, X_train, y_train, cv=5, seed=cv_seed,
+                                            threads=threads, checkpoint_path=cv_path,
+                                            scoring=scoring, folds=folds,
+                                            _comparison_recovery=recovery)
+            if serial_final and not _batch.closed:
+                model_pins[name] = {"partition": fold_digest, "cv": _cv_pin(calibrated.report)}
+            # Calibration captures estimator and grid state after fold selection
+            # and before fitting. Its generator may also be the split generator.
+            configuration = calibrated.report["identity"]["structural_configuration"]
+        comparison_fingerprint = _digest([comparison_context, configuration])
+        earlier_retained_state |= retains_state
+        earlier_unverified_state |= unverified_state
+        # A competing caller can publish partial CV after our path check.
+        # Calibration reports what it actually loaded under its writer lock.
+        if reuse or recovery.loaded_checkpoint:
+            loaded_model_checkpoint = True
+            skipped_global_model |= uses_global
+            skipped_captures.update((id(value), value) for value, captured in rng_dependencies if captured)
+            if serial_final:
+                skipped_cv.append((name, uses_global, retains_state, unverified_state,
+                                   {id(value): value for value, captured in rng_dependencies if captured}))
+        if reuse:
+            _check_transform_output(transform_output)
+            existing = saved_evaluations[name] if serial_final else json.loads(result_path.read_text(encoding="utf-8"))
+            if (existing.get("comparison_fingerprint") != comparison_fingerprint
+                    or existing.get("fold_plan_sha256") != fold_digest):
+                raise ValueError(f"Existing {name} results are incompatible; create a new run directory.")
+            results[name] = existing
+            continue
+        publish_model = partial(publish, name, comparison_fingerprint, result_path,
+                                identity["sklearn_skip_parameter_validation"], calibrated, recovery)
+        if serial_final:
+            results[name] = None  # Preserve model order while waiting for the remaining CV.
+            _batch.checks.append(partial(verify_skipped_cv, name, uses_global, retains_state,
+                                          unverified_state, _comparison_has_mutable_parameters(configuration),
+                                          rng_dependencies))
+            _batch.pending.append(publish_model)
+        else:
+            publish_model()
     summary = {"author": "Chang Cheng", "phase": "development_comparison",
                "scoring": scoring,
+               "fold_plan_sha256": fold_digest,
                "defaults_frozen": False, "tuning_complete": False,
                "remaining_work": ["Expand unconstrained boundary optima and refine interior intervals.",
                                   "Repeat experiments and verify numerical convergence.",
                                   "Compare empirical data before deciding package defaults.",
                                   "Freeze settings before a separate final-test evaluation."],
                "models": results}
-    write_json(output_dir / "comparison.json", summary)
+    if serial_final:
+        _batch.pending.append(partial(write_json, output_dir / "comparison.json", summary))
+    else:
+        write_json(output_dir / "comparison.json", summary)
     return summary

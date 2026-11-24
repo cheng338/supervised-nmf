@@ -1,6 +1,6 @@
 # API reference
 
-This page describes version 0.5.1, including its solver-aware MU projection default. Per-observation MU
+This page describes version 0.6.0, including its solver-aware MU projection default. Per-observation MU
 projection was added as an option in 0.4.0; newly fitted MU models now select it
 through `mu_projection="auto"`. Version 0.3.3 introduced optional QR
 projection and MU numerical recovery. Optional KNN SD
@@ -30,6 +30,38 @@ refitting or adding compatibility for older model formats; see
 [model persistence](#model-persistence).
 
 ## Classifier
+
+### Input columns
+
+`NMFClassifier`, `BinaryScreening` and `FeatureSPA` record
+`feature_names_in_` when fitted on a table with unique string column names.
+Supply the same columns in the same order for later predictions and
+transformations. A renamed, missing, added or reordered feature raises an
+error. Duplicate string labels are ambiguous. Rename the columns before
+fitting, or pass a numerical array when feature positions are intentional.
+Plain arrays and tables with integer-only column labels use positional order.
+Switching between named and unnamed input on a fitted estimator follows
+scikit-learn's feature-name warning convention.
+
+`BinaryScreening.get_feature_names_out()` returns the selected input names.
+A standalone `FeatureSPA().set_output(transform="pandas")` returns coordinates
+with the original row index and component names such as `featurespa0`.
+The classifier's own coordinate transformations return arrays.
+
+Calibration and comparison checkpoints include the ordered names when
+present. Resume with the same schema. On a named search, the report's
+`refit_input_container` records how the final estimator was fitted.
+For a positional refit, supply features in training order when calling the
+returned third-party estimator directly. To check named inputs against the
+original positional refit, pass the result itself to
+`evaluate_classifier(result, X_test, y_test)`. The result keeps that
+calibration's column order. If the training data had no column names,
+evaluation with the result reads validation columns by position. Supply
+a validation table in training order even when its columns have names.
+After independently refitting the estimator,
+use its new calibration result or supply an array in the new training order.
+The numerical search rebuilds named inputs using an available table library
+(pandas, Polars or PyArrow). Positional searches take arrays directly.
 
 ```python
 from supervised_nmf import NMFClassifier
@@ -72,7 +104,7 @@ probabilities = classifier.predict_proba(X_new)
 
 The default is SPA with absolute-score screening. Available solvers are
 `"spa"`, `"mu"`, and `"cd"`; CD reproduces the original solver choice. The
-[four-method development comparison](nmf-solver-comparison.md) supplies empirical
+[four-method development comparison](../research/nmf-solver-comparison.md) supplies empirical
 context, not a universal solver ranking. Rank, cutoff and classifier parameters remain
 tunable. The current `max_iter=20000` default provides a numerical allowance for
 CD/MU iterations and SPA's public NNLS solves; it does not request 20,000 steps
@@ -404,6 +436,19 @@ the sensitivity of stopping decisions to float32 rounding. Range guards retain
 the existing handling of exact zeros, tiny inputs and extreme values, including
 per-observation recovery when needed. The output dtype follows the rules above.
 
+During fixed-basis MU projection, a positive denominator can be too small to
+represent even when the updated coordinate is representable. The projection
+checks for this loss with scikit-learn 1.6.1, 1.7.0–1.7.2, 1.8.0 and
+1.9.0–1.9.1 and recovers the coordinate when needed. On other versions,
+ordinary batch projection delegates to the fitted estimator's transform.
+Rowwise projection still solves each observation independently, with the
+additional denominator check disabled. If you replace `numpy.dot`
+to instrument the solve,
+the package preserves the numerical calls, order and exceptions of the original
+projection path. With extreme input and basis scales, that path can underflow
+silently and give a different prediction even if your wrapper simply forwards
+every call. Restore the original `numpy.dot` to use the checked path again.
+
 `"auto"` selects a policy from the solver at fit time, never from incoming query
 composition. `get_params()` retains the requested setting; `mu_projection_`
 records the resolved fitted policy. Current-format persistence preserves both.
@@ -449,8 +494,8 @@ observations retain their original scope. Current guarded prefix and setup reuse
 reduce repeated work in eligible capped recovery without a new public option.
 A later fixed comparison found substantial capped-recovery gains, while ordinary
 and full-query costs remained mixed; it does not promise zero overhead or faster
-prediction for every workload. See the [original policy evidence](development-protocol.md#mu-projection-default-and-recovery)
-and the [recovery refinement and costs](development-protocol.md#interrupted-mu-recovery-and-panel-refinement).
+prediction for every workload. See the [original policy evidence](../research/engineering/development-protocol.md#mu-projection-default-and-recovery)
+and the [recovery refinement and costs](../research/engineering/development-protocol.md#interrupted-mu-recovery-and-panel-refinement).
 
 Rowwise projection removes the shared stopping decision, but does not guarantee
 bitwise agreement across batch shapes, convergence at the iteration cap, or
@@ -616,16 +661,16 @@ workspace to reduce temporary allocation and reduction work. Caller inputs and
 the fitted basis remain unchanged. Projection policy, stopping rules and public
 defaults are unchanged; no new setting is required.
 
-This acceleration is qualified for NumPy 2.5.4 and SciPy 1.18.1 with the expected
-implementation source and numerical bindings. These checks do not restrict
-installation requirements. Other supported implementations and unsupported
-numerical contexts use the existing calculation. The owned float64 route
+Two NumPy/SciPy pairs qualify for this acceleration: 2.5.4/1.18.1 and
+2.5.2/1.18.0. Each also requires the expected SciPy source and numerical
+bindings. When the source is unavailable or a required binding is missing,
+the package uses the standard reduction. The owned float64 route
 preserves the qualified stable-reduction order; `FloatingPointError` retains scalar recovery
 on the original operands. Library upgrades may disable acceleration until
 requalified.
 
 Benefits depend on the workflow, and some small or capped requests can be
-slower. The [development decision](development-protocol.md#guarded-logarithmic-mu-reductions)
+slower. The [development decision](../research/engineering/development-protocol.md#guarded-logarithmic-mu-reductions)
 records the measured gains, adverse cases, setup cost and maintenance scope.
 
 ### Prediction state and diagnostics
@@ -835,7 +880,7 @@ objective and its numerical checks without changing the installed AOCL library.
 This is a temporary compatibility measure. Padding will be bypassed for verified
 AMD-fixed runtimes and removed when the supported AOCL builds no longer require
 it; unqualified versions retain the safeguard. See the
-[implementation, evidence scope and retirement policy](aocl-nnls-workaround.md).
+[implementation, evidence scope and retirement policy](../research/engineering/aocl-nnls-workaround.md).
 
 These controls apply to both `FeatureSPA` and `NMFClassifier(solver="spa")`.
 They affect fixed-basis projection, including `FeatureSPA.fit_transform` and
@@ -890,6 +935,11 @@ and threadpoolctl 3.7.0 with the accepted stock MKL/OpenMP composition. These
 checks do not pin or change your dependencies. Other supported runtimes,
 unqualified implementations and changed numerical policies retain the ordinary
 QR/fallback route. A dependency upgrade may disable this extra acceleration.
+Only Linux attempts optional discovery before the process has initialized its
+thread controller. On Windows with qualifying MKL libraries, an ordinary
+serial projection can initialize that controller. A later eligible call can
+then save factors for subsequent calls. Each process worker checks its own
+controller before using factors prepared by the parent.
 Parent and worker inventories compare complete native-library records in a
 canonical order. Different enumeration order alone no longer rejects matching
 state; library identities, duplicate records, process identity, thread settings
@@ -921,9 +971,9 @@ per-row solves can also cost more than the current batched path. Small changes
 in coefficients from floating-point arithmetic are possible. Select the solver
 using complete fit/prediction workloads: QR is not a general speed or accuracy
 improvement. See the [measured benefits, costs and evidence limits](
-development-protocol.md#reusing-prepared-fixed-basis-qr-factors), including the
+../research/engineering/development-protocol.md#reusing-prepared-fixed-basis-qr-factors), including the
 [native inventory, transport and import refinement](
-development-protocol.md#native-inventory-transport-and-classifier-import-refinement).
+../research/engineering/development-protocol.md#native-inventory-transport-and-classifier-import-refinement).
 
 Input magnitude is checked before every projection solver.
 Ordinary-range inputs retain their solver path. Extreme inputs use exactly
@@ -1070,9 +1120,6 @@ only the parameter for the selected mode affects feature selection. For example,
 `BinaryScreening(percentile=20.0)` still uses absolute screening. To retain a
 percentile, set `screening="percentile"`.
 
-**November 3 update:** standalone `BinaryScreening` now defaults to absolute
-screening, matching `NMFClassifier`; percentile selection remains an explicit option.
-
 For a classifier pipeline with a screening step named `screen`, compare modes
 with separate grid dictionaries so that each parameter is active:
 
@@ -1111,10 +1158,13 @@ The returned data are never multiplied by the screening scores.
 
 Absolute thresholds must be finite and nonnegative. Globally constant columns
 are excluded even at threshold zero. Different classwise constants have infinite
-absolute scores. Percentile ranking uses the original feature count as its
-denominator and follows deterministic feature-index tie breaking. Degenerate
-features and empty selection are explicit; near-zero variance is not silently
-regularized.
+absolute scores. Percentile screening calculates its cutoff on ranks of the
+computed `abs(t_scores_)`, using the original feature count. Eligible features
+above the cutoff are retained. At the cutoff, lower input-column indices fill
+any remaining places up to `int(n_features_in_ * percentile / 100)`.
+Mathematically equal statistics can round to different magnitudes, in which
+case the larger computed magnitude ranks first. Screening raises if no feature
+survives. Near-zero variances are used as computed.
 
 #### Screening execution layouts
 
@@ -1136,7 +1186,7 @@ Ordinary CV row gathers such as `X[train]` produce C arrays, and compatible
 calibration searches reuse statistics within a fold. Do not convert inputs to
 Fortran order solely on the assumption that screening will become faster: the
 conversion has a cost, and small or bypassed cases can retain overhead. The
-[development decision](development-protocol.md#screening-statistics-for-fortran-order-inputs)
+[development decision](../research/engineering/development-protocol.md#screening-statistics-for-fortran-order-inputs)
 records measured gains, costs and the scope of the numerical checks.
 
 ### Standalone SPA coordinates
@@ -1154,7 +1204,7 @@ the selected anchors. Retaining all signal features does not guarantee that the
 low-rank representation preserves their classification information. This also
 applies when `NMFClassifier` projects both training and query observations.
 See the [mathematical qualifications](theory-implementation.md#spa-anchor-selection-and-screening-false-positives)
-and [retrospective diagnostic](wang-simulation-validation.md#october-20-anchor-and-information-diagnostic).
+and [retrospective diagnostic](../research/wang-simulation-validation.md#october-20-anchor-and-information-diagnostic).
 
 Version 0.5.0 makes `FeatureSPA.fit_transform(X)` use the
 same fixed-basis NNLS map as `fit(X).transform(X)`. A generic sklearn pipeline
@@ -1254,6 +1304,32 @@ Rank expansion retains actual candidate objects internally. JSON report entries
 for estimator-valued parameters are display descriptions, not executable
 estimators to reconstruct from text. Resume uses the supplied original grid.
 
+### Reading a completed calibration result
+
+| Call | Checkpoint argument | How to identify the selection |
+| --- | --- | --- |
+| `calibration_search(..., refit=False)` | Optional `checkpoint_path` | `selected_candidate_index` identifies the CV winner, or is `None` if no candidate qualified. `result.estimator` is `None` and `is_fallback` is `False`. |
+| `calibration_search(..., refit=True)` | Optional `checkpoint_path` | `selected_candidate_index` identifies the first candidate in CV order that passes the full-training refit checks. If none passes, the search emits `CalibrationFallbackWarning`, the index is `None`, `is_fallback` is `True`, and `result.estimator` is a fitted training-majority classifier. |
+| `calibration_knn_grid` | Required `checkpoint_dir` | The first entry in `ranked_candidate_indices` is the CV winner. An empty list means no candidate qualified. |
+| `calibration_rank_search` | Required `checkpoint_dir` | `selected_candidate_index` identifies the CV winner across the evaluated stages, or is `None` if no candidate qualified. The top-level indices span all stages. Each stage also has its own local indices. |
+
+For `calibration_search`, set `report = result.report`. For either specialized
+search, use the returned dictionary as `report`. This gives the qualified CV
+order, with earlier candidates first when their scores tie.
+
+```python
+qualified = sorted(
+    (row for row in report["candidates"] if row["valid"]),
+    key=lambda row: (-row["mean_score"], row["index"]),
+)
+cv_order = [row["index"] for row in qualified]
+```
+
+When a general search writes a checkpoint, the file contains the report
+with its `checkpoint_sha256` field. The shared-grid and bounded-rank
+`report.json` files store the report under `payload` with the checksum
+in the sibling `sha256` field.
+
 ### Input preparation and CV usage conditions
 
 For decoded 8-bit face images, pass floating-point pixel values divided by
@@ -1314,15 +1390,70 @@ The seed contracts remain deliberately different:
 | Shared-grid and rank search | A fixed, nonboolean Python/NumPy integer from `0` through `2**32-1`, including with explicit folds. Temporal values are rejected. |
 | `run_comparison` | The generated-fold generic contract, checked without drawing random numbers before output creation or native-runtime setup. |
 
-Use a fixed integer seed for reproducible checkpointed workflows, and set
-estimator `random_state` independently. With generic `None` or mutable RNGs,
-newly generated folds can differ and prevent checkpoint resume. Changing an
-unused explicit-fold seed can also reject resume because it remains a requested
-setting in the identity. Existing mutable-RNG identity and completed-comparison
-reuse behavior are preserved; these APIs do not serialize and restore arbitrary
-RNG states. Distinct `RandomState` objects can have different checkpoint identities
-even when initialized with the same seed. A compatible completed `run_comparison`
-result can be returned without generating new folds. Integer seed normalization
+For reproducible restarts, give the splitter and each estimator independent
+integer seeds. General calibration can also recognize a supported private
+`RandomState` reconstructed at the same starting state. An advanced split
+generator can select different folds. The supplied split seed is also part
+of the request when folds are explicit.
+
+An estimator can use NumPy's global random state through `random_state=None`
+or by holding the global generator itself. Skipping a completed fit can skip
+draws that a later fit needs. A restart can refuse to reuse results when it
+cannot establish the starting state for the requested work. Start a fresh
+search in this case. Recovery does not rewind the calling process. A custom
+fit that calls `default_rng(None)` draws fresh system entropy on each fit.
+Pass an explicit integer seed if that fit must be reproducible.
+
+A callback can declare its dependency on NumPy's global random state through
+a default, bound argument or captured variable named `random_state`, `rng` or
+`seed` with the value `None`. Recovery may decline a wrapped callback when it
+cannot establish which arguments the fit used.
+
+For supported estimator-owned NumPy generators, recovery checks the draw state,
+the seed sequence used to spawn children, and shared references that affect
+the fit. A fresh search can use configurations whose generator state cannot
+be verified for recovery. For example, a generator initialized from a mutable
+seed array can create child streams during a fresh run. If the estimator takes
+a generator and the comparison will be extended later, initialize the generator
+from an integer, such as `np.random.default_rng(123)`. On NumPy 1.26, use
+an integer estimator parameter for restartable fits; the reader cannot verify
+how an estimator-owned generator's child stream survived cloning.
+
+A function used as an estimator parameter can keep its closure and default
+arguments across fits. When these hold a generator, sharing a container or a
+seed-pool view can change what the fit draws. The reader distinguishes
+supported sharing patterns. If a captured view exposes other parent storage,
+or a retained object has state the reader cannot verify, plan to repeat the
+fit in a fresh location. When a custom callback reads a fitted attribute or
+storage outside its declared array values, the caller must reconstruct that
+state too. A successful read alone cannot establish that it was reconstructed.
+
+If a callback advances a private generator during a saved representation fold,
+restart that shared-grid or rank study in a fresh directory. In a model
+comparison, loading an earlier model skips its draws during fitting and
+validation. A later model that depends on the skipped draws can require a
+fresh comparison, even if it already has its own saved evaluation. Independent
+integer seeds avoid this dependency. A callback's array view or a generator
+stored in a NumPy dtype's metadata or field title can also link two models.
+When the reader cannot verify their independence, rerun the comparison from
+scratch. This applies both to reading the later model on its own and to
+appending a model whose constructor or grid may use a buffer changed by the
+skipped work. The same restart restriction applies to a fit with a custom
+Python object as a NumPy string dtype's missing-value sentinel.
+For ordinary string dtypes, the checkpoint distinguishes a missing element
+from a literal string with the same display value and records the exact
+scalar sentinel, including floating-point NaN bits.
+Use a stock NumPy splitter or an integer seed for restartable comparisons.
+A `RandomState` subclass can change estimator inputs during `shuffle`.
+Restoring its saved partition skips those changes.
+
+`run_comparison` saves one common
+partition for its first model and uses it for every subsequent model, including
+models appended in later calls. Earlier releases drew folds for each model.
+With `seed=None` or a mutable `RandomState` split seed, later models can
+therefore receive different folds and produce different results after upgrading.
+Reading a compatible completed evaluation also reuses the saved partition.
+Integer seed normalization
 does not alter estimator constructor parameters, Boolean class labels, or
 `positive_label` semantics.
 
@@ -1344,17 +1475,19 @@ depending on memory addresses printed by `repr`.
 
 The base estimator and replacements supplied in the grid both contribute
 implementation-source hashes, including inherited class implementations.
-Source is checked again around fold fits and generic final refits. Changed
-configuration or source requires a new checkpoint location; a changed-source
-fit is not committed as completed evidence. Identity schema 2 removes the old
+`calibration_search` checks these implementation files before and after each
+new fold fit and each final candidate refit. If a check detects a source
+change, the search raises an error before saving the affected fit result.
+Changed source or configuration requires a new checkpoint location.
+Identity schema 2 removes the old
 display-only `parameters` and `candidates` entries from the calibration identity;
 candidate report entries still contain readable parameter descriptions. Old
 checkpoints remain historical evidence and are not migrated to the new identity.
 
-Unsupported opaque/cyclic values, array subclasses carrying extra state, and
-unavailable custom implementation source raise a clear error before fitting.
-Save custom estimators/functions in an importable source file when using these
-search helpers. These restrictions do not change ordinary estimator
+Unsupported opaque or cyclic values and array subclasses carrying extra state
+raise an error before fitting. Save custom Python estimators and user-defined
+functions in an importable source file so the search can inspect their
+implementations. These restrictions do not change ordinary estimator
 `fit`/`predict` calls. Source-file tracking is not a dependency sandbox: mutable
 globals, external data/services, imported helper implementations not traversed
 through the configuration, runtime monkeypatches and old class objects retained
@@ -1363,6 +1496,122 @@ fixed and self-contained, and start a fresh search when such dependencies change
 Custom callable parameters must behave as fixed functions; cloning does not
 isolate stateful closures or mutable globals, and constructor configuration must
 remain unchanged while a search is running.
+
+#### Recovering a search with custom transformations
+
+With a checkpoint, `calibration_search` compares the estimator and grid at
+calibration entry with their state just before publishing each fold. This also
+applies to the calibrations started by `run_comparison`. When the check first
+observes a change, it saves `resume_eligible=False` together with the affected
+fold. The report gives its zero-based `resume_ineligibility_candidate_index`
+and `resume_ineligibility_fold`, and explains the decision in
+`resume_ineligibility_reason`. The current call can still finish.
+
+- To obtain a fitted estimator after a marked fold, rerun the **entire search**
+  with a new checkpoint path or comparison output directory. Even an
+  output-neutral change, such as incrementing a captured list counter, can
+  require this rerun.
+- A compatible, completed `refit=False` checkpoint still returns its
+  checksummed CV report. A compatible saved model evaluation still supplies
+  its archived predictions and carries the same marker fields with the
+  `calibration_` prefix. For either archive read, reconstruct the estimator
+  and grid as they were at calibration entry. Reusing a callback instance
+  mutated by an earlier call can fail the entry fingerprint check.
+- When the folds were clean and a change occurred only during the final refit,
+  restart from the original configuration. The search reuses the folds and
+  repeats the refit.
+
+The entry fingerprint includes the contents of ordinary NumPy arrays and
+scalars. For structured parameters it records how NumPy exposes each field,
+including its scalar type, byte order, offset, alignment and lookup names.
+This applies to nested fields and fixed-size subarrays. For example, a
+transformer can read a named field as an attribute on an `np.record` scalar.
+For a function that captures a plain `np.void` or `np.record` scalar, the
+fingerprint also records its NumPy flags. Two callbacks that select different
+features based on `scalar.flags.writeable` need distinct representation fits.
+For supported NumPy buffers, the identity also records the scalar's position,
+the layout and contents of the backing allocation, and sharing with other
+captured views. This matters when a callback reads another record through
+`scalar.base`. Changing any of these properties can require a fresh checkpoint.
+
+The scalar's chain of ordinary NumPy arrays can contain up to four arrays,
+including a contiguous allocation of at most 4 KiB, using supported
+non-object dtypes. A directly linked array view can share that allocation.
+An indirect view, for example one created through a memoryview, can obscure
+whether the callback sees the same storage. A callback with larger or
+unverifiable backing storage can run in a fresh search. This includes a
+callback that retrieves a record scalar stored in an object field of its own
+backing array. An object array with named fields can also return the stored
+scalar directly when indexed. Iterating over ordinary records with object-valued fields
+remains supported when the stored values themselves can be identified.
+The shared grid fits distinct opaque declarations independently
+and can still share a fit across neighbor counts for the same declaration.
+To make such a search restartable, capture the small value the callback
+actually needs, such as its feature index or a Boolean writeability flag.
+If a shared-grid callback changes a supported scalar or its backing data
+during a committed fold, restarting in a fresh directory ensures that the
+callback runs again. Rank search checks committed folds across all stages
+before it resumes.
+
+A fresh calibration or shared KNN grid can use a custom `np.void` subclass
+even when the class was defined interactively and its source is unavailable.
+A shared grid accepts the subclass as a dtype or as a class.
+It can also use a record scalar with extra Python
+attributes, including one stored in dtype metadata. In these cases each
+separately supplied representation receives its own fit. Neighbor counts
+can share a fit when they use the same parameter objects. Recovery requires
+a fresh search because the scalar's Python state can affect the result.
+
+At fold publication the check tracks Python configuration structure,
+Python scalar values and the contents of supported NumPy RNG states. Outside
+those RNG states, it checks the dtype, array shape and supported captured
+layout or flags. It also checks the bounded backing storage of captured record
+scalars. Other ordinary non-object buffer contents are skipped. Replacing a
+number, a fixed-width string, a date or a field in a non-object structured array can
+escape detection if shape and dtype stay the same. Equal-length byte
+replacements, mutable globals and state shared across models can also escape
+detection. A checkpoint without a marker can therefore yield different results
+if a callback consumes external state. Skipping completed folds or a cached
+model also skips the random draws that happened in that work.
+
+For a random feature map, give each estimator an independent integer seed.
+Learn the map in `fit` and apply that fitted map to each validation row in
+`transform`. For example, scikit-learn's `GaussianRandomProjection` stores
+its sampled matrix as `components_`. Both pipelines below can reconstruct
+their own maps when a later call adds a model or resumes an interrupted fit.
+
+```python
+from sklearn.pipeline import Pipeline
+from sklearn.random_projection import GaussianRandomProjection
+from sklearn.tree import DecisionTreeClassifier
+from supervised_nmf.evaluation import run_comparison
+
+models = {}
+for name, seed in [("map_a", 101), ("map_b", 202)]:
+    model = Pipeline([
+        ("map", GaussianRandomProjection(n_components=4, random_state=seed)),
+        ("tree", DecisionTreeClassifier(random_state=seed)),
+    ])
+    models[name] = model, {"tree__max_depth": [2, 4]}
+
+results = run_comparison(models, X_train, y_train, X_validation, y_validation,
+                         output_dir="runs/random-maps", seed=42)
+```
+
+Keep `comparison-folds.json`, `comparison-folds-receipt.json` and the
+per-model records together. The receipt identifies the saved fold plan. Each
+model evaluation identifies the estimator and grid configuration recorded
+when its calibration began. The directory reserves `comparison.json` and
+`<model>-cv.json` or `<model>-evaluation.json` for names made of ASCII
+letters, digits, underscores and hyphens. Start a new comparison in a fresh
+directory if an older comparison lacks its plan or receipt. To finish a job
+started before upgrading, use its original source and environment. With the
+upgraded package, use a fresh checkpoint path or comparison directory.
+
+Each call writes `comparison.json` for the models supplied to that call.
+If A already has results, calling with B alone keeps A's per-model files and
+writes a summary listing only B. Pass both A and B to produce a combined
+summary using their compatible saved evaluations.
 
 ### Selection objective and report fields
 
@@ -1419,9 +1668,9 @@ plus class-specific measures, from the supplied evaluation predictions.
 `run_comparison` forwards `scoring` to each method's calibration and records that
 selection objective separately from its development-validation metrics.
 
-**November 3 update:** calibration defaults to ordinary accuracy; balanced
-accuracy is an explicit choice. Checkpoint identities bind the scorer and source,
-so changing either requires a new run directory. Historical results remain unchanged.
+Calibration defaults to ordinary accuracy. Pass `scoring="balanced_accuracy"`
+to weight the two classes equally. Changing the scorer or package source
+requires a fresh checkpoint path or comparison directory.
 
 The following compact API example uses the default `refit=True`, which fits
 a selected configuration on all supplied training data after CV. It illustrates
@@ -1441,17 +1690,27 @@ calibrated = calibration_search(
 if calibrated.report["is_fallback"]:
     raise RuntimeError("Calibration returned a majority fallback, not a qualified NMF model.")
 print(calibrated.report["scoring"], calibrated.report["selected_mean_score"])
-validation = evaluate_classifier(calibrated.estimator, X_validation, y_validation)
+validation = evaluate_classifier(calibrated, X_validation, y_validation)
 ```
 
 The cutoff grid above uses the absolute-screening `classifier` configured at
 the start of this page. Suitable ranges depend on the dataset. Any
 failed or nonconverged required fold disqualifies its candidate. The report
 retains each attempt, parameters, warnings, folds, selected dimensions, and
-timings. If every candidate fails, a clearly labeled training-majority fallback
-is returned when `refit=True`. It must not be reported as the requested method's
-successful fit. With `refit=False`, no fallback is fitted and
+timings. If no candidate qualifies in CV or all qualifying candidates fail
+the full-training refit, standalone `calibration_search(..., refit=True)`
+returns a classifier that predicts the training majority and emits
+`supervised_nmf.evaluation.CalibrationFallbackWarning`. Use this category
+to filter the warning or turn it into an exception. With checkpointing enabled,
+the search saves the completed report before issuing the warning. A retry
+can reuse those CV folds and runs the final refit stage again. With `refit=False`,
 `selected_parameters=None` identifies the absence of a qualified candidate.
+
+`CalibrationFallbackWarning` applies only to standalone refitting.
+`run_comparison` returns a report with an `is_fallback` field for each model,
+so callers can identify the substitution on fresh and resumed comparisons.
+Pass the model record to `format_evaluation_summary` to display the fallback
+alongside its metrics.
 
 For logistic regression, pass `NMFClassifier(classifier="logistic", screening="absolute")` and replace
 `n_neighbors` with `logistic_C`, for example `[0.01, 0.1, 1.0, 10.0, 100.0]`.
@@ -1463,9 +1722,40 @@ For linear SVM, use `NMFClassifier(classifier="linear_svm", screening="absolute"
 for tuning C. SVM warnings are retained and disqualify candidates in the same
 way. Optional KNN SD scaling is fitted separately within each training fold.
 
+### Resuming a calibration search
+
 Checkpoints can resume only when data, parameters, scoring, versions, folds and package
 source hashes match. Changing code or settings requires a new run. The source
 examples create unique run directories and expose `--resume` for compatible runs.
+
+Source hashes describe the files on disk. Python can keep executing code it
+imported before those files changed. Start each study process from a fixed
+installation or a verified source snapshot. Keep that copy and the custom
+estimators, callbacks, execution backends and helpers it uses fixed for the
+life of the process. You can edit a separate development checkout while the
+study runs. To reuse saved model results, keep the recorded implementation
+files at their original paths. The paths reported for loaded numerical
+libraries must also match. Moving a recorded implementation or library can
+require a fresh run even when the copied files have identical contents.
+
+After all writers have stopped, you can move an otherwise compatible run's
+saved outputs. For `calibration_search`, move the checkpoint file and pass
+its new location as `checkpoint_path`. For `calibration_knn_grid` and
+`calibration_rank_search`, move the entire checkpoint directory and pass its
+new location as `checkpoint_dir`. For `run_comparison`, move the entire
+comparison directory and pass its new location as `output_dir`. Keep the
+directory contents and their relative paths intact.
+
+If code or a tracked dependency changes in the active environment, restart
+the study processes from a clean installation or snapshot of the intended
+version. Use a new checkpoint path or run directory for the changed study.
+Recompute affected results produced or reused after the change and regenerate
+reports derived from them.
+
+Even for numeric input arrays, checkpoint compatibility includes the installed
+Pillow distribution version or its recorded absence. A custom transformer or
+execution backend can use Pillow during fitting or prediction. If the recorded
+version or presence changes, start a new checkpointed run.
 
 `examples/celeba_parameter_study.py` additionally offers example-specific
 `--final-fit-recovery off|all` (default `off`). `all` commits completed selected
@@ -1524,13 +1814,15 @@ writes. Atomic replacement preserves complete-file visibility; it does not
 promise durability through power loss. Checkpoints from earlier package source
 remain incompatible and are not migrated by this change.
 
+### Groups, folds and sample identifiers
+
 Both `calibration_search` and `calibration_knn_grid` accept `groups`, `folds`,
 and `data_ids`. `groups` keeps rows from a subject together. `folds` supplies
 exact training/validation index pairs and must contain `cv` exhaustive splits;
 each validation row appears once and training indices are its complement.
 Every validation fold must contain both classes, and every training fold needs
 at least two observations per class. Supplied IDs and folds are validated and
-bound to checkpoints. See [tuning improvements](tuning-improvements.md).
+bound to checkpoints. See [tuning improvements](../research/engineering/tuning-improvements.md).
 
 Evaluation metadata is optional, but independence is checked only when the
 corresponding metadata is supplied:
@@ -1539,13 +1831,17 @@ corresponding metadata is supplied:
 from supervised_nmf.evaluation import format_evaluation_summary
 
 validation = evaluate_classifier(
-    calibrated.estimator, X_validation, y_validation,
+    calibrated, X_validation, y_validation,
     sample_ids=validation_ids, train_sample_ids=training_ids,
     groups=validation_subjects, train_groups=training_subjects,
     train_y=y_train,
 )
 print(format_evaluation_summary(validation))
 ```
+
+Passing the full calibration result lets the evaluation report and its
+formatted summary identify a substituted classifier. The fitted estimator
+alone carries no record of why calibration selected it.
 
 Training/evaluation IDs and subjects must not overlap. Each corresponding pair
 (`sample_ids`/`train_sample_ids` and `groups`/`train_groups`) must use the same
@@ -1643,7 +1939,7 @@ wider-precision keys alone cost roughly 1.3–1.6 ms more and first use added a 
 microseconds in a two-ID request. The later Windows AOCL/physical Ubuntu MKL
 investigation measured the native comparison and group routes separately,
 including adverse ordinary and complete-transaction costs. See the
-[current design and evidence](development-protocol.md#exact-identifier-evaluation-and-group-bookkeeping).
+[current design and evidence](../research/engineering/development-protocol.md#exact-identifier-evaluation-and-group-bookkeeping).
 Exact identity and source/runtime resume requirements take precedence over
 narrowing values for speed.
 
@@ -1662,6 +1958,48 @@ includes its screening, factorization, training projection and classifier stages
 These totals overlap and must not be added. Individual-operation latency and
 batch throughput are distinct; sums of stage medians or concurrent worker times
 do not establish total elapsed time.
+
+For a CPU timing comparison, finish CV before timing the selected model. Run
+each final fit and held-out prediction with one application worker and one
+native BLAS/OpenMP thread. Use the same prediction batch size for every method.
+Schedule one timed job at a time on each physical host, including across seeds
+and Python environments. Report CV wall time and its worker/thread settings
+separately. CV can use the available parallel budget.
+
+The simulation and CelebA comparison examples use
+`run_comparison(..., threads=cv_threads, serial_final=True)`. With this policy
+the comparison finishes CV for every declared method before fitting any final
+model. The simulation example also finishes CV for all declared replications
+before final fitting begins. Start a fresh serial comparison to change the
+method list or CV worker settings. The final clone
+uses serial settings for Joblib, KNN and SPA projection, including when the CV
+grid selected a parallel setting. The report records timing intervals and the
+native pools observed. Use a fresh output directory when switching timing
+policies. For a restart from backup, restore the study directory, its CV
+timing journal (where provided), and its model records from the same snapshot.
+Independent runs of the same protocol have different elapsed times.
+In a serial comparison, `final_fit_seconds` gives the duration of
+the fit that produced the evaluated estimator. `cumulative_final_fit_seconds`
+also includes failed attempts and refits following an interruption. A caught
+interrupt saves its measured duration. If the thread-pool check fails after
+a fit, its attempt records the unverified interval and the run stops. A
+subsequent successful run includes that cost in the cumulative duration.
+If a process ends before it can save
+the duration, `tuning_seconds_complete` or
+`cumulative_final_fit_seconds_complete` is false and the corresponding
+number is the measured subtotal. `first_final_fit_started_utc` is null when
+an earlier fit may have started before its timestamp was saved. Each CV interval records its Joblib
+settings and native thread limit. Custom
+estimators with their own worker pools need their own serial
+configuration. Serial comparisons and their example launchers reserve the host for the current user
+while they run. On a host with an existing study scheduler, set
+`SUPERVISED_NMF_TIMING_LOCK` to its absolute lock-file path for all timing
+launchers in every environment. The parent directory must exist. On Unix
+the drivers acquire an exclusive `flock` on this file. Launch them with the
+lock available to acquire. After forcibly terminating a coordinator, wait
+for its CV worker processes to exit before starting another timed run.
+Coordinate other accounts and unrelated jobs when timing on a shared machine.
+
 Numerical-phase diagnostics on `NMFClassifier` now include
 `factorization_converged_` and `training_projection_converged_`, with their
 corresponding `*_convergence_warnings_` attributes.
@@ -1793,7 +2131,7 @@ the intended method; do not select them to exploit unconverged fits.
 A completed declared grid is evidence for that grid, not proof that tuning is
 finished. Inspect boundary winners and nearby intervals on training CV, record
 revised grids where needed, and keep official test evaluation behind the protocol
-freeze. The [CelebA study plan](celeba-study.md) describes the four main
+freeze. The [CelebA study plan](../research/celeba-study.md) describes the four main
 parameters and the attribute-specific evaluation requirements.
 
 ## Explicit grids with shared representations
@@ -1860,7 +2198,7 @@ This reduces repeated qualification and vote work; a duplicate-heavy batch
 can still pay for a shared query followed by native per-count calls on the
 whole original query batch. It does not guarantee faster complete calibration:
 small or sparse grids and full workflows retain measured costs and variability.
-The [development record](development-protocol.md#guarded-neighbor-reuse-in-explicit-grids)
+The [development record](../research/engineering/development-protocol.md#guarded-neighbor-reuse-in-explicit-grids)
 describes the decision and its limits. Use a new checkpoint directory after a
 source change; historical checkpoints are not migrated to the new identity.
 
@@ -1870,6 +2208,45 @@ per-head `prediction_seconds` records voting, guards and any public fallback.
 A completed resume retains historical compute totals and performs no new
 representation fits or neighbor queries. Those totals are not resume runtime.
 Source and schema identities prevent reuse of old checkpoints under this change.
+
+Shared KNN calibration uses the training coordinates from the original fit. If
+scikit-learn does not expose usable fitted coordinates, calibration raises
+`RuntimeError` and leaves the affected fold available to retry. Completed folds
+can be reused once the coordinates are available under the same source and
+runtime identity. The shared grid fits the pipeline once per representation
+and fold using `n_neighbors=1`. It requires one final KNN fit on the fold
+labels after preprocessing. On validation rows it calls each active
+intermediate step's `transform` in prediction order. An intermediate step
+can supply `fit_transform` and `transform` without a separate `fit` method.
+
+A scikit-learn fit callback can inspect the neighbor count and change only
+one candidate's fit. The shared grid checks for `set_callbacks` registrations
+after applying each candidate's parameters, including step replacements and
+setters. If it finds a registration, it raises `RuntimeError` before fitting
+or accessing its checkpoint directory.
+
+For configuration instances, the check follows the values of the dictionary
+returned by public `get_params(deep=False)`. This also applies to containers
+and NumPy subclasses with additional parameters, and to objects without a
+`fit` method. If the method rejects `deep=False` and its signature confirms
+that the keyword is unsupported, the check skips it. If the signature is
+unavailable or a compatible method raises an error, the error propagates.
+This prevents an inspection failure from silently allowing checkpoint reuse.
+The check also follows the references below.
+
+- Members of lists, tuples (including named tuples), sets, frozensets, and
+  deques. For dictionaries it follows keys, values, and a `defaultdict`'s
+  factory. It also reads mapping proxies over finite, side-effect-free mappings,
+  the backing mappings of `ChainMap`, and the `data` of `UserList` and `UserDict`.
+- Object references in NumPy arrays, scalars, and dtypes, and the components of slices.
+- Defaults and closures of Python functions, owners of bound methods, and the
+  callable and arguments bound by `functools.partial`.
+
+Use `calibration_search(..., refit=False, checkpoint_path=None)` with the same
+folds to run the complete pipeline independently for each neighbor count. Use
+it when a callback is reachable only through another container, opaque callable,
+global, class or module namespace, or undeclared object attribute, or when user code installs callbacks
+during fitting, transformation, or prediction.
 
 Checksummed fold records can be reused only with matching data, folds, grid, scoring,
 estimator, source and runtime identity. A report describes the declared grid and
@@ -1896,12 +2273,36 @@ unconditional class-frequency result.
 
 This internal optimization has no public switch. It requires qualified native
 methods, numeric state, error policy and callback behavior. Its current
-additional compatibility checks qualify scikit-learn 1.9.1 with Joblib 1.6.0;
-other versions and unsupported contexts retain the existing native route.
+additional compatibility checks qualify scikit-learn 1.9.1 with Joblib 1.6.0.
+With scikit-learn 1.9.0 and Joblib 1.5.3, dense brute-force heads also
+qualify when using ordinary serial Joblib dispatch (`n_jobs=None` or `1`),
+native pairwise kernels, and ordinary finite and array-API settings.
+These checks compare the live classifier and its direct operations with the
+source in the installed distribution. The version pairs above were tested
+with stock scikit-learn classifier implementations. Other version pairs and
+unsupported contexts retain the existing native route for this shortcut.
 Custom backends or methods, unsafe coordinate magnitudes and distance-weighted
 heads do not acquire this shortcut merely because their neighbor count equals
-the training size. Tree-backed shared queries retain their full width. Grids
-without a successfully fitted full-size head skip this extra planning setup.
+the training size. With BallTree, each fitted head makes its own prediction at
+the selected neighbor count. Widening that search can change which branches
+the tree visits. In the ordinary serial Joblib configuration (`n_jobs=None`
+or `1`), KDTree heads fitted by the grid on the same numeric array can
+share a full-width query. A head configured for multiple workers queries its
+selected width so its scheduler receives the expected calls. Pipeline
+calibration fits each neighbor classifier before preprocessing the validation
+fold, as an independent pipeline fit would. If validation changes the stored
+coordinates used by the fitted heads, each KDTree queries its selected neighbor
+count using its fitted index. If a pipeline provides a prebuilt neighbor
+index during training, calibration fits
+each candidate from that index. This preserves the distance metric stored in
+a KDTree or BallTree. Each KDTree head fitted from an index queries its
+selected neighbor count. In an explicit Joblib context, with a custom dispatch
+backend, or when calibration cannot verify the functions that schedule a
+KDTree query, each classifier predicts at its selected neighbor count. This
+preserves warnings and errors specific to that count. When instrumentation
+needs to observe every candidate's native prediction, use `calibration_search`
+with the same folds to fit and query the candidates independently. Grids without a
+successfully fitted full-size head skip this extra planning setup.
 
 Per-head `neighbor_query_reuse` records can identify the vote basis as
 `native_query_training_histogram` or `short_query_training_histogram`.
@@ -1923,7 +2324,7 @@ neighbor work it saves. Ordinary grids, guarded fallback and completed resumes
 can retain overhead; this is not a speedup for every input. Completed resumes
 perform no new queries, retain historical compute totals and still validate
 source/runtime identity. Use a new checkpoint directory after a source change.
-The [development decision](development-protocol.md#uniform-knn-full-training-membership)
+The [development decision](../research/engineering/development-protocol.md#uniform-knn-full-training-membership)
 records the measured benefit, retained costs and compatibility tradeoff.
 
 Recognized NMFClassifier and screening/PCA/KNN layouts also share training-fold
@@ -1943,8 +2344,11 @@ takes precedence over errors or warnings that those unexecuted operations
 might have produced. A count equal to the training-fold size remains allowed.
 
 The declared candidates and all fold records remain in the report. A group with
-at least one feasible neighbor count still fits its shared representation; its
-oversized counts fail individually. With unequal fold sizes, feasible folds
+at least one feasible neighbor count still fits its shared representation. If
+the representation is valid, oversized counts fail individually. If it fails
+or does not converge, its outcome takes precedence for every count in that
+fold. Any head fits already performed retain their recorded time. With unequal
+fold sizes, feasible folds
 still execute and retain their diagnostics even if a candidate fails elsewhere.
 A candidate must be valid on every fold to qualify; successful folds are never
 averaged into a valid score for an otherwise failed candidate. Completed failure
@@ -2066,6 +2470,22 @@ initialization still precede this preflight. This option does not repair lost ac
 authority. A completed-only call validates metadata without opening the learned
 payloads; that is not a claim that unused payload bytes were verified.
 
+The final JSON rename commits the event. Recovery relies on atomic renames
+within the checkpoint directory and on subsequent file lookups seeing their
+outcome. On Windows, a permission error during a rename can trigger up to
+five retries, with up to 1.55 seconds of scheduled waiting per file. If a
+failed JSON rename leaves its destination present or its status uncertain,
+calibration stops before saving the affected fold receipt. It also stops if
+it cannot record the link between a committed event and its fold. Restart
+with the same checkpoint directory so calibration can verify the saved event
+and account for the fit once. Temporary files and payloads without committed
+JSON are retained as interruption evidence and ignored on restart.
+
+If calibration cannot record the time spent reading a checkpoint or complete
+the bookkeeping for a restored screening event, it raises
+`StatisticsRecoveryError`. Restart with the same directory to retry the read.
+If the read is already aborting, its original error or interruption propagates.
+
 Original `compute_seconds`, `tuning_seconds`, `screening_statistics_fits` and
 fold work flags retain their committed-receipt meaning. The additional
 `screening_statistics_recovery` report records each unique event and its
@@ -2079,7 +2499,7 @@ These overlapping/historical clocks are not a wall-time partition.
 
 Data, grid, fold, estimator, policy, source and runtime identity must still match.
 No cross-source checkpoint migration, generic estimator serialization or
-power-loss durability is promised. The [development decision](development-protocol.md#early-recovery-of-screening-statistics)
+power-loss durability is promised. The [development decision](../research/engineering/development-protocol.md#early-recovery-of-screening-statistics)
 records the tested benefits, costs and recovery boundaries. This option belongs
 to `calibration_knn_grid`; `calibration_rank_search` retains its existing default
 `off` calls and does not expose it.
@@ -2093,7 +2513,8 @@ and all three arrays must satisfy one of these configurations:
 
 - All detected BLAS pools are one-thread MKL, and the arrays are C- or
   F-contiguous.
-- On Windows, exactly one BLAS pool is detected as AOCL/BLIS with version
+- On Windows, exactly one BLAS pool is detected as AOCL/BLIS with prefix
+  `aocl-libblis` and version
   `AOCL-BLAS 5.3.0 Build 20260511`, using one thread, and all arrays are
   C-contiguous.
 - On Windows, exactly two BLAS pools are detected: one MKL and one AOCL/BLIS
@@ -2101,34 +2522,74 @@ and all three arrays must satisfy one of these configurations:
   architecture `zen3`. Both use one thread, all arrays are C-contiguous, and
   both the observation count and feature count are divisible by eight.
 
-Other configurations, including unrecognized AOCL builds, other mixed BLAS backends,
-multithreaded settings and unsupported shapes or layouts, retain the
-full-product expression. No array is copied merely to enter the blocked path.
-The mixed-library case follows the configured environment's NumPy AOCL policy;
-the global library inventory alone does not identify which library owns NumPy.
-It uses the ambient thread counts when reporting, after projection thread
-controls have ended. Screened arrays can be F-contiguous and remain ineligible
-for this mixed case. The alignment restriction limits newly admitted products
-and their final blocks; it is not a universal native-library safety guarantee.
-Block norms are combined to report the Frobenius norm; matrix-product rounding
-can differ from the full expression.
-This affects reconstruction diagnostics only. It does not change optimizers,
-stopping rules, KKT qualification, fitted coordinates or predictions. The
-runtime restrictions reflect measured timing results, not a universal speed
-advantage.
+Larger fits can also use blocks. The extended range covers 8,192–162,112 rows
+and 1,024–4,608 features, up to 162,112 × 4,096 matrix elements and rank 1–32.
+It applies when either dimension exceeds the original range. All three operands
+must be plain, contiguous float64 NumPy arrays, and NumPy must be using its
+default floating-point error policy.
+
+- On Linux with one single-threaded MKL pool, a C-contiguous input uses
+  128-row blocks. A column-major input uses blocks of features.
+- On Windows, the two-pool MKL and AOCL/BLIS configuration described above
+  uses 32-row blocks. The layout and alignment requirements still apply.
+
+The check uses the thread counts in effect when the fit reports its error,
+after projection thread controls have ended. On Windows the mixed-pool rule
+reflects the tested NumPy AOCL configuration. The inventory alone cannot
+identify which library NumPy uses. Screened arrays can be column-major and
+then use the full product on this mixed runtime.
+
+Blocking uses the supplied layout directly. Other shapes, layouts and runtimes
+use the full product. In the extended range, extreme or nonfinite factor
+values, an unsafe block calculation, or a large combined norm also trigger
+the full expression. This fallback can require full-size temporary storage.
+
+The result is the Frobenius norm of the reconstruction residual. Changing
+the block shape can change floating-point rounding, especially for a nearly
+exact fit. The estimator computes this diagnostic after fitting. Optimizer
+steps, stopping decisions and predictions use the fitted factors directly.
 
 ## Bounded rank exploration
 
-`supervised_nmf.search.calibration_rank_search` accepts the same estimator,
-explicit grid, training data, fold metadata, and checkpoint controls as
-`calibration_knn_grid`, including `scoring="accuracy"` or explicit
-`"balanced_accuracy"`. Its stages, winner comparison, and refinement decisions
+`supervised_nmf.search.calibration_rank_search` explores a rank parameter
+in a supported KNN estimator. Like `calibration_knn_grid`, it requires
+`checkpoint_dir` and accepts `scoring="accuracy"` or `"balanced_accuracy"`.
+The shared grid also accepts `execution_order` and
+`screening_statistics_recovery`. Bounded rank search uses their defaults
+internally. Its stages, winner comparison, and refinement decisions
 use that same selected objective. It adds `rank_parameter=None`, `max_expansions=2`, and
 `max_rank=None`. The rank parameter is inferred only when exactly one
 `n_components` grid parameter is declared. An upper-boundary winner may be
 tested at doubled rank with its other parameters fixed. New ranks are bounded
 by known fold-local dimensions and an optional user cap. Original grid entries
 are preserved, including infeasible ones.
+
+Bounded search accepts positive integer ranks, including custom integral
+values that can be cloned, identified for checkpointing, and fitted by the
+estimator. The initial estimator must expose the parameter name. Each grid
+entry must assign it to the package's NMF classifier or to a PCA, NMF, or
+FeatureSPA pipeline step, including when the grid replaces the step.
+Boolean values and NumPy durations are invalid for ranks and expansion limits.
+For a custom integral value, Python indexing and integer conversion must
+agree when both are available. PCA uses indexing to slice components, while
+other supported estimators can use integer conversion to store their rank.
+
+Candidate records retain the declared parameter display. Rank comparisons and
+refinement bounds use the numerical values, including declared ranks that
+exceeded a fold's dimensions. For example, if rank 1 qualifies and rank 9
+does not, the report retains both bounds and marks the upper rank unresolved.
+When the grid includes two PCA steps, for example, `rank_parameter` selects
+which step to expand. The final refinement report keeps the other step's
+range from the full initial grid, including when a later stage wins.
+In a standalone shared grid, a parameter name used by both a factorizer and
+an unrelated transformer is reported as categorical. Its settings do not
+share a numerical rank scale.
+When reporting a supported representation, a setting with no usable numeric
+coordinate retains its fit result but does not supply a numeric bound. A
+selected setting of this kind is reported as categorical. Finite extended-
+precision PCA fractions retain their precision in the report. Checkpoint
+reuse requires the same scikit-learn `skip_parameter_validation` setting:
+changing it can make a previously failed PCA setting eligible.
 
 The returned report contains each stage, its candidates, the selected settings,
 `scoring`, `selected_mean_score`, `stop_reason`, and
@@ -2173,6 +2634,6 @@ It samples uniformly within each partition. This development example uses only
 training and validation images. It checks that their image IDs are disjoint.
 Checking whether the same person appears in both partitions requires a separate
 identity audit. The final-test attempt in the original
-[default-selection study](celeba-default-results.md) ended before it produced
-test predictions. A separate [October 12 official-partition study](validation.md#october-12-official-partition-evaluation)
+[default-selection study](../research/celeba-default-results.md) ended before it produced
+test predictions. A separate [October 12 official-partition study](../research/validation.md#october-12-official-partition-evaluation)
 evaluated held-out test images with identity and exact-image-duplicate exclusions.

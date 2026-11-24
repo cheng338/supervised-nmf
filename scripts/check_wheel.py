@@ -40,7 +40,7 @@ def main():
         assert any("matplotlib" in requirement and 'extra == "study"' in requirement
                    for requirement in metadata.get_all("Requires-Dist", []))
         assert not any(n.endswith((".jpg", ".png", ".pdf")) for n in archive.namelist())
-        assert not any(set(Path(n).parts) & {"tmp", "data", "runs"} or "ensemble-reference" in n
+        assert not any(set(Path(n).parts) & {"tmp", "data", "runs", "docs", "research", "private"} or "ensemble-reference" in n
                        for n in archive.namelist())
         assert not any(n.endswith(withdrawn_workflow) for n in archive.namelist())
         source_modules = {path.relative_to(root / "src").as_posix(): path
@@ -51,13 +51,9 @@ def main():
         for name, path in source_modules.items():
             assert archive.read(name) == path.read_bytes(), name
 
-    temporary_root = (root / "tmp").resolve()
-    temporary_root.relative_to(root.resolve())
-    temporary_root.mkdir(exist_ok=True)
-    wheel_installation = tempfile.TemporaryDirectory(prefix="wheel-check-", dir=temporary_root)
+    wheel_installation = tempfile.TemporaryDirectory(prefix="wheel-check-")
     atexit.register(wheel_installation.cleanup)
     installed_root = Path(wheel_installation.name).resolve()
-    installed_root.relative_to(temporary_root)
     with zipfile.ZipFile(wheel) as archive:
         archive.extractall(installed_root)
     sys.dont_write_bytecode = True
@@ -260,31 +256,39 @@ def main():
 
     with tarfile.open(root / "dist" / f"supervised_nmf-{version}.tar.gz") as archive:
         members = archive.getnames()
-        for license_file in license_files:
-            member = f"supervised_nmf-{version}/{license_file}"
+        prefix = f"supervised_nmf-{version}/"
+        public_docs = {path.relative_to(root).as_posix()
+                       for directory in ("docs", "research")
+                       for path in (root / directory).rglob("*.md")}
+        packaged_docs = {member.name.removeprefix(prefix) for member in archive.getmembers()
+                         if not member.isdir() and member.name.startswith((prefix + "docs/", prefix + "research/"))}
+        assert packaged_docs == public_docs, f"Source archive documentation differs: {packaged_docs ^ public_docs}"
+        for relative in (*license_files, "README.md", *sorted(public_docs)):
+            member = f"supervised_nmf-{version}/{relative}"
             assert archive.getmember(member).isfile(), member
             with archive.extractfile(member) as stream:
-                assert stream.read() == (root / license_file).read_bytes(), license_file
-        assert not any(set(Path(n).parts) & {"tmp", "data", "runs"} or "ensemble-reference" in n for n in members)
+                assert stream.read() == (root / relative).read_bytes(), relative
+        assert not any(set(Path(n).parts) & {"tmp", "data", "runs", "private"} or "ensemble-reference" in n for n in members)
         assert not any(n.endswith(withdrawn_workflow) for n in members)
         for relative in ("src/supervised_nmf/_aocl.py", "tests/test_aocl_nnls.py",
-                         "docs/aocl-nnls-workaround.md", "docs/current-package-evidence-20261029.md",
-                         "docs/release-0.4.1.md", "CHANGELOG.md",
-                         f"docs/release-{version}.md"):
+                         "docs/README.md", "docs/api.md", "research/README.md",
+                         "research/engineering/aocl-nnls-workaround.md", "research/current-package-evidence-20261029.md",
+                         "docs/releases/release-0.4.1.md", "CHANGELOG.md",
+                         f"docs/releases/release-{version}.md"):
             with archive.extractfile(f"supervised_nmf-{version}/{relative}") as stream:
                 assert stream.read() == (root / relative).read_bytes(), relative
         for suffix in ("provenance/original/sim.py", "provenance/original/snmf_am.py",
                        "examples/compare_simulation.py", "examples/celeba_classification.py",
                        "examples/celeba_parameter_study.py", "examples/celeba_starting_grid.json",
                        "src/supervised_nmf/evaluation.py", "src/supervised_nmf/study.py",
-                       "tests/test_study.py", "docs/celeba-study.md",
+                       "tests/test_study.py", "research/celeba-study.md",
                        "scripts/profile_celeba_stages.py", "scripts/report_celeba_study.py",
                        "scripts/review_celeba_cv.py", "scripts/celeba_default_study.py",
                        "scripts/select_celeba_default.py", "scripts/evaluate_celeba_frozen_default.py",
                        "scripts/prepare_celeba_default_caches.py", "scripts/plan_celeba_default_study.py",
                        "scripts/plan_celeba_default_repetitions.py", "scripts/preflight_celeba_default_grid.py",
-                       "examples/celeba_default_decision_protocol.json", "docs/default-selection-protocol.md",
-                       "docs/celeba-default-results.md", "docs/theory-implementation.md",
+                       "examples/celeba_default_decision_protocol.json", "research/default-selection-protocol.md",
+                       "research/celeba-default-results.md", "docs/theory-implementation.md",
                        "scripts/apply_spca_preference.py", "tests/test_spca_preference.py",
                        "tests/test_default_study.py", "tests/test_default_shortlist.py",
                        "tests/test_select_celeba_default.py", "tests/test_frozen_evaluation.py",
@@ -299,7 +303,7 @@ def main():
                        "tests/test_margin_evaluation.py", "tests/test_neighbor_reuse.py",
                        "tests/test_numerical_range_repairs.py", "tests/test_reported_residual.py",
                        "tests/test_training_coordinate_defaults.py",
-                       "docs/tuning-improvements.md"):
+                       "research/engineering/tuning-improvements.md"):
             assert any(n.endswith(suffix) for n in members), suffix
     print("Wheel import, author/license metadata, SPA/CD/MU fit/predict, KNN/logistic/SVM heads, SD KNN, default/explicit SPA training coordinates, explicit override, and source archive contents verified.")
 

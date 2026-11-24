@@ -4,14 +4,19 @@ import functools
 import hashlib
 import importlib.util
 from pathlib import Path
+import os
+import subprocess
 import sys
 
 import numpy as np
 import pytest
+from joblib import effective_n_jobs, parallel_config
 from scipy.linalg.blas import dgemv
 from threadpoolctl import threadpool_info, threadpool_limits
 
 from supervised_nmf import NMFClassifier
+from supervised_nmf.evaluation import _timing_study_lock
+from supervised_nmf.study import _read_receipt
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,6 +67,7 @@ def test_final_fit_budget_and_branch_restoration(example, monkeypatch, tmp_path,
         def fit(self, X, y):
             events.append("fit")
             assert set(widths().values()) == {1}
+            assert effective_n_jobs(None) == 1
             assert X.shape == (120, 16)
             np.testing.assert_array_equal(y, np.tile([0, 0, 1, 1], 30))
             if expected_error is not None:
@@ -78,14 +84,14 @@ def test_final_fit_budget_and_branch_restoration(example, monkeypatch, tmp_path,
         assert kwargs["max_expansions"] == 1 and kwargs["max_rank"] == 8
         np.testing.assert_array_equal(kwargs["groups"], np.repeat(np.arange(30), 4))
         np.testing.assert_array_equal(kwargs["data_ids"], np.arange(120))
-        return {"stop_reason": "fixture", "selected_parameters": None if outcome == "no-selection" else selected,
+        return {"stop_reason": "fixture", "stages": [], "fingerprint": "fixture",
+                "selected_parameters": None if outcome == "no-selection" else selected,
                 "tuning_seconds": 0.0}
 
     def evaluate(estimator, X, y, **kwargs):
         events.append("evaluation")
-        # The final-fit scope must have ended; evaluation owns its own explicit
-        # threads=1 policy, rather than inheriting a leaked fitting scope.
-        assert set(widths().values()) == {ambient}
+        # The public evaluator owns the narrower prediction timing interval.
+        assert kwargs["_serial_timing"] == {}
         assert kwargs["threads"] == 1 and X.shape == (40, 16)
         np.testing.assert_array_equal(kwargs["sample_ids"], np.arange(120, 160))
         np.testing.assert_array_equal(kwargs["train_sample_ids"], np.arange(120))
@@ -100,7 +106,7 @@ def test_final_fit_budget_and_branch_restoration(example, monkeypatch, tmp_path,
     monkeypatch.setattr(example, "format_evaluation_summary", lambda report: report["evaluation"]["status"])
     monkeypatch.setattr(sys, "argv", [str(example.__file__), "--output", str(tmp_path / "cp")])
     original = widths()
-    with threadpool_limits(limits=ambient):
+    with parallel_config(n_jobs=2), threadpool_limits(limits=ambient):
         before = widths()
         assert set(before.values()) == {ambient}
         if expected_error is not None:
@@ -116,11 +122,84 @@ def test_final_fit_budget_and_branch_restoration(example, monkeypatch, tmp_path,
         else:
             example.main()
         assert widths() == before
+        assert effective_n_jobs(None) == 2
     assert widths() == original
     expected = ["search"] if outcome == "no-selection" else ["search", "set-parameters", "fit"]
     if outcome == "success":
         expected.append("evaluation")
     assert events == expected
+    timing, = (tmp_path / "cp/grouped-timing").glob("*.json")
+    record = _read_receipt(timing)
+    assert record["cv"][0]["operation"] == "calibrate" and record["cv"][0]["state"] == "completed"
+    assert record["state"] == {"interrupted": "interrupted", "success": "completed"}.get(outcome, "failed")
+    if outcome != "no-selection":
+        assert record["fit_execution"]["verified"] is True
+
+
+def test_timing_reservation_is_shared_across_processes_and_output_paths(tmp_path, monkeypatch):
+    # Use the same account home but different working directories, as two study
+    # launchers in different output directories would.
+    for key in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(key, str(tmp_path))
+    monkeypatch.delenv("SUPERVISED_NMF_TIMING_LOCK", raising=False)
+    other = tmp_path / "second"
+    other.mkdir()
+    env = dict(os.environ, PYTHONPATH=str(ROOT / "src"))
+    code = ("from supervised_nmf.evaluation import _timing_study_lock\n"
+            "with _timing_study_lock(): print('acquired')")
+    def attempt():
+        return subprocess.run([sys.executable, "-B", "-c", code], cwd=other, env=env,
+                              capture_output=True, text=True, timeout=60)
+    with pytest.raises(InterruptedError):
+        with _timing_study_lock():
+            busy = attempt()
+            assert busy.returncode and "Another timing study is active" in busy.stderr
+            raise InterruptedError
+    available = attempt()
+    assert available.returncode == 0, available.stderr
+    assert available.stdout.strip() == "acquired"
+
+
+def test_uses_scheduler_lock_across_working_directories(tmp_path, monkeypatch):
+    workspace = tmp_path / "study-workspace"
+    workspace.mkdir()
+    marker = workspace / ".snmf-numerical-study.lock"
+    monkeypatch.setenv("SUPERVISED_NMF_TIMING_LOCK", str(marker))
+    child_code = ("from supervised_nmf.evaluation import _timing_study_lock\n"
+                  "with _timing_study_lock(): print('acquired')")
+    child_env = dict(os.environ, PYTHONPATH=str(ROOT / "src"))
+    def attempt():
+        return subprocess.run([sys.executable, "-B", "-c", child_code], cwd=tmp_path,
+                              env=child_env, capture_output=True, text=True, timeout=60)
+
+    # Acquire the site's file directly, as an independent scheduler would.
+    with marker.open("w+b") as stream:
+        stream.write(b"0")
+        stream.flush()
+        stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        busy = attempt()
+        assert busy.returncode and "Another timing study is active" in busy.stderr
+        # Both public opt-in comparisons and numerical smoke checks participate.
+        from supervised_nmf.evaluation import run_comparison
+        with pytest.raises(RuntimeError, match="Another timing study is active"):
+            run_comparison({}, [], [], [], [], output_dir=tmp_path/"unstarted", serial_final=True)
+        assert not (tmp_path / "unstarted").exists()
+        smoke = subprocess.run([sys.executable, "-B", str(ROOT / "scripts/check_four_solver_training.py"),
+                                "--output", str(tmp_path / "smoke.json")], cwd=tmp_path,
+                               env=child_env, capture_output=True, text=True, timeout=60)
+        assert smoke.returncode and "Another timing study is active" in smoke.stderr
+        assert not (tmp_path / "smoke.json").exists()
+    assert attempt().returncode == 0
+    monkeypatch.setenv("SUPERVISED_NMF_TIMING_LOCK", ".relative-lock")
+    with pytest.raises(ValueError, match="absolute"):
+        with _timing_study_lock():
+            pytest.fail("The reservation accepted a working-directory-dependent path")
 
 
 def test_real_grouped_workflow_and_completed_resume_keep_one_thread(example, monkeypatch, tmp_path_factory):
@@ -170,7 +249,8 @@ def test_real_grouped_workflow_and_completed_resume_keep_one_thread(example, mon
 
     def immutable_receipts():
         return {path.relative_to(checkpoint): hashlib.sha256(path.read_bytes()).hexdigest()
-                for path in checkpoint.rglob("*.json") if path.name != "report.json"}
+                for path in checkpoint.rglob("*.json") if path.name != "report.json"
+                and path.relative_to(checkpoint).parts[0] not in {"cv-timing", "grouped-timing"}}
 
     monkeypatch.setattr(NMFClassifier, "_fit_impl", fit)
     monkeypatch.setattr(NMFClassifier, "predict_with_probabilities", predict)
@@ -205,3 +285,47 @@ def test_real_grouped_workflow_and_completed_resume_keep_one_thread(example, mon
     assert evaluations[0]["metrics"] == evaluations[1]["metrics"]
     assert evaluations[0]["predictions"]["sample_ids"] == list(range(120, 160))
     assert set(evaluations[0]["evaluation_groups"]) == set(range(30, 40))
+    fresh, replay = sorted((_read_receipt(p) for p in (checkpoint / "grouped-timing").glob("*.json")),
+                           key=lambda row: row["started_utc"])
+    assert fresh["cv"][0]["operation"] == "calibrate" and fresh["cv"][0]["cv_wall_seconds_this_invocation"] > 0
+    assert replay["cv"][0]["operation"] == "verify_completed_folds"
+    assert replay["cv"][0]["cv_wall_seconds_this_invocation"] == 0
+    assert replay["cv"][0]["cv_wall_seconds_cumulative"] == fresh["cv"][0]["cv_wall_seconds_cumulative"]
+    for record in (fresh, replay):
+        assert record["fit_execution"]["verified"] and record["prediction_execution"]["verified"]
+        assert record["cv"][-1]["finished_utc"] <= record["fit_execution"]["started_utc"]
+        assert record["fit_execution"]["finished_utc"] <= record["prediction_execution"]["started_utc"]
+    fold = next((checkpoint / "stage-000/folds").glob("*.json"))
+    fold.unlink()
+    events.clear()
+    with pytest.raises(ValueError, match="folds are missing"):
+        example.main()
+    assert not events and not fold.exists()
+
+
+def test_grouped_partial_cv_records_interruption_and_recovery(example, monkeypatch, tmp_path_factory):
+    from supervised_nmf import study
+
+    folder = tmp_path_factory.mktemp("gc") / "cp"
+    original = study._run_representation_fold
+    count = 0
+
+    def interrupt(*args, **kwargs):
+        nonlocal count
+        count += 1
+        if count == 2:
+            raise KeyboardInterrupt("pause after a committed fold")
+        return original(*args, **kwargs)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(study, "_run_representation_fold", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            example.run(folder)
+    example.run(folder)
+    stopped, recovered = sorted((_read_receipt(p) for p in (folder / "grouped-timing").glob("*.json")),
+                                key=lambda row: row["started_utc"])
+    assert stopped["state"] == stopped["cv"][0]["state"] == "interrupted"
+    assert [row["operation"] for row in recovered["cv"]] == ["verify_completed_folds", "calibrate"]
+    assert not recovered["cv"][0]["complete"] and recovered["cv"][1]["complete"]
+    assert recovered["cv"][1]["cv_wall_seconds_cumulative"] == pytest.approx(
+        stopped["cv"][0]["cv_wall_seconds_this_invocation"] + recovered["cv"][1]["cv_wall_seconds_this_invocation"])

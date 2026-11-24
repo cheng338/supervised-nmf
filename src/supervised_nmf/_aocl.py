@@ -101,6 +101,19 @@ def padded_matmul(left, right, *, _final_report_copy4=False):
     return np.array(product[:m, :n], order="C", copy=True)
 
 
+# Capture these where the padded product is defined. A caller may install a
+# product observer before loading or reloading the NNLS solver.
+_NUMPY = np
+_PLAIN_MATMUL = np.matmul if type(np.matmul) is np.ufunc and np.matmul.__name__ == "matmul" else None
+_PADDED_MATMUL = padded_matmul
+
+
+def _uses_native_product(operation, numpy):
+    return (np is numpy is _NUMPY and _PLAIN_MATMUL is not None
+            and np.matmul is _PLAIN_MATMUL and np.abs is np.absolute
+            and (operation is _PLAIN_MATMUL or operation is _PADDED_MATMUL))
+
+
 class _PreparedRightOperand:
     """Own one fixed validated RHS in its existing padded native geometry.
 

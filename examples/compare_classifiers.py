@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from supervised_nmf.datasets import make_original_simulation
 from supervised_nmf.validation import _validate_threads
 from supervised_nmf.evaluation import (
+    _serial_comparison_batch, _timing_study_lock,
     comparison_models, new_run_directory, provenance, run_comparison,
     save_data_manifest, write_json,
 )
@@ -28,7 +29,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--quick", action="store_true", help="One candidate per method; correctness check only.")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--threads", type=int, default=1,
+                        help="Native threads for CV. Final fit and prediction use one worker and one native thread.")
     parser.add_argument("--output", type=Path, default=Path("runs"))
     parser.add_argument("--max-iter", type=int, default=20000, help="NMF/NNLS iteration limit.")
     parser.add_argument("--tol", type=float, default=1e-4, help="CD/MU stopping tolerance.")
@@ -41,6 +43,11 @@ def main():
     except ValueError as error:
         parser.error(str(error))
 
+    with _timing_study_lock():
+        _run(args)
+
+
+def _run(args):
     class_weight = None if args.logistic_class_weight == "none" else "balanced"
     data = make_original_simulation(n_samples=160 if args.quick else 400,
                                     n_features=60 if args.quick else 120,
@@ -73,10 +80,12 @@ def main():
         "validation_indices": validation, "role": "development_only_not_final_test",
     })
     print(f"Five-fold training calibration across {len(models)} methods; reports: {run_dir.resolve()}", flush=True)
-    summary = run_comparison(models, data.data[training], data.target[training],
-                             data.data[validation], data.target[validation],
-                             output_dir=run_dir, seed=args.seed, threads=args.threads,
-                             validation_ids=validation, signal_support=data.signal_support)
+    with _serial_comparison_batch(_host_reserved=True) as batch:
+        summary = run_comparison(models, data.data[training], data.target[training],
+                                 data.data[validation], data.target[validation],
+                                 output_dir=run_dir, seed=args.seed, threads=args.threads,
+                                 validation_ids=validation, signal_support=data.signal_support,
+                                 serial_final=True, _batch=batch)
     print("\nMethod | validation balanced accuracy | tune (s) | MF (s) | classifier fit (s) | total fit (s) | predict (s) | status")
     for name, record in summary["models"].items():
         evaluation = record["evaluation"]

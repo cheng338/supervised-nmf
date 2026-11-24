@@ -7,6 +7,7 @@ import inspect
 from pathlib import Path
 import sys
 from unittest.mock import patch
+import weakref
 
 import numpy as np
 import pytest
@@ -27,6 +28,39 @@ REVIEW_SPEC = importlib.util.spec_from_file_location(
 reviewer = importlib.util.module_from_spec(REVIEW_SPEC)
 sys.modules[REVIEW_SPEC.name] = reviewer
 REVIEW_SPEC.loader.exec_module(reviewer)
+
+
+@pytest.mark.parametrize("labels", [np.array([0, 1], dtype="datetime64[D]"),
+                                    np.empty((0, 2), dtype=np.int64)], ids=["dates", "empty-matrix"])
+def test_malformed_cache_labels_release_training_features(tmp_path, monkeypatch, labels):
+    X = np.zeros((2, 4096), dtype=np.float32)
+    path = tmp_path / "train-X.npy"
+    np.save(path, X, allow_pickle=False)
+    np.save(tmp_path / "train-Smiling-y.npy", labels, allow_pickle=False)
+    record = {"image_ids": ["a", "b"], "metadata": {"partition_code": 0},
+              "attributes": {"Smiling": {"data_sha256": data_fingerprint(X, np.array([0, 1]))}}}
+    study.write_json(tmp_path / "manifest.json",
+                     {"seed": 17, "official_test_loaded": False, "splits": {"train": record}})
+    with pytest.raises((TypeError, ValueError, BufferError)) as expected:
+        data_fingerprint(X, labels)
+
+    load = np.load
+    mapped = []
+
+    def observe_load(filename, **options):
+        value = load(filename, **options)
+        if filename == path and isinstance(value, np.memmap):
+            mapped.append(weakref.ref(value))
+        return value
+
+    monkeypatch.setattr(np, "load", observe_load)
+    with pytest.raises(type(expected.value)) as caught:
+        study.prepare_cache(tmp_path, None, None, None, 2, 2, 17)
+    assert str(caught.value) == str(expected.value)
+    replacement = tmp_path / "replacement.npy"
+    np.save(replacement, np.ones_like(X), allow_pickle=False)
+    replacement.replace(path)
+    assert all(ref() is None for ref in mapped)
 
 
 def test_real_worker_aggregation_and_resume_keep_frozen_balanced_accuracy(tmp_path, monkeypatch):

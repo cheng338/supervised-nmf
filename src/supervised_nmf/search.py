@@ -5,35 +5,42 @@ It does not change estimator defaults or claim joint parameter optimality.
 """
 
 from copy import deepcopy
-from numbers import Integral
 from pathlib import Path
 import time
 
 import numpy as np
 from sklearn.base import clone
-from sklearn.decomposition import NMF, PCA
+from sklearn.decomposition import PCA
 from sklearn.model_selection import ParameterGrid
 from sklearn.pipeline import Pipeline
 
 from .classifier import NMFClassifier
 from ._calibration import _validate_scoring
+from ._feature_names import _input_feature_names
 from ._search_diagnostics import mark_inactive_refinement
-from .decomposition import FeatureSPA
-from .evaluation import _digest, _jsonable, _search_identity, refinement_diagnostics
+from .evaluation import _check_transform_output, _digest, _jsonable, _search_identity, refinement_diagnostics
 from ._identity import implementation_sources
 from ._labels import _check_labeled_data, _validate_class_labels
+from ._neighbors import _is_integer_index
 from .screening import BinaryScreening
 from .study import (
-    _checkpoint_lock, _read_receipt, _runtime_identity, _write_receipt,
-    calibration_knn_grid,
+    _calibration_knn_grid, _check_captured_folds, _checkpoint_lock, _rank_axis_kind, _read_receipt, _runtime_identity,
+    _write_receipt, calibration_knn_grid,
 )
-from .validation import _validate_fixed_seed, _validate_threads, build_cv_folds, validate_metadata
+from .validation import _rank_count, _validate_fixed_seed, _validate_threads, build_cv_folds, validate_metadata
 
 
 def _positive_integer(value, name, *, minimum=1):
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral) or value < minimum:
-        raise ValueError(f"{name} must be an integer >= {minimum}.")
-    return int(value)
+    if _is_integer_index(value):
+        try:
+            count = _rank_count(value)
+        except (MemoryError, RecursionError):
+            raise
+        except Exception as error:
+            raise ValueError(f"{name} must identify one integer count. {error}") from error
+        if count >= minimum:
+            return count
+    raise ValueError(f"{name} must be an integer >= {minimum}.")
 
 
 def _rank_parameter(estimator, candidates, parameter):
@@ -47,16 +54,13 @@ def _rank_parameter(estimator, candidates, parameter):
         raise ValueError("rank_parameter must name an estimator parameter.")
     if parameter != "n_components" and not parameter.endswith("__n_components"):
         raise ValueError("rank_parameter must be n_components or a pipeline step's n_components.")
+    ranks = []
     for candidate in candidates:
         if parameter not in candidate:
             raise ValueError("Every initial candidate must explicitly declare rank_parameter.")
-        _positive_integer(candidate[parameter], "Every declared rank")
-    if type(estimator) is NMFClassifier and parameter == "n_components":
-        return parameter
-    if type(estimator) is Pipeline:
-        step_name, attribute = parameter.rsplit("__", 1)
-        if attribute == "n_components" and type(estimator.named_steps.get(step_name)) in (PCA, NMF, FeatureSPA):
-            return parameter
+        ranks.append(_positive_integer(candidate[parameter], "Every declared rank"))
+    if _rank_axis_kind(estimator, candidates, parameter) == "rank":
+        return parameter, ranks
     raise TypeError("Rank expansion supports NMFClassifier or a PCA, NMF, or FeatureSPA pipeline step.")
 
 
@@ -93,7 +97,7 @@ def _physical_limit(estimator, parameters, parameter, candidate, X, folds):
 def calibration_rank_search(estimator, param_grid, X, y, *, rank_parameter=None,
                             cv=5, seed=0, threads=1, checkpoint_dir,
                             max_expansions=2, max_rank=None, groups=None,
-                            folds=None, data_ids=None, scoring="accuracy"):
+                            folds=None, data_ids=None, scoring="accuracy", _require_completed=False):
     """Extend an upper-boundary rank winner using frozen training folds only.
 
     First evaluate the explicit grid with :func:`calibration_knn_grid`. When
@@ -139,13 +143,15 @@ def calibration_rank_search(estimator, param_grid, X, y, *, rank_parameter=None,
         max_rank = _positive_integer(max_rank, "max_rank")
     candidates = list(ParameterGrid(param_grid))
     raw_y = y
+    feature_names = _input_feature_names(X)
     X, _, y = _check_labeled_data(X, y)
     _validate_class_labels(raw_y, y)
     # Validate before a custom clone can hide the original implementation.
-    implementation_sources(estimator, candidates)
+    rng_limits = []
+    implementation_sources(estimator, candidates, _split_limits=rng_limits)
     estimator = clone(estimator)
-    parameter = _rank_parameter(estimator, candidates, rank_parameter)
-    initial_maximum = max(int(params[parameter]) for params in candidates)
+    parameter, stage_ranks = _rank_parameter(estimator, candidates, rank_parameter)
+    initial_maximum = max(stage_ranks)
     if max_rank is not None and initial_maximum > max_rank:
         raise ValueError("max_rank must not exclude any explicit initial candidate.")
     X, y = np.array(X, copy=True), np.array(y, copy=True)
@@ -159,7 +165,7 @@ def calibration_rank_search(estimator, param_grid, X, y, *, rank_parameter=None,
         "schema_version": 2, "method": "bounded_coordinate_rank_expansion",
         "calibration": _search_identity(estimator, candidates, X, y, cv, seed, threads,
                                          refit=False, groups=groups, folds=pairs, data_ids=data_ids,
-                                         scoring=scoring),
+                                         scoring=scoring, _feature_names=feature_names),
         "scoring": scoring,
         "runtime": runtime, "rank_parameter": parameter,
         "max_expansions": max_expansions, "max_rank": max_rank,
@@ -170,10 +176,10 @@ def calibration_rank_search(estimator, param_grid, X, y, *, rank_parameter=None,
     directory = Path(checkpoint_dir)
     directory.mkdir(parents=True, exist_ok=True)
     stages, all_candidates = [], []
-    # Reports contain JSON display values, including repr strings for estimator
-    # objects. Keep the caller's actual configurations separately for later
-    # stages; never reconstruct executable estimators from a saved report.
-    actual_parameters = {}
+    # Keep numerical coordinates and the winner's original parameter objects.
+    # The stage reports contain display values for custom estimators and ranks.
+    attempted_ranks = []
+    incumbent_parameters = None
     incumbent = None
     rank_limit = None
     bounds = []
@@ -185,22 +191,47 @@ def calibration_rank_search(estimator, param_grid, X, y, *, rank_parameter=None,
         if manifest.exists():
             if _read_receipt(manifest) != identity:
                 raise ValueError("Rank-search checkpoint is incompatible with these data, folds, settings, source or runtime.")
+            if "unverified scalar owner" in rng_limits:
+                raise ValueError("Cannot verify the backing storage of a captured NumPy scalar in this saved rank search.")
+            if "unverified fit RNG" in rng_limits or "ambient fit RNG" in rng_limits:
+                raise ValueError("Cannot verify the fit generator in this saved rank search.")
+            if "captured fit RNG" in rng_limits or "captured scalar storage" in rng_limits:
+                # An expanded stage can be the first to change captured state.
+                # Check all committed stages before refitting any missing fold.
+                for stage in directory.glob("stage-*"):
+                    stage_manifest = stage / "identity.json"
+                    if stage_manifest.is_file():
+                        _check_captured_folds(stage, _digest(_read_receipt(stage_manifest)))
+                    elif any((stage / "folds").glob("*.json")):
+                        raise ValueError("Saved rank-search folds require their original stage identity.")
         else:
+            if _require_completed:
+                return None
+            if rng_limits and (any(directory.glob("stage-*/identity.json")) or any(directory.glob("stage-*/folds/*.json"))
+                               or any(directory.glob("stage-*/report.json")) or (directory / "report.json").exists()):
+                raise ValueError("Saved rank-search stages with unverified randomness or captured state require their original identity.")
             _write_receipt(manifest, identity)
         while True:
             if _runtime_identity(estimator, threads, candidates) != runtime:
                 raise ValueError("Source or numerical runtime changed during rank search.")
             stage_parameters = list(ParameterGrid(stage_grid))
-            stage = calibration_knn_grid(
+            stage_options = {"_reuse_only": True} if _require_completed else {}
+            if feature_names is not None:
+                stage_options["_feature_names"] = feature_names
+            stage_search = _calibration_knn_grid if stage_options else calibration_knn_grid
+            stage = stage_search(
                 estimator, stage_grid, X, y, cv=cv, seed=seed, threads=threads,
                 checkpoint_dir=directory / f"stage-{len(stages):03d}",
                 groups=groups, folds=pairs, data_ids=data_ids, scoring=scoring,
+                **stage_options,
             )
+            if stage is None and _require_completed:
+                return None
             stages.append(stage)
             new_valid = []
             for row in stage["candidates"]:
                 row = deepcopy(row)
-                actual_parameters[len(all_candidates)] = stage_parameters[row["index"]]
+                attempted_ranks.append(stage_ranks[row["index"]])
                 row.update(stage_candidate_index=row["index"],
                            index=len(all_candidates), stage=len(stages) - 1)
                 all_candidates.append(row)
@@ -208,19 +239,19 @@ def calibration_rank_search(estimator, param_grid, X, y, *, rank_parameter=None,
                     new_valid.append(row)
                     if incumbent is None or row["mean_score"] > incumbent["mean_score"]:
                         incumbent = row
+                        incumbent_parameters = stage_parameters[row["stage_candidate_index"]]
             if incumbent is None:
                 reason, complete = "no_qualified_initial_candidate", False
                 break
-            incumbent_parameters = actual_parameters[incumbent["index"]]
             rank_limit, bounds = _physical_limit(estimator, incumbent_parameters, parameter,
                                                  incumbent, X, pairs)
-            current_rank = int(incumbent_parameters[parameter])
+            current_rank = attempted_ranks[incumbent["index"]]
             if not new_valid:
                 reason, complete = "no_qualified_expansion_candidate", False
                 break
             if current_rank < highest_attempted:
-                higher_qualified = any(row["valid"] and row["parameters"][parameter] > current_rank
-                                       for row in all_candidates)
+                higher_qualified = any(attempted_ranks[row["index"]] > current_rank
+                                       for row in all_candidates if row["valid"])
                 reason, complete = (("winner_below_upper_rank_boundary", True) if higher_qualified else
                                     ("unqualified_upper_rank_candidates", False))
                 break
@@ -238,8 +269,25 @@ def calibration_rank_search(estimator, param_grid, X, y, *, rank_parameter=None,
                 proposed = min(proposed, max_rank)
             parameters = dict(incumbent_parameters, **{parameter: proposed})
             stage_grid = {key: [value] for key, value in parameters.items()}
+            stage_ranks = [proposed]
             highest_attempted = proposed
             expansions += 1
+        selected = incumbent["parameters"] if incumbent else None
+        # An expansion changes only the named rank. The initial grid supplies
+        # every other rank's full range, selected value and effective owners.
+        fixed_rank_bounds = {
+            key: stages[0]["refinement"]["parameters"][key]
+            for key in selected or ()
+            if key != parameter and _rank_axis_kind(estimator, candidates, key)
+        }
+        to_refine = ({key: value for key, value in selected.items() if key not in fixed_rank_bounds}
+                     if fixed_rank_bounds else selected)
+        refinement = refinement_diagnostics(
+            [row["parameters"] for row in all_candidates], to_refine,
+            _rank_coordinates={parameter: (attempted_ranks, current_rank)} if incumbent else None)
+        if fixed_rank_bounds:
+            bounds_by_key = refinement["parameters"] | fixed_rank_bounds
+            refinement["parameters"] = {key: bounds_by_key[key] for key in selected}
         report = _jsonable({
             "schema_version": 2, "author": "Chang Cheng", "state": "cv_completed",
             "fingerprint": fingerprint, "identity": identity, "stages": stages,
@@ -255,8 +303,7 @@ def calibration_rank_search(estimator, param_grid, X, y, *, rank_parameter=None,
             "physical_limit_evidence": bounds, "stop_reason": reason, "search_complete": complete,
             "unresolved_upper_rank_boundary": not complete,
             "refinement": mark_inactive_refinement(
-                refinement_diagnostics([row["parameters"] for row in all_candidates],
-                                       incumbent["parameters"] if incumbent else None),
+                refinement,
                 stages[incumbent["stage"]].get("screening_diagnostics") if incumbent else None,
                 incumbent["stage_candidate_index"] if incumbent else None),
             "search_scope": "initial_explicit_grid_then_one_rank_coordinate_with_other_parameters_fixed",
@@ -267,5 +314,6 @@ def calibration_rank_search(estimator, param_grid, X, y, *, rank_parameter=None,
             "reused_representation_folds": sum(stage["reused_representation_folds"] for stage in stages),
             "current_call_wall_seconds": time.perf_counter() - start,
         })
+        _check_transform_output(runtime["sklearn_transform_output"])
         _write_receipt(directory / "report.json", report)
         return report

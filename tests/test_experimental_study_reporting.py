@@ -171,7 +171,7 @@ def configure_evaluation(monkeypatch, problem):
                          plans=[{"job": job}], sources={},
                          splits={"pair": {"validation_indices": list(range(len(query_y)))}},
                          protocol={"profile_repeats": 1})
-    monkeypatch.setattr(runner, "aggregate_cv", lambda *a, **k: {"jobs": {job["id"]: selected}})
+    monkeypatch.setattr(runner, "_verified_evaluation_cv", lambda *a, **k: {"jobs": {job["id"]: selected}})
     monkeypatch.setattr(runner, "_verify_arrays", lambda record: None)
     monkeypatch.setattr(runner, "_check_source", lambda source: None)
     monkeypatch.setattr(runner, "_load_arrays", lambda record: (X, y) if record["kind"] == "train" else (query, query_y))

@@ -198,3 +198,255 @@ def test_qualified_aocl_route_passes_original_readonly_arrays(monkeypatch, nativ
     assert _residual.reconstruction_error(*eligible_arrays) == 13.
     assert len(received) == 1
     assert all(actual is original for actual, original in zip(received[0], eligible_arrays))
+
+
+_MIXED_AOCL = dict(AOCL, architecture="zen3")
+_REPORT_ERRORS = dict(divide="warn", over="warn", invalid="warn", under="ignore")
+
+
+@pytest.fixture(scope="module")
+def extended_metadata_arrays():
+    # Real, contiguous extended geometry. No test computes on this payload.
+    return np.empty((32776, 1024)), np.empty((32776, 8)), np.empty((8, 1024))
+
+
+@pytest.mark.parametrize("platform,pools,expected", [
+    ("linux", [MKL], True),
+    ("linux", [MKL, MKL.copy()], False),
+    ("linux", [dict(MKL, num_threads=2)], False),
+    ("linux", [MKL, _MIXED_AOCL], False),
+    ("darwin", [MKL], False),
+    ("win32", [MKL], False),
+    ("win32", [_MIXED_AOCL], False),
+    ("win32", [MKL, _MIXED_AOCL], True),
+    ("win32", [_MIXED_AOCL, MKL], True),
+    ("win32", [MKL, _MIXED_AOCL, MKL.copy()], False),
+    ("win32", [MKL, dict(_MIXED_AOCL, architecture="zen4")], False),
+    ("win32", [MKL, dict(_MIXED_AOCL, version="other")], False),
+    ("win32", [MKL, dict(_MIXED_AOCL, num_threads=2)], False),
+    ("linux", [dict(MKL, internal_api="openblas")], False),
+])
+def test_extended_backend_scope(native_pools, extended_metadata_arrays, platform, pools, expected):
+    native_pools(pools, platform=platform)
+    assert not _residual._use_blocks(*extended_metadata_arrays)
+    assert _residual._use_blocks(*extended_metadata_arrays, extended=True) is expected
+
+
+@pytest.mark.parametrize("platform,pools", [("win32", [MKL, _MIXED_AOCL]), ("linux", [MKL])])
+def test_extended_input_layout_and_type(native_pools, extended_metadata_arrays, platform, pools):
+    native_pools(pools, platform=platform)
+    x, w, h = extended_metadata_arrays
+    for index, array in enumerate((x, w, h)):
+        operands = [x, w, h]
+        operands[index] = array.reshape(array.shape[::-1]).T
+        assert _residual._use_blocks(*operands, extended=True) is (platform == "linux")
+        operands[index] = array[:, ::-1]
+        assert not _residual._use_blocks(*operands, extended=True)
+        operands[index] = np.ndarray(array.shape, dtype=np.float32, buffer=array)
+        assert not _residual._use_blocks(*operands, extended=True)
+    assert _residual._use_blocks(x[:-1], w[:-1], h, extended=True) is (platform == "linux")
+    # Transpose-based views above preserve dimensions. This wide C-order view
+    # isolates the feature alignment rule while keeping row alignment intact.
+    wide = x.ravel()[:8192 * 4097].reshape(8192, 4097)
+    assert _residual._use_blocks(wide, w[:8192], np.empty((8, 4097)),
+                                 extended=True) is (platform == "linux")
+
+
+@pytest.mark.parametrize("n,p,rank,expected", [
+    (8191, 4097, 1, False), (8192, 4097, 1, True),
+    (32769, 1023, 1, False), (32769, 1024, 1, True),
+    (162112, 4096, 32, True), (162113, 4096, 32, False),
+    (8192, 4608, 32, True), (8192, 4609, 32, False),
+    (32769, 1024, 0, False), (32769, 1024, 33, False),
+])
+def test_extended_dimension_boundaries(native_pools, n, p, rank, expected):
+    from unittest.mock import Mock
+
+    # Only shape, dtype, and flags enter this predicate. Represent the largest
+    # shapes without reserving several GiB of address space in each CI worker.
+    def matrix(shape):
+        return Mock(spec=np.ndarray, shape=shape, ndim=2, dtype=np.dtype("float64"),
+                    flags=SimpleNamespace(c_contiguous=True, f_contiguous=False))
+
+    native_pools([MKL], platform="linux")
+    arrays = (matrix((n, p)), matrix((n, rank)), matrix((rank, p)))
+    assert _residual._use_blocks(*arrays, extended=True) is expected
+
+
+@pytest.fixture
+def scaled_extended_report(monkeypatch):
+    # Keep one real outer dimension above its old ceiling and shrink the other.
+    # Exercise the production report, its arithmetic guards and its real tiles.
+    monkeypatch.setattr(_residual, "_use_blocks", lambda *arrays, extended=False: extended)
+    return _residual.reconstruction_error
+
+
+@pytest.fixture
+def report_norm_shapes(monkeypatch):
+    original_norm = np.linalg.norm
+    shapes = []
+
+    def observed_norm(array):
+        shapes.append(array.shape)
+        return original_norm(array)
+
+    monkeypatch.setattr(np.linalg, "norm", observed_norm)
+    return shapes
+
+
+@pytest.mark.parametrize("platform,order,width", [
+    ("win32", "C", 32), ("linux", "C", 128), ("linux", "F", 128),
+])
+def test_extended_tiles_and_tails_match_exact_rational_residual(
+        monkeypatch, scaled_extended_report, report_norm_shapes, platform, order, width):
+    monkeypatch.setattr(_residual, "sys", SimpleNamespace(platform=platform))
+    n, p = 136, 4104
+    i = np.arange(n) % 5 - 2
+    j = np.arange(p) % 7 - 3
+    w = np.column_stack((i, 2 - i, np.full(n, 3))) / 8
+    h = np.vstack((j + 1, 2 * j, 4 - j)) / 16
+    # Expanding these three inner products in integers gives the exact target.
+    numerator = i[:, None] * (1 - j) + j + 12
+    delta = 2.**-40
+    x = np.array(numerator / 128 + delta, order=order)
+    x[-8:, :] += 2 * delta
+    x[:, -8:] += 4 * delta
+    expected_square = (n - 8) * (p - 8) + 9 * 8 * (p - 8) + 25 * (n - 8) * 8 + 49 * 64
+    originals = [a.copy() for a in (x, w, h)]
+    for a in (x, w, h):
+        a.flags.writeable = False
+
+    with np.errstate(**_REPORT_ERRORS):
+        observed = scaled_extended_report(x, w, h)
+    assert observed == pytest.approx(delta * math.sqrt(expected_square), rel=5e-15, abs=0)
+    outer, inner = (n, p) if order == "C" else (p, n)
+    assert report_norm_shapes == [(width, inner)] * (outer // width) + [(8, inner)]
+    for actual, original in zip((x, w, h), originals):
+        np.testing.assert_array_equal(actual, original)
+        assert not actual.flags.writeable
+
+
+@pytest.mark.parametrize("n,rank,width", [
+    (32769, 19, 8), (32769, 20, 32), (131071, 20, 32), (131072, 20, 128),
+])
+def test_tall_fortran_tile_crossover(monkeypatch, scaled_extended_report, n, rank, width):
+    monkeypatch.setattr(_residual, "sys", SimpleNamespace(platform="linux"))
+    x = np.empty((n, 3), order="F")
+    w = np.zeros((n, rank))
+    h = np.zeros((rank, 3))
+
+    def selected(target, left, right, tile_width):
+        assert tile_width == width
+        for view, original in zip((target, left, right), (x, h, w)):
+            assert np.shares_memory(view, original)
+            assert view.shape == original.T.shape
+        return 19.
+
+    monkeypatch.setattr(_residual, "_blocked_error", selected)
+    with np.errstate(**_REPORT_ERRORS):
+        assert scaled_extended_report(x, w, h) == 19.
+
+
+def test_extended_size_cap(monkeypatch, scaled_extended_report, report_norm_shapes):
+    assert _residual._MAX_BLOCK_ELEMENTS == 162112 * 4096
+    x, w, h = np.zeros((136, 4104)), np.zeros((136, 1)), np.zeros((1, 4104))
+    with np.errstate(**_REPORT_ERRORS):
+        for limit, full in [(x.size, False), (x.size - 1, True)]:
+            monkeypatch.setattr(_residual, "_MAX_BLOCK_ELEMENTS", limit)
+            report_norm_shapes.clear()
+            assert scaled_extended_report(x, w, h) == 0
+            assert (x.shape in report_norm_shapes) is full
+
+
+@pytest.mark.parametrize("index", [0, 1, 2], ids=["data", "coordinates", "components"])
+def test_extended_ndarray_subclasses_keep_full_expression(
+        scaled_extended_report, report_norm_shapes, index):
+    class ArraySubclass(np.ndarray):
+        pass
+
+    arrays = [np.full((136, 4104), 6.), np.ones((136, 2)), np.full((2, 4104), 3.)]
+    arrays[index] = arrays[index].view(ArraySubclass)
+    with np.errstate(**_REPORT_ERRORS):
+        assert scaled_extended_report(*arrays) == 0
+    assert report_norm_shapes == [arrays[0].shape]
+
+
+@pytest.mark.parametrize("index,sign", [(1, -1), (1, 1), (2, -1), (2, 1)])
+def test_extended_factor_guard_includes_both_endpoints(
+        scaled_extended_report, report_norm_shapes, index, sign):
+    arrays = [np.zeros((136, 4104)), np.zeros((136, 1)), np.zeros((1, 4104))]
+    bound = 2.**240
+    with np.errstate(**_REPORT_ERRORS):
+        for magnitude, full in [(bound, False), (math.nextafter(bound, math.inf), True)]:
+            arrays[index][0, 0] = sign * magnitude
+            report_norm_shapes.clear()
+            assert scaled_extended_report(*arrays) == 0
+            assert (arrays[0].shape in report_norm_shapes) is full
+
+
+@pytest.mark.parametrize("value,replay", [(math.nextafter(2.**511, 0), False), (2.**511, True)])
+def test_extended_aggregate_replay_boundary(scaled_extended_report, report_norm_shapes, value, replay):
+    x = np.zeros((32776, 2))
+    x[0, 0] = value
+    with np.errstate(**_REPORT_ERRORS):
+        assert scaled_extended_report(x, np.zeros((len(x), 1)), np.zeros((1, 2))) == value
+    assert (x.shape in report_norm_shapes) is replay
+
+
+@pytest.mark.parametrize("case,mode", [
+    ("distributed-overflow", "default"), ("split-inf-nan", "default"),
+    ("signaling-nan", "default"), ("signaling-nan", "warnings-as-errors"),
+    ("signaling-nan", "under-raise"), ("signaling-nan", "invalid-raise"),
+    ("signaling-nan", "callback"),
+])
+def test_extended_exceptional_results_replay_the_numpy_expression(
+        scaled_extended_report, report_norm_shapes, case, mode):
+    import warnings
+
+    x = np.zeros((32776, 2))
+    w, h = np.zeros((len(x), 1)), np.zeros((1, 2))
+    if case == "distributed-overflow":
+        # Each tile has at most one finite square of 2**511. Their sum is 2**1024.
+        x[:512:128, 0] = 2.**511
+    elif case == "split-inf-nan":
+        x[0, 0], x[128, 0] = np.inf, np.nan
+    else:
+        # A signaling NaN raises invalid on the first arithmetic operation.
+        x.view(np.uint64)[128, 0] = 0x7ff0000000000001
+    errors = _REPORT_ERRORS.copy()
+    if mode == "under-raise":
+        errors["under"] = "raise"
+    elif mode == "invalid-raise":
+        errors["invalid"] = "raise"
+    elif mode == "callback":
+        errors["invalid"] = "call"
+
+    def observe(report):
+        callbacks = []
+
+        def handler(message, flag):
+            callbacks.append((message, flag))
+
+        with np.errstate(**errors, call=handler), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("error" if mode == "warnings-as-errors" else "always", RuntimeWarning)
+            try:
+                outcome = ("value", float(report(x, w, h)).hex())
+            except (RuntimeWarning, FloatingPointError) as exc:
+                outcome = (type(exc).__name__, str(exc))
+            assert np.geterr() == errors
+            assert np.geterrcall() is handler
+        return outcome, [(item.category, str(item.message)) for item in caught], callbacks
+
+    reference = observe(lambda x, w, h: np.linalg.norm(x - w @ h))
+    report_norm_shapes.clear()
+    assert observe(scaled_extended_report) == reference
+    if case == "distributed-overflow":
+        assert reference[0] == ("value", "inf")
+    if case == "split-inf-nan":
+        assert reference[0] == ("value", "nan")
+    if mode in ("default", "warnings-as-errors"):
+        assert any(shape != x.shape for shape in report_norm_shapes)
+    else:
+        assert all(shape == x.shape for shape in report_norm_shapes)
+    if reference[0][0] == "value":
+        assert report_norm_shapes[-1] == x.shape

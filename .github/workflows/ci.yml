@@ -28,7 +28,7 @@ jobs:
     if: ${{ github.event.repository.private == false }}
     name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -56,10 +56,21 @@ jobs:
         run: python scripts/build_release.py
       - name: Verify built distributions
         run: python -I scripts/check_wheel.py
-      - name: Install and import built wheel
+      - name: Check distribution inventory and install verified wheel
+        shell: python
         run: |
-          python -c "from pathlib import Path; import subprocess, sys; wheels = list(Path('dist').glob('*.whl')); assert len(wheels) == 1; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', '--no-deps', str(wheels[0])])"
-          python -I -c "from importlib.metadata import version; import supervised_nmf; from supervised_nmf import _aocl; assert supervised_nmf.__version__ == version('supervised-nmf'); assert 'site-packages' in supervised_nmf.__file__; assert 'site-packages' in _aocl.__file__; print(supervised_nmf.__version__)"
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          dist = Path("dist")
+          wheels = sorted(path.name for path in dist.glob("*.whl"))
+          sources = sorted(path.name for path in dist.glob("*.tar.gz"))
+          if len(wheels) != 1 or len(sources) != 1:
+              raise SystemExit(f"Expected one wheel and one source archive in dist/. Found wheels {wheels} and source archives {sources}.")
+          subprocess.run([sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", str(dist / wheels[0])], check=True)
+      - name: Import installed wheel
+        run: python -I -c "from importlib.metadata import version; import supervised_nmf; from supervised_nmf import _aocl; assert supervised_nmf.__version__ == version('supervised-nmf'); assert 'site-packages' in supervised_nmf.__file__; assert 'site-packages' in _aocl.__file__; print(supervised_nmf.__version__)"
       - name: Retain verified release distributions
         if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

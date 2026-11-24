@@ -44,17 +44,19 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import numpy as np
 from sklearn.base import clone
 from sklearn.model_selection import ParameterGrid, StratifiedKFold
-from threadpoolctl import threadpool_limits
 
 from supervised_nmf._completed_reuse import _try_completed
 from supervised_nmf._identity import configuration_identity, implementation_sources
 from supervised_nmf.evaluation import (
-    _diagnostics, _digest, _initialized_provenance, _jsonable, _nonconverged, _warning_records,
+    _SerialTimingError, _check_serial_workers, _diagnostics, _digest, _initialized_provenance, _jsonable, _nonconverged,
+    _timing_study_lock, _warning_records,
     comparison_models, data_fingerprint, evaluate_classifier, provenance,
     refinement_diagnostics, write_json,
 )
-from supervised_nmf.study import (_checkpoint_lock, _read_receipt, _write_receipt,
-                                  calibration_knn_grid, _reuse_calibration_knn_grid)
+from supervised_nmf.study import (_checkpoint_lock, _cv_wall_attempt, _cv_work_pending, _evaluation_cv_repairs,
+                                  _frozen_study_cv, _protocol_cv_chunks, _read_receipt,
+                                  _seal_study_cv, _time_study_fit, _write_receipt,
+                                  _calibrate_worker_cache)
 import profile_celeba_stages as _profile_helper
 if (getattr(_profile_helper, "__file__", None) is None
         or Path(_profile_helper.__file__).resolve()
@@ -180,18 +182,21 @@ def _cache_identity(cache, jobs, *, validation=False):
     split = "validation" if validation else "train"
     record = manifest["splits"][split]
     X = np.load(cache / f"{split}-X.npy", mmap_mode="r", allow_pickle=False)
-    if X.shape != (len(record["image_ids"]), 4096) or X.dtype != np.float32 or not np.isfinite(X).all() or X.min() < 0 or X.max() > 1:
-        raise ValueError("Cache must contain finite original 64x64 float32 images in [0, 1].")
-    for attribute in sorted({job["attribute"] for job in jobs}):
-        y = np.load(cache / f"{split}-{attribute}-y.npy", allow_pickle=False)
-        counts = np.bincount(y, minlength=2) if y.dtype.kind in "iu" and np.all((y == 0) | (y == 1)) else None
-        expected = record["attributes"][attribute]
-        if (y.shape != (len(X),) or counts is None or len(counts) != 2
-                or counts.tolist() != expected["class_counts"]
-                or data_fingerprint(X, y) != expected["data_sha256"]):
-            raise ValueError(f"Cached values, labels, counts or fingerprint differ for {split}/{attribute}.")
-        if split == "train" and min(counts) < 5:
-            raise ValueError("Both training classes require at least five observations.")
+    try:
+        if X.shape != (len(record["image_ids"]), 4096) or X.dtype != np.float32 or not np.isfinite(X).all() or X.min() < 0 or X.max() > 1:
+            raise ValueError("Cache must contain finite original 64x64 float32 images in [0, 1].")
+        for attribute in sorted({job["attribute"] for job in jobs}):
+            y = np.load(cache / f"{split}-{attribute}-y.npy", allow_pickle=False)
+            counts = np.bincount(y, minlength=2) if y.dtype.kind in "iu" and np.all((y == 0) | (y == 1)) else None
+            expected = record["attributes"][attribute]
+            if (y.shape != (len(X),) or counts is None or len(counts) != 2
+                    or counts.tolist() != expected["class_counts"]
+                    or data_fingerprint(X, y) != expected["data_sha256"]):
+                raise ValueError(f"Cached values, labels, counts or fingerprint differ for {split}/{attribute}.")
+            if split == "train" and min(counts) < 5:
+                raise ValueError("Both training classes require at least five observations.")
+    finally:
+        del X
     return {"manifest_sha256": _digest(manifest), "manifest": manifest}
 
 
@@ -227,7 +232,7 @@ def initialize(protocol_path, output):
     return identity
 
 
-def _worker(work, *, reuse_only=False, _reuse_environment=None):
+def _worker(work, *, reuse_only=False, _reuse_environment=None, _frozen_report=None):
     output, plan, chunk, expected_sources = work
     if reuse_only:
         if _source_identity(_environment=_reuse_environment) != expected_sources:
@@ -235,22 +240,13 @@ def _worker(work, *, reuse_only=False, _reuse_environment=None):
     else:
         _check_source(expected_sources, _environment=_reuse_environment)
     job = plan["job"]
-    X = np.load(Path(job["cache"]) / "train-X.npy", mmap_mode="r", allow_pickle=False)
-    try:
-        y = np.load(Path(job["cache"]) / f"train-{job['attribute']}-y.npy", allow_pickle=False)
-        # This recorded protocol selects by balanced accuracy, independently of
-        # the general calibration API's default scoring objective.
-        calibrate = _reuse_calibration_knn_grid if reuse_only else calibration_knn_grid
-        options = {} if _reuse_environment is None else {"_reuse_environment": _reuse_environment}
-        report = calibrate(_estimator(job), chunk["grid"], X, y, cv=5, seed=job["seed"], threads=1,
-                                      scoring="balanced_accuracy",
-                                      checkpoint_dir=Path(output) / job["id"] / chunk["id"], **options)
-        if report is not None:
-            _check_source(expected_sources, _environment=_reuse_environment)
-    finally:
-        # The worker owns this mapping, and calibration copies its input before
-        # fitting. Close even when an exception traceback still references X.
-        X._mmap.close()
+    report = _calibrate_worker_cache(
+        lambda: _estimator(job), chunk["grid"], Path(job["cache"]) / "train-X.npy",
+        Path(job["cache"]) / f"train-{job['attribute']}-y.npy", cv=5, seed=job["seed"], threads=1,
+        scoring="balanced_accuracy", checkpoint_dir=Path(output) / job["id"] / chunk["id"],
+        reuse_only=reuse_only, _reuse_environment=_reuse_environment, _frozen_report=_frozen_report)
+    if report is not None:
+        _check_source(expected_sources, _environment=_reuse_environment)
     if report is None:
         return None
     return {"job": job["id"], "chunk": chunk["id"], "candidates": len(report["candidates"]),
@@ -274,12 +270,15 @@ def aggregate_cv(output, configuration, *, require_complete=False):
         candidates, costs = [], {}
         manifest = configuration["caches"][job["cache"]]["manifest"]
         X = np.load(Path(job["cache"]) / "train-X.npy", mmap_mode="r", allow_pickle=False)
-        y = np.load(Path(job["cache"]) / f"train-{job['attribute']}-y.npy", allow_pickle=False)
+        try:
+            y = np.load(Path(job["cache"]) / f"train-{job['attribute']}-y.npy", allow_pickle=False)
+            # Stratification needs only the sample count. A detached scalar
+            # preserves sklearn's validation order and scalar diagnostic.
+            samples = X.copy() if getattr(X, "ndim", None) == 0 else range(len(X))
+        finally:
+            del X
         expected_folds = _jsonable([{"training_indices": a, "validation_indices": b}
-                                   for a, b in StratifiedKFold(5, shuffle=True, random_state=job["seed"]).split(X, y)])
-        # No subsequent check needs the mapped array. Release it before a
-        # validation exception can retain it in a traceback on Windows.
-        del X
+                                   for a, b in StratifiedKFold(5, shuffle=True, random_state=job["seed"]).split(samples, y)])
         report_receipts = {}
         for chunk, path in zip(plan["chunks"], paths):
             report = _read_receipt(path)
@@ -361,13 +360,15 @@ def _checkpoint_files_present(work):
     return True
 
 
-def _completed_or_spawned(work, workers, *, _cli_forkserver=False):
+def _completed_or_spawned(work, workers, *, _cli_forkserver=False, _pins=None):
+    frozen = {} if _pins is None else {id(item): pin for item, pin in zip(work, _pins, strict=True)}
     def describe(item):
         output, plan, chunk, _ = item
         return _estimator(plan["job"]), chunk["grid"], Path(output) / plan["job"]["id"] / chunk["id"], 1
 
     def invoke(item, environment):
-        return _worker(item, reuse_only=True, _reuse_environment=environment)
+        options = {"_frozen_report": frozen[id(item)]} if frozen else {}
+        return _worker(item, reuse_only=True, _reuse_environment=environment, **options)
 
     completed = _try_completed(work, workers, describe=describe, invoke=invoke)
     if completed is not None:
@@ -380,9 +381,13 @@ def _completed_or_spawned(work, workers, *, _cli_forkserver=False):
         if method == "forkserver":
             context.set_forkserver_preload([])
         with ProcessPoolExecutor(max_workers=workers, mp_context=context) as executor:
-            futures = [executor.submit(_worker, item) for item in work]
+            futures = [executor.submit(_worker, item, reuse_only=True, _frozen_report=frozen[id(item)])
+                       for item in work] if frozen else [executor.submit(_worker, item) for item in work]
             for future in as_completed(futures):
-                yield future.result()
+                result = future.result()
+                if frozen and result is None:
+                    raise ValueError("A frozen CV fold or identity is missing or incompatible; fresh CV is closed.")
+                yield result
 
 
 def run_cv(output, configuration, *, workers=8, job_ids=None, _cli_forkserver=False):
@@ -393,13 +398,22 @@ def run_cv(output, configuration, *, workers=8, job_ids=None, _cli_forkserver=Fa
     work = [(str(output), plan, chunk, configuration["sources"]) for plan in configuration["plans"]
             if plan["job"]["id"] in chosen for chunk in plan["chunks"]]
     receipts = []
-    completed = (_completed_or_spawned(work, workers, _cli_forkserver=True)
-                 if _cli_forkserver is True else _completed_or_spawned(work, workers))
-    for index, result in enumerate(completed, 1):
-        receipts.append(result)
-        print(f"CV {index}/{len(work)} {result['job']} {result['chunk']} "
-              f"valid={result['valid_candidates']}/{result['candidates']} "
-              f"new={result['new_representation_fits']} reused={result['reused_representation_folds']}", flush=True)
+    directories = [Path(output) / plan["job"]["id"] / chunk["id"] for _, plan, chunk, _ in work]
+    pins = _frozen_study_cv(output, configuration, directories)
+    if pins is not None:
+        completed = _completed_or_spawned(work, workers, _cli_forkserver=_cli_forkserver, _pins=pins)
+    else:
+        completed = (_completed_or_spawned(work, workers, _cli_forkserver=True)
+                     if _cli_forkserver is True else _completed_or_spawned(work, workers))
+    with _cv_wall_attempt(output, _digest(configuration),
+                          active=pins is None and _cv_work_pending(directories, (chunk["grid"] for _, _, chunk, _ in work)),
+                          preexisting_work=any(path.exists() for path in directories),
+                          workers=workers, native_threads=1):
+        for index, result in enumerate(completed, 1):
+            receipts.append(result)
+            print(f"CV {index}/{len(work)} {result['job']} {result['chunk']} "
+                  f"valid={result['valid_candidates']}/{result['candidates']} "
+                  f"new={result['new_representation_fits']} reused={result['reused_representation_folds']}", flush=True)
     summary = aggregate_cv(output, configuration)
     return {"state": summary["state"], "completed_chunks": receipts, "missing_chunks": summary["missing_chunks"]}
 
@@ -407,7 +421,13 @@ def run_cv(output, configuration, *, workers=8, job_ids=None, _cli_forkserver=Fa
 def evaluate(output, configuration):
     """Serial independent final fits plus exact-reproduction stage profiling."""
     output = Path(output)
+    chunks, directories = _protocol_cv_chunks(output, configuration)
+    pins = _frozen_study_cv(output, configuration, directories)
+    repairs, repair_pins = _evaluation_cv_repairs(chunks, directories, pins)
+    for _ in _completed_or_spawned(repairs, 1, _pins=repair_pins):
+        pass
     cv = aggregate_cv(output, configuration, require_complete=True)
+    _seal_study_cv(output, configuration, directories)
     for cache, saved in configuration["caches"].items():
         actual = _cache_identity(cache, [plan["job"] for plan in configuration["plans"] if plan["job"]["cache"] == cache], validation=True)
         if actual != saved:
@@ -445,41 +465,40 @@ def evaluate(output, configuration):
             yv = np.load(cache / f"validation-{job['attribute']}-y.npy", allow_pickle=False)
             ids = configuration["caches"][job["cache"]]["manifest"]["splits"]["validation"]["image_ids"]
             template = _estimator(job).set_params(**selected["selected_parameters"])
+            _check_serial_workers(template)
             model, caught = clone(template), []
-            with threadpool_limits(limits=1):
-                start = time.perf_counter()
-                try:
-                    with warnings.catch_warnings(record=True) as caught:
-                        warnings.simplefilter("always")
-                        model.fit(X, y)
-                    result["final_fit_seconds"] = time.perf_counter() - start
-                    result["diagnostics"] = _diagnostics(model)
-                    if _nonconverged(model, caught):
-                        result["evaluation"] = {"status": "held", "reason": "Selected final fit did not converge."}
-                    else:
-                        result["evaluation"] = evaluate_classifier(model, Xv, yv, threads=1, sample_ids=ids)
-                except Exception as error:
-                    result["evaluation"] = {"status": "failed", "error_type": type(error).__name__, "error": str(error)}
-                finally:
-                    if result["final_fit_seconds"] is None:
-                        result["final_fit_seconds"] = time.perf_counter() - start
-                    result["final_fit_warnings"] = _warning_records(caught)
-                if result["evaluation"]["status"] == "valid":
-                    for repeat in range(configuration["protocol"].get("profile_repeats", 1)):
-                        profile = profile_selected_estimator(template, X, y, Xv, yv,
-                                                             reference=result["evaluation"], sample_ids=ids)
-                        profile["repeat"] = repeat
-                        result["profiling"].append(profile)
-                    result["profiling_valid"] = all(item["status"] == "valid" and item["exact_prediction_match"]
-                                                    for item in result["profiling"])
-                    if result["profiling_valid"]:
-                        for stage in result["profiling"][0]["timing"]:
-                            values = [item["timing"][stage] for item in result["profiling"]]
-                            result["profile_medians_seconds"][stage] = float(np.median(values)) if all(value is not None for value in values) else None
-                        result["profile_medians_seconds"]["fit_plus_prediction_seconds"] = float(np.median([
-                            item["timing"]["total_fit_seconds"] + item["timing"]["prediction_seconds"]
-                            for item in result["profiling"]]))
-                    result["profile_timing_note"] = "Additional serial fit and prediction; exact original labels and probabilities required. Component timers are nested within total fit/predict. Do not add this fit cost to original fitting or CV costs."
+            try:
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    _time_study_fit(model, X, y, result)
+                result["diagnostics"] = _diagnostics(model)
+                if _nonconverged(model, caught):
+                    result["evaluation"] = {"status": "held", "reason": "Selected final fit did not converge."}
+                else:
+                    result["evaluation"] = evaluate_classifier(model, Xv, yv, threads=1, sample_ids=ids,
+                        _serial_timing=result.setdefault("prediction_execution", {}))
+            except _SerialTimingError:
+                raise
+            except Exception as error:
+                result["evaluation"] = {"status": "failed", "error_type": type(error).__name__, "error": str(error)}
+            finally:
+                result["final_fit_warnings"] = _warning_records(caught)
+            if result["evaluation"]["status"] == "valid":
+                for repeat in range(configuration["protocol"].get("profile_repeats", 1)):
+                    profile = profile_selected_estimator(template, X, y, Xv, yv,
+                                                         reference=result["evaluation"], sample_ids=ids)
+                    profile["repeat"] = repeat
+                    result["profiling"].append(profile)
+                result["profiling_valid"] = all(item["status"] == "valid" and item["exact_prediction_match"]
+                                                for item in result["profiling"])
+                if result["profiling_valid"]:
+                    for stage in result["profiling"][0]["timing"]:
+                        values = [item["timing"][stage] for item in result["profiling"]]
+                        result["profile_medians_seconds"][stage] = float(np.median(values)) if all(value is not None for value in values) else None
+                    result["profile_medians_seconds"]["fit_plus_prediction_seconds"] = float(np.median([
+                        item["timing"]["total_fit_seconds"] + item["timing"]["prediction_seconds"]
+                        for item in result["profiling"]]))
+                result["profile_timing_note"] = "Additional serial fit and prediction; exact original labels and probabilities required. Component timers are nested within total fit/predict. Do not add this fit cost to original fitting or CV costs."
         _check_source(configuration["sources"])
         _write_receipt(path, result)
         results[job["id"]] = result
@@ -508,7 +527,7 @@ def main(*, _cli_forkserver=False):
     if args.mode == "evaluate" and args.jobs:
         parser.error("Evaluation requires all jobs and does not support --jobs")
     args.output.mkdir(parents=True, exist_ok=True)
-    with _checkpoint_lock(args.output):
+    with _timing_study_lock(), _checkpoint_lock(args.output):
         configuration = initialize(args.protocol, args.output)
         attempt_path = args.output / "executions" / f"{uuid.uuid4().hex}.json"
         attempt = {"started_at": _now(), "mode": args.mode, "workers": args.workers if args.mode == "cv" else 1,

@@ -24,7 +24,9 @@ from sklearn.model_selection import train_test_split
 # Also usable from a source checkout before installation.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from supervised_nmf.datasets import make_simulation
+from supervised_nmf.validation import _validate_threads
 from supervised_nmf.evaluation import (
+    _serial_comparison_batch, _timing_study_lock,
     comparison_models, new_run_directory, provenance, run_comparison, save_data_manifest, write_json,
 )
 
@@ -44,7 +46,8 @@ def parse_args():
     parser.add_argument("--correlation-scope", choices=["within_blocks", "all_features"], default="within_blocks",
                         help="Pre-clipping Gaussian correlation within signal/background or across all features.")
     parser.add_argument("--scenario", choices=["additive", "xor"], default="additive")
-    parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--threads", type=int, default=1,
+                        help="Native threads for CV. Final fit and prediction use one worker and one native thread.")
     parser.add_argument("--max-iter", type=int, default=20000)
     parser.add_argument("--tol", type=float, default=1e-4)
     parser.add_argument("--classifier", choices=("knn", "logistic", "linear_svm"), default="knn")
@@ -57,11 +60,21 @@ def parse_args():
                         help="Linear-SVM stopping tolerance (default: 1e-5).")
     parser.add_argument("--svm-class-weight", choices=("none", "balanced"), default="none",
                         help="Linear-SVM class weighting (default: none). SVM options apply only to linear_svm.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    try:
+        args.threads = _validate_threads(args.threads)
+    except ValueError as error:
+        parser.error(str(error))
+    return args
 
 
 def main():
     args = parse_args()
+    with _timing_study_lock():
+        _run(args)
+
+
+def _run(args):
     if len(set(args.seeds)) != len(args.seeds):
         raise ValueError("Replication seeds must be distinct.")
     logistic_class_weight = None if args.logistic_class_weight == "none" else "balanced"
@@ -92,34 +105,38 @@ def main():
         write_json(run_dir / "configuration.json", config)
         write_json(run_dir / "provenance.json", provenance(args.threads))
     repetitions = []
-    for seed in args.seeds:
-        data = make_simulation(n_samples=config["n_samples"], n_features=config["n_features"],
-                               n_signal=config["n_signal"], signal_strength=args.signal_strength,
-                               correlation=args.correlation, random_state=seed, scenario=args.scenario,
-                               correlation_scope=args.correlation_scope)
-        training, validation = train_test_split(np.arange(len(data.target)), test_size=0.25,
-                                                stratify=data.target, random_state=seed)
-        seed_dir = run_dir / f"seed-{seed}"
-        save_data_manifest(seed_dir / "data.json", {"generator": "make_simulation", "seed": seed,
-                                            "signal_support": data.signal_support,
-                                            "metadata": data.metadata,
-                                            "training_indices": training, "validation_indices": validation,
-                                            "role": "development_only_not_final_test"})
-        models = comparison_models(random_state=seed, quick=args.quick, max_iter=args.max_iter, tol=args.tol,
-                                   classifier=args.classifier, logistic_max_iter=args.logistic_max_iter,
-                                   logistic_tol=args.logistic_tol, logistic_class_weight=logistic_class_weight,
-                                   **svm_options)
-        unknown = set(config["grid_override"]) - set(models)
-        if unknown:
-            raise ValueError(f"Unknown grid model names: {sorted(unknown)}")
-        for name, grid in config["grid_override"].items():
-            models[name] = (models[name][0], grid)
-        print(f"Seed {seed}: five-fold development calibration across {len(models)} methods", flush=True)
-        summary = run_comparison(models, data.data[training], data.target[training],
-                                 data.data[validation], data.target[validation], output_dir=seed_dir,
-                                 seed=seed, threads=args.threads, validation_ids=validation,
-                                 signal_support=data.signal_support)
-        repetitions.append(summary)
+    seed_dirs = [run_dir / f"seed-{seed}" for seed in args.seeds]
+    with _serial_comparison_batch(_host_reserved=True, root=run_dir, directories=seed_dirs) as batch:
+        for seed in args.seeds:
+            data = make_simulation(n_samples=config["n_samples"], n_features=config["n_features"],
+                                   n_signal=config["n_signal"], signal_strength=args.signal_strength,
+                                   correlation=args.correlation, random_state=seed, scenario=args.scenario,
+                                   correlation_scope=args.correlation_scope)
+            training, validation = train_test_split(np.arange(len(data.target)), test_size=0.25,
+                                                    stratify=data.target, random_state=seed)
+            seed_dir = run_dir / f"seed-{seed}"
+            save_data_manifest(seed_dir / "data.json", {"generator": "make_simulation", "seed": seed,
+                                                "signal_support": data.signal_support,
+                                                "metadata": data.metadata,
+                                                "training_indices": training, "validation_indices": validation,
+                                                "role": "development_only_not_final_test"})
+            models = comparison_models(random_state=seed, quick=args.quick, max_iter=args.max_iter, tol=args.tol,
+                                       classifier=args.classifier, logistic_max_iter=args.logistic_max_iter,
+                                       logistic_tol=args.logistic_tol, logistic_class_weight=logistic_class_weight,
+                                       **svm_options)
+            unknown = set(config["grid_override"]) - set(models)
+            if unknown:
+                raise ValueError(f"Unknown grid model names: {sorted(unknown)}")
+            for name, grid in config["grid_override"].items():
+                models[name] = (models[name][0], grid)
+            print(f"Seed {seed}: five-fold development calibration across {len(models)} methods", flush=True)
+            summary = run_comparison(models, data.data[training], data.target[training],
+                                     data.data[validation], data.target[validation], output_dir=seed_dir,
+                                     seed=seed, threads=args.threads, validation_ids=validation,
+                                     signal_support=data.signal_support, serial_final=True, _batch=batch)
+            repetitions.append(summary)
+    for seed, summary in zip(args.seeds, repetitions):
+        print(f"Seed {seed}: development validation", flush=True)
         for name, result in summary["models"].items():
             metric = result["evaluation"].get("metrics", {}).get("balanced_accuracy")
             print(f"  {name}: balanced accuracy={metric}, fallback={result['is_fallback']}, "

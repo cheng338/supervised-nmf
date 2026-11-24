@@ -43,7 +43,8 @@ from threadpoolctl import threadpool_limits
 from supervised_nmf import NMFClassifier
 from supervised_nmf.datasets import _attribute_labels, _partitions, load_celeba
 from supervised_nmf.evaluation import (
-    _diagnostics, _digest, _nonconverged, _warning_records, comparison_models,
+    _check_serial_workers, _diagnostics, _digest, _nonconverged, _serial_timing_phase, _timing_study_lock,
+    _warning_records, comparison_models,
     data_fingerprint, evaluate_classifier, provenance, write_json,
 )
 from supervised_nmf.study import _checkpoint_lock, _read_receipt, _write_receipt
@@ -307,16 +308,20 @@ def revalidate_models(output, freeze, chosen):
             yv = np.load(cache / f"validation-{job['attribute']}-y.npy", allow_pickle=False)
             model = comparison_models(random_state=43, max_iter=20000, tol=1e-4)[job["method"]][0]
             model.set_params(**source["evaluation"]["selected_parameters"])
-            with threadpool_limits(limits=1), warnings.catch_warnings(record=True) as caught:
+            _check_serial_workers(model)
+            fit_execution = attempt["fit_execution"] = {}
+            with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
-                fit_start = time.perf_counter()
-                model.fit(X, y)
-                fit_seconds = time.perf_counter() - fit_start
+                with _serial_timing_phase(fit_execution) as finish:
+                    model.fit(X, y)
+                    fit_seconds = finish()
             fit_warnings = _warning_records(caught)
             if _nonconverged(model, caught):
                 raise ValueError("Final-source training fit did not converge; official-test gate remains closed.")
+            prediction_execution = attempt["prediction_execution"] = {}
             evaluation = evaluate_classifier(model, Xv, yv, threads=1,
-                                             sample_ids=source["manifest"]["splits"]["validation"]["image_ids"])
+                sample_ids=source["manifest"]["splits"]["validation"]["image_ids"],
+                _serial_timing=prediction_execution)
             check = _compare_predictions(source["evaluation"]["evaluation"]["predictions"], evaluation.get("predictions", {}))
             if evaluation["status"] != "valid" or not check["exact_match"]:
                 raise ValueError("Final-source validation predictions differ; official-test gate remains closed.")
@@ -331,6 +336,7 @@ def revalidate_models(output, freeze, chosen):
                       "stage2_evaluation_file_sha256": source["evaluation_file_sha256"],
                       "model_file": relative, "model_sha256": _sha(model_path), "model_parameters": model.get_params(),
                       "fit_seconds": fit_seconds, "fit_warnings": fit_warnings,
+                      "fit_execution": fit_execution, "prediction_execution": prediction_execution,
                       "diagnostics": _diagnostics(model), "validation_evaluation": evaluation,
                       "reproducibility": check, "official_test_loaded": False}
             _write_new(path, record)
@@ -453,10 +459,13 @@ def evaluate_frozen(output, freeze, chosen):
         try:
             model = _load_model(output, record, freeze)
             y = np.load(output / "test-cache" / f"{job['attribute']}-y.npy", allow_pickle=False)
-            evaluation = evaluate_classifier(model, X, y, threads=1, sample_ids=test["image_ids"])
+            prediction_execution = attempt["prediction_execution"] = {}
+            evaluation = evaluate_classifier(model, X, y, threads=1, sample_ids=test["image_ids"],
+                                             _serial_timing=prediction_execution)
             result = {"author": "Chang Cheng", "identity": identity, "method": job["method"], "attribute": job["attribute"],
                       "selected_default": job["method"] == freeze["winner_method"],
                       "model_parameters": record["model_parameters"], "fit_seconds": record["fit_seconds"],
+                      "fit_execution": record.get("fit_execution"), "prediction_execution": prediction_execution,
                       "validation_reproduced_exactly": True, "evaluation": evaluation,
                       "training_class_counts": source["manifest"]["splits"]["train"]["attributes"][job["attribute"]]["class_counts"],
                       "test_class_counts": test["attributes"][job["attribute"]]["class_counts"],
@@ -495,19 +504,20 @@ def main():
     parser.add_argument("--output", type=Path)
     parser.add_argument("--prepare-freeze", action="store_true")
     args = parser.parse_args()
-    if args.prepare_freeze:
-        freeze = prepare_freeze(args.comparison, args.decision, args.freeze, args.images, args.attributes, args.partitions)
-        print(json.dumps({"freeze": str(args.freeze.resolve()), "sha256": _sha(args.freeze),
-                          "winner_method": freeze["winner_method"], "model_count": len(freeze["job_ids"]),
-                          "official_test_loaded": False}, indent=2))
-        return
-    if args.output is None:
+    if not args.prepare_freeze and args.output is None:
         parser.error("--output is required when executing the frozen comparison")
-    freeze = _validate_freeze(args.freeze, args.comparison, args.decision, args.images, args.attributes, args.partitions)
-    _, chosen = _stage2(args.comparison)
-    args.output.mkdir(parents=True, exist_ok=True)
-    with _checkpoint_lock(args.output), threadpool_limits(limits=1):
-        summary = evaluate_frozen(args.output, freeze, chosen)
+    with _timing_study_lock():
+        if args.prepare_freeze:
+            freeze = prepare_freeze(args.comparison, args.decision, args.freeze, args.images, args.attributes, args.partitions)
+            print(json.dumps({"freeze": str(args.freeze.resolve()), "sha256": _sha(args.freeze),
+                              "winner_method": freeze["winner_method"], "model_count": len(freeze["job_ids"]),
+                              "official_test_loaded": False}, indent=2))
+            return
+        freeze = _validate_freeze(args.freeze, args.comparison, args.decision, args.images, args.attributes, args.partitions)
+        _, chosen = _stage2(args.comparison)
+        args.output.mkdir(parents=True, exist_ok=True)
+        with _checkpoint_lock(args.output), threadpool_limits(limits=1):
+            summary = evaluate_frozen(args.output, freeze, chosen)
     print(json.dumps({"output": str(args.output.resolve()), "state": summary["state"],
                       "winner_method": summary["winner_method"], "official_test_loaded": True,
                       "default_changed_from_test": False}, indent=2))

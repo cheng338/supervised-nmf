@@ -392,13 +392,65 @@ def load_dataset(run, dataset, inputs):
         if row["qualified"]:
             close(record["profile_medians_seconds"]["fit_plus_prediction_seconds"], case_cost(row), "Paired timing median")
         rows.append(row)
+    return rows, configuration, read_executions(run, identity, inputs)
+
+
+def read_executions(run, identity, inputs):
     executions = []
     for path in sorted((run / "executions").glob("*.json")):
         record = inputs.read(path)
         require(record["configuration_sha256"] == identity, "Execution belongs to another configuration.")
-        executions.append({key: record.get(key) for key in ("mode", "state", "started_at", "finished_at", "workers",
-                                                           "native_threads", "current_call_wall_seconds")})
-    return rows, configuration, executions
+        execution = {key: record.get(key) for key in ("mode", "state", "started_at", "finished_at", "workers",
+                                                      "native_threads", "current_call_wall_seconds")}
+        cv = record.get("cv", {})
+        for key in ("cv_timing_attempt_id", "cv_timing_sha256", "cv_timing_state",
+                    "cv_wall_seconds_this_invocation", "cv_wall_seconds_cumulative"):
+            if key in cv:
+                execution[key] = cv[key]
+        executions.append(execution)
+    return executions
+
+
+def cv_wall_history(run, configuration_sha256, inputs, executions):
+    directory = run / "cv-timing"
+    if (directory / "attempts.index").exists():
+        # Historical archives without an indexed journal can be read independently.
+        if str(ROOT / "src") not in sys.path:
+            sys.path.insert(0, str(ROOT / "src"))
+        from supervised_nmf.study import _validated_cv_wall_receipts
+        receipts = _validated_cv_wall_receipts(run, configuration_sha256, read_receipt=inputs.read)
+        attempts = [row for _, row in receipts]
+    else:
+        attempts = [inputs.read(path) for path in directory.glob("*.json")]
+        for row in attempts:
+            require(not {"attempt_id", "previous_sha256", "seal_sha256"}.intersection(row),
+                    "Missing attempt index for registered CV timing receipts.")
+            require(row["configuration_sha256"] == configuration_sha256,
+                    "CV timing evidence belongs to another configuration.")
+        attempts.sort(key=lambda row: row["started_utc"])
+    by_id = {row["attempt_id"]: row for row in attempts if "attempt_id" in row}
+    matched_ids = set()
+    legacy_seconds = Counter()
+    for execution in executions:
+        if {"cv_timing_attempt_id", "cv_timing_sha256", "cv_timing_state"}.intersection(execution):
+            attempt_id = execution.get("cv_timing_attempt_id")
+            attempt = by_id.get(attempt_id)
+            state = execution.get("cv_timing_state", "completed")  # Earlier bindings were written only after success.
+            require(attempt is not None and attempt_id not in matched_ids
+                    and state in {"completed", "failed", "interrupted"} and attempt["state"] == state
+                    and (execution["state"] in {"failed", "interrupted"} or execution["state"] == state == "completed")
+                    and digest(attempt) == execution.get("cv_timing_sha256")
+                    and all(key in execution and execution[key] == attempt[key] for key in
+                            ("cv_wall_seconds_this_invocation", "cv_wall_seconds_cumulative")),
+                    "Missing or inconsistent CV timing receipt for a timed invocation.")
+            matched_ids.add(attempt_id)
+        elif "cv_wall_seconds_this_invocation" in execution:
+            # Earlier command records have only their measured interval as an independent witness.
+            legacy_seconds[execution["cv_wall_seconds_this_invocation"]] += 1
+    available_seconds = Counter(row["cv_wall_seconds_this_invocation"] for row in attempts
+                                if row.get("attempt_id") not in matched_ids and row.get("state", "completed") == "completed")
+    require(legacy_seconds <= available_seconds, "Missing CV timing history for a timed execution.")
+    return attempts
 
 
 def case_key(row):
@@ -657,6 +709,13 @@ def markdown(report):
     for dataset, executions in report["executions"].items():
         for row in executions:
             lines.append(f"- {dataset}, {row['mode']}, {row['state']}: {number(row['current_call_wall_seconds'],3)} s; {row['workers']} worker(s), native threads {row['native_threads']}.")
+    for dataset, attempts in report.get("cv_wall_attempts", {}).items():
+        if attempts:
+            lines += ["", f"Parallel CV wall time for {dataset}", ""]
+            for attempt in attempts:
+                lines.append(f"- {attempt['started_utc']} ({attempt['state']}), "
+                             f"{number(attempt['cv_wall_seconds_this_invocation'],3)} s this invocation, "
+                             f"{number(attempt.get('cv_wall_seconds_cumulative'),3)} s cumulative.")
     if report.get("recovery"):
         recovery = report["recovery"]
         counts = recovery["counts"]
@@ -771,10 +830,12 @@ def write_report(run, output=None):
     run = Path(run).resolve()
     output = Path(output).resolve() if output else run / "report"
     inputs = Inputs()
-    rows, configurations, executions = [], {}, {}
+    rows, configurations, executions, cv_wall_attempts = [], {}, {}, {}
     for directory, dataset in (("fashion", "Fashion-MNIST"), ("celeba", "CelebA")):
         local, configurations[dataset], executions[dataset] = load_dataset(run / directory, dataset, inputs)
         rows.extend(local)
+        cv_wall_attempts[dataset] = cv_wall_history(
+            run / directory, digest(configurations[dataset]), inputs, executions[dataset])
     fashion_protocol = configurations["Fashion-MNIST"]["protocol"]
     rule = fashion_protocol["cross_dataset_decision"]
     require(rule["candidates"] == list(METHODS), "Unexpected decision candidates.")
@@ -793,7 +854,7 @@ def write_report(run, output=None):
                   source_run=str(run), winner_method=report["primary"]["winner"], decision_rule=rule,
                   decision_protocol_sha256=configurations["Fashion-MNIST"]["protocol_file_sha256"],
                   input_sha256=inputs.hashes, missing_evidence=inputs.missing, executions=executions,
-                  recovery=recovery,
+                  cv_wall_attempts=cv_wall_attempts, recovery=recovery,
                   reporter_source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                   package_defaults_modified=False, final_test_evaluated=False,
                   remaining_audits=["Independent evidence/decision audit", "Public API integration if MU or ANLS-BPP is selected",

@@ -118,7 +118,7 @@ class CelebaFourSolverTests(unittest.TestCase):
             self.assertEqual(first["evaluation_role"], "official_celeba_validation_natural_class_proportions")
 
     def test_incomplete_cv_blocks_validation_reads(self):
-        with patch.object(runner.shared, "aggregate_cv", side_effect=ValueError("incomplete")), \
+        with patch.object(runner.shared, "_verified_evaluation_cv", side_effect=ValueError("incomplete")), \
              patch.object(runner, "_verify_values") as verify, patch.object(runner.shared, "evaluate") as evaluate:
             with self.assertRaisesRegex(ValueError, "incomplete"):
                 runner.evaluate("unused", {"arrays": {}})
@@ -128,7 +128,7 @@ class CelebaFourSolverTests(unittest.TestCase):
     def test_completed_gate_checks_validation_before_shared_evaluation(self):
         events = []
         configuration = {"arrays": {"smiling/train": {"fixture": "train"}, "smiling/validation": {"fixture": "validation"}}}
-        with patch.object(runner.shared, "aggregate_cv", side_effect=lambda *a, **k: events.append("gate")), \
+        with patch.object(runner.shared, "_verified_evaluation_cv", side_effect=lambda *a, **k: events.append("gate")), \
              patch.object(runner, "_verify_values", side_effect=lambda *a, **k: events.append("validation")), \
              patch.object(runner.shared, "evaluate", side_effect=lambda *a, **k: events.append("evaluate")):
             runner.evaluate("unused", configuration)

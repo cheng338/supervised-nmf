@@ -34,18 +34,18 @@ the original work has yet to be selected. See [LICENSE](LICENSE) and the
 # Installation
 
 Use Python 3.11 or later. Download the wheel from the
-[GitHub release](https://github.com/cheng338/supervised-nmf/releases/tag/v0.5.1),
+[GitHub release](https://github.com/cheng338/supervised-nmf/releases/tag/v0.6.0),
 then run this command in the download directory.
 
 ```sh
-python -m pip install ./supervised_nmf-0.5.1-py3-none-any.whl
+python -m pip install ./supervised_nmf-0.6.0-py3-none-any.whl
 ```
 
 For the examples, tests and study scripts, use the matching source archive or
 clone the release.
 
 ```sh
-git clone --branch v0.5.1 https://github.com/cheng338/supervised-nmf.git
+git clone --branch v0.6.0 https://github.com/cheng338/supervised-nmf.git
 cd supervised-nmf
 python -m pip install .
 ```
@@ -152,11 +152,11 @@ python examples/quickstart.py
 python examples/grouped_tuning.py --output runs/grouped-example
 ```
 
-- [API reference](docs/api.md) — estimator settings, fitted models, calibration and evaluation.
+- [Documentation index](docs/README.md) and [API reference](docs/api.md) — guides by task and detailed estimator settings.
 - [Methodology](docs/methodology.md) and [theory](docs/theory-implementation.md) — how screening and factorization work, and the assumptions behind factor recovery.
-- [Validation studies](docs/validation.md) — comparisons with simpler baselines, including the solver settings and data splits used in each study. Accuracy from an earlier study applies to its recorded configuration.
+- [Validation studies](research/README.md) — comparisons with simpler baselines, including the solver settings and data splits used in each study. Accuracy from an earlier study applies to its recorded configuration.
 - [Runtime compatibility](docs/compatibility.md) and [model persistence](docs/api.md#model-persistence) — numerical backends and loading fitted models.
-- [Study recovery](docs/celeba-parameter-study-recovery.md) — checkpoint costs and how to resume a CelebA parameter study. Use only trusted local model files for restoration.
+- [Resume a calibration search](docs/api.md#resuming-a-calibration-search) or [recover a CelebA parameter study](docs/celeba-parameter-study-recovery.md). For the CelebA example’s optional final-fit recovery, load only model files from your own trusted local run.
 
 # Tests and local builds
 
@@ -186,4 +186,5 @@ python -I scripts/check_wheel.py
 
 # Changelog
 
-See the [changelog](CHANGELOG.md) for release history.
+See the [0.6.0 release notes](docs/releases/release-0.6.0.md) for upgrade guidance
+and the [changelog](CHANGELOG.md) for release history.

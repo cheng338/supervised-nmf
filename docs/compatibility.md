@@ -73,7 +73,7 @@ training factorization inputs or change the fitted basis. See the
 [projection diagnostics](api.md#fit-diagnostics) for its scope and cost.
 
 See [fit diagnostics](api.md#fit-diagnostics) for the meaning of convergence
-flags and [numerical test interpretation](development-protocol.md#numerical-test-interpretation)
+flags and [numerical test interpretation](../research/engineering/development-protocol.md#numerical-test-interpretation)
 for the distinction between composition checks and environment comparisons.
 
 ## Historical Python 3.10 profile
@@ -115,7 +115,7 @@ thread counts must be recorded with its results.
 The 0.1.0a1 wheel installed in the exact Python 3.10.12 profile without changing
 the five pinned dependencies. Installed-package fit/predict checks passed for
 all six SPA/CD/MU by KNN/logistic combinations, and `pip check` found no broken
-requirements. See [validation](validation.md) for completed checks and their limits.
+requirements. See [validation](../research/validation.md) for completed checks and their limits.
 
 ## SPA training-coordinate default in version 0.3.0
 
@@ -137,7 +137,7 @@ simulation portable retains its pinned released 0.2.0 wheel and explicitly
 projects training observations; it does not depend on this new default.
 
 The coordinate behavior in the version 0.3.0 section above describes that
-historical release. Since the November 3, 2026 development change, newly fitted
+historical release. Since version 0.5.0, newly fitted
 `FeatureSPA` pipelines and every accepted SPA `NMFClassifier` coordinate mode
 use fixed-basis NNLS for training. Explicit `training_coordinates="fit_transform"`
 no longer selects anchor coordinates on refit with current source. Reproducing
@@ -146,8 +146,8 @@ loading an existing fitted model does not retrain it or rewrite its metadata.
 
 ## Use an existing target environment
 
-Use an environment with Python 3.11 or later; Python 3.12 is the primary
-development target. Activate the intended environment and install from the
+Use Python 3.11 or later and scikit-learn 1.6.1 or later. Python 3.12 is the
+primary development target. Activate the intended environment and install from the
 source checkout without changing its already-provisioned numerical dependencies:
 
 ```shell
@@ -158,26 +158,27 @@ This command does not install missing dependencies or validate the environment.
 Image-loading examples additionally require Pillow, and plotting requires
 Matplotlib.
 
-## Provision a separate Python 3.12 environment
+## Optional Python 3.12 environment for the October studies
 
-For a new, isolated Python 3.12 environment, the numerical version profile is
-recorded in [requirements/robust-py312.txt](../requirements/robust-py312.txt).
-Install those versions before installing the package:
+For a current installation, follow the [installation guide](../README.md#installation).
+To reproduce the October studies’ five Python 3.12 numerical dependency versions,
+install the [study requirements](../requirements/robust-py312.txt) in a separate
+environment before installing the applicable study source. For a source checkout, run
 
 ```shell
 python -m pip install -r requirements/robust-py312.txt
 python -m pip install --no-deps .
 ```
 
-These pins do not reproduce the Windows AOCL binaries on Linux. Record the
-actual BLAS libraries and thread configuration, and assess performance in the
-chosen environment. The same version numbers do not establish equivalent
-numerical performance across machines.
+Screening, fitting and prediction also run with the stock OpenBLAS wheels. Some optimizations depend on the loaded libraries as well as their
+versions. For example, repeated explicit QR projections recompute the factors
+on OpenBLAS, while a qualified MKL configuration can reuse them. Record the
+loaded BLAS libraries and thread counts when comparing runs.
 
 ## Historical version 0.2.0 validation
 
-The [October 9 release record](release-0.2.0.md) and
-[implementation record](implementation-improvements.md) preserve the evidence
+The [October 9 release record](releases/release-0.2.0.md) and
+[implementation record](../research/engineering/implementation-improvements.md) preserve the evidence
 for the released 0.2.0 source: 370 tests passed on Windows Python 3.12 and
 Python 3.10. Earlier Linux Python 3.12 checks covered projection and thresholds;
 the final workspace-lifetime change was checked on Windows. These are historical

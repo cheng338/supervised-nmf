@@ -13,6 +13,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import celeba_default_study as runner
+from supervised_nmf import study
 from supervised_nmf.evaluation import _digest, data_fingerprint, write_json
 from supervised_nmf.study import _read_receipt, _write_receipt
 
@@ -102,27 +103,39 @@ class DefaultStudyTests(unittest.TestCase):
         config = self.initialize()
         plan = config["plans"][0]
         retained_traceback = None
-        with patch.object(runner, "calibration_knn_grid", side_effect=RuntimeError("worker fixture")):
+        with patch.object(study, "_calibration_knn_grid", side_effect=RuntimeError("worker fixture")):
             try:
                 runner._worker((str(self.output), plan, plan["chunks"][0], config["sources"]))
             except RuntimeError as error:
                 self.assertEqual(str(error), "worker fixture")
                 retained_traceback = error.__traceback__
         self.assertIsNotNone(retained_traceback)
-        # A live traceback still owns the worker frame and its X reference.
-        # Windows permits this unlink only after its mapping has been closed.
+        # The cache file must be replaceable while the error and its input still exist.
         (self.cache / "train-X.npy").unlink()
 
     def test_three_serial_profiles_reproduce_predictions_and_evaluation_resume(self):
         config = self.initialize()
         self.complete(config)
+        chunk = self.output / "spa-pct" / config["plans"][0]["chunks"][0]["id"]
+        report_path = chunk / "report.json"
+        original = _read_receipt(report_path)
+        report_path.unlink()
         result = runner.evaluate(self.output, config)
+        rebuilt = _read_receipt(report_path)
+        self.assertEqual(rebuilt["candidates"], original["candidates"])
+        self.assertEqual(rebuilt["representation_folds"], original["representation_folds"])
+        self.assertEqual(rebuilt["new_representation_fits"], 0)
         self.assertEqual(result["valid_evaluations"], 1)
         self.assertEqual(result["exact_profiles"], 3)
         path = self.output / "spa-pct" / "evaluation.json"
         record = _read_receipt(path)
         self.assertTrue(record["profiling_valid"])
         self.assertEqual(len(record["profiling"]), 3)
+        for row in [record, *record["profiling"]]:
+            self.assertEqual(row["fit_execution"]["seconds"],
+                             row["final_fit_seconds"] if row is record else row["timing"]["total_fit_seconds"])
+            self.assertLessEqual(row["fit_execution"]["finished_utc"], row["prediction_execution"]["started_utc"])
+            self.assertEqual(row["prediction_execution"]["seconds"], row["evaluation"]["prediction_seconds"])
         expected = float(np.median([row["timing"]["total_fit_seconds"] + row["timing"]["prediction_seconds"]
                                     for row in record["profiling"]]))
         self.assertEqual(record["profile_medians_seconds"]["fit_plus_prediction_seconds"], expected)
@@ -130,6 +143,24 @@ class DefaultStudyTests(unittest.TestCase):
         with patch.object(runner, "profile_selected_estimator", side_effect=AssertionError("Refitted saved result")):
             resumed = runner.evaluate(self.output, self.initialize())
         self.assertEqual(resumed, result)
+        self.assertEqual(before, path.read_bytes())
+        argv = ["celeba", "--protocol", str(self.protocol_path), "--output", str(self.output), "--mode", "evaluate"]
+        frozen = report_path.read_bytes()
+        report_path.unlink()
+        with patch.object(sys, "argv", argv):
+            runner.main()
+        self.assertEqual(report_path.read_bytes(), frozen)
+        missing = next((chunk / "folds").glob("*.json"))
+        missing.unlink()
+        attempts = set((chunk / "attempts").iterdir())
+        with (patch.object(sys, "argv", argv), patch.object(runner, "aggregate_cv") as summarize,
+              self.assertRaisesRegex(ValueError, "fresh CV is closed")):
+            runner.main()
+        summarize.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "fresh CV is closed"):
+            runner.run_cv(self.output, config, workers=1)
+        self.assertFalse(missing.exists())
+        self.assertEqual(set((chunk / "attempts").iterdir()), attempts)
         self.assertEqual(before, path.read_bytes())
 
     def test_configuration_and_cache_mismatch_rejected(self):

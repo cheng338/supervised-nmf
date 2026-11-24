@@ -10,6 +10,7 @@ from sklearn.neighbors import KNeighborsClassifier
 from threadpoolctl import threadpool_limits
 
 from supervised_nmf._neighbors import _KNNQueryReuse
+from tests.test_neighbor_full_membership import native_queries
 
 
 class NeighborReuseTests(unittest.TestCase):
@@ -27,7 +28,7 @@ class NeighborReuseTests(unittest.TestCase):
     def compare(self, X, Q, y, ks, **settings):
         before = X.copy(), Q.copy(), y.copy()
         models = self.models(X, y, ks, **settings)
-        reuse = _KNNQueryReuse(models, Q)
+        reuse = _KNNQueryReuse(models, Q, _head_fit_input=X)
         outcomes = {}
         for k, model in models.items():
             labels, diagnostic, _ = reuse.predict(k)
@@ -62,7 +63,7 @@ class NeighborReuseTests(unittest.TestCase):
                                      algorithm=algorithm, weights="distance")
                 reference = models[18].predict(Q)
                 reuse = _KNNQueryReuse(models, Q)
-                with patch.object(models[18], "predict", wraps=models[18].predict) as public:
+                with patch.object(reuse, "_public", wraps=reuse._public) as public:
                     actual, metadata, _ = reuse.predict(18)
                 np.testing.assert_array_equal(actual, reference)
                 self.assertFalse(metadata["accelerated"])
@@ -77,8 +78,8 @@ class NeighborReuseTests(unittest.TestCase):
                     for key in ("near_vote_rows", "near_threshold_rows",
                                 "invalid_vote_rows", "vote_guard", "uncertain_rows"):
                         self.assertIsNone(metadata[key])
-                public.assert_called_once()
-                self.assertIs(public.call_args.args[0], Q)
+                public.assert_called_once_with(models[18], False)
+                self.assertIs(reuse.query, Q)
                 self.assertEqual(metadata["public_fallback_query_rows"], len(Q))
 
     def test_binary_near_half_zero_and_duplicate_contracts(self):
@@ -103,7 +104,7 @@ class NeighborReuseTests(unittest.TestCase):
                     with self.subTest(dtype=dtype, algorithm=algorithm, X=X.tolist()):
                         models = self.models(X, y, [1, 2, 3, len(X)],
                                              algorithm=algorithm, weights="distance")
-                        reuse = _KNNQueryReuse(models, Q)
+                        reuse = _KNNQueryReuse(models, Q, _head_fit_input=X)
                         for k, model in models.items():
                             expected = model.predict_proba(Q)
                             for positive_index in (0, 1):
@@ -121,12 +122,11 @@ class NeighborReuseTests(unittest.TestCase):
         y = np.zeros(len(self.X), dtype=int)
         models = self.models(self.X, y, algorithm="brute", weights="uniform")
         reuse = _KNNQueryReuse(models, self.Q)
-        with patch.object(models[18], "kneighbors", wraps=models[18].kneighbors) as query:
+        with native_queries(models) as calls:
             for k in models:
                 _, metadata, _ = reuse.predict(k)
                 self.assertTrue(metadata["accelerated"])
-            self.assertEqual(query.call_count, 1)
-            self.assertEqual(query.call_args.kwargs["n_neighbors"], 19)
+        self.assertEqual(calls, [(18, 19)])
         self.assertEqual(len(reuse.query_records()), 1)
         self.assertGreaterEqual(reuse.query_seconds, 0.)
         copied = self.models(self.X.copy(), y, [3], algorithm="brute", weights="uniform")
@@ -167,15 +167,12 @@ class NeighborReuseTests(unittest.TestCase):
         models = self.models(self.X, y, [1, 3], algorithm="brute", weights="distance")
         expected = {k: model.predict(self.Q) for k, model in models.items()}
         reuse = _KNNQueryReuse(models, self.Q)
-        original = models[3].kneighbors
+        def fail_shared(count, result):
+            self.assertEqual(count, 4)
+            warnings.warn("shared query diagnostic", RuntimeWarning)
+            raise RuntimeError("only the optimization query failed")
 
-        def fail_shared(*args, **kwargs):
-            if kwargs.get("n_neighbors") == 4:
-                warnings.warn("shared query diagnostic", RuntimeWarning)
-                raise RuntimeError("only the optimization query failed")
-            return original(*args, **kwargs)
-
-        with patch.object(models[3], "kneighbors", fail_shared):
+        with native_queries(models, on_shared=fail_shared):
             for k in models:
                 actual, metadata, caught = reuse.predict(k)
                 np.testing.assert_array_equal(actual, expected[k])

@@ -114,11 +114,11 @@ def test_generic_digest_reuse_is_local_to_each_search(tmp_path, monkeypatch):
     original = evaluation.implementation_sources
     calls = []
 
-    def observe(*values, _previous_files=None):
+    def observe(*values, _previous_files=None, **kwargs):
         if len(calls) == 1:  # First guard after the independent entry check.
             assert _previous_files == {}
         calls.append(_previous_files)
-        return original(*values, _previous_files=_previous_files)
+        return original(*values, _previous_files=_previous_files, **kwargs)
 
     monkeypatch.setattr(evaluation, 'implementation_sources', observe)
     stores = []

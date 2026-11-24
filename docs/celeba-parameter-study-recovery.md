@@ -49,17 +49,27 @@ Use the run directory printed by that invocation when resuming:
 python examples/celeba_parameter_study.py --data-cache data/celeba-development-4000-seed42 --workers 4 --threads 1 --final-fit-recovery all --resume runs/celeba-parameter-study-RUN_ID
 ```
 
-Replace `RUN_ID` with the actual directory name. Repeat any nondefault grid,
-seed, sample-count and thread settings from the original invocation. Omit
+Replace `RUN_ID` with the actual directory name. The directory must contain
+the original `configuration.json`, `data.json`, and `provenance.json`. Keep
+the original grid, seed, worker count, thread count, and recovery policy.
+Grid values must match their saved JSON types, including the distinction
+between `0` and `0.0`. Use `--max-train` and `--max-validation` values that
+match the number of saved image IDs in each split. Omit
 `--final-fit-recovery all`, or specify `off`, for the default policy on a new run;
 do not change policies within an existing run.
 
 `--data-cache` remains fingerprint-verified and takes precedence over image
 paths. `--grid-json` defines the complete declared candidate inventory. Changing
-it requires a new run. `--workers` controls concurrent CV workers;
-`--threads` controls native numerical threads per worker and during final fitting
-and evaluation. Final methods are evaluated serially. Account for workers times
-threads when selecting a compute budget.
+it requires a new run. During CV, `--workers` controls the number of concurrent
+workers and `--threads` sets the native numerical threads per worker. Multiply
+the two when budgeting CV threads. After CV, the example times final fitting
+and prediction one model at a time with one worker and one native thread.
+
+If the cache is missing, supply the original raw inputs to rebuild it. The
+runner verifies the rebuilt manifest before starting CV. A cache originally
+created with a limit larger than the available split can have a different
+creation limit and saved row count. In that case, restore the original or an
+identically rebuilt cache and resume with the saved row count.
 
 ## What a resume reuses
 

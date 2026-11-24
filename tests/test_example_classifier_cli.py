@@ -74,6 +74,8 @@ class ExampleClassifierCLITests(unittest.TestCase):
             result.factory = stack.enter_context(patch.object(
                 evaluation, "comparison_models", wraps=evaluation.comparison_models))
             result.comparison = stack.enter_context(patch.object(evaluation, "run_comparison", side_effect=comparison))
+            # The stub never runs CV or creates the fold records its real batch would seal.
+            stack.enter_context(patch.object(evaluation, "_serial_comparison_batch"))
             result.simulation = stack.enter_context(patch.object(datasets, "make_simulation", side_effect=lambda **kw: self._data()))
             result.loader = stack.enter_context(patch.object(datasets, "load_celeba", side_effect=load))
             result.directory = stack.enter_context(patch.object(evaluation, "new_run_directory", side_effect=directory))
@@ -195,6 +197,50 @@ class ExampleClassifierCLITests(unittest.TestCase):
                     self.assertIn("invalid choice", result.stderr)
                     self._assert_no_work(result)
                     self.assertFalse(result.output.exists())
+
+    def _assert_threads_usage_error(self, result):
+        self.assertIsInstance(result.error, SystemExit)
+        self.assertEqual(result.error.code, 2)
+        self.assertIn("usage:", result.stderr)
+        self.assertIn(f"threads must be a positive integer no greater than {np.iinfo(np.intc).max}.", result.stderr)
+        self._assert_no_work(result)
+        self.assertFalse(result.output.exists())
+
+    def test_invalid_threads_rejected_before_work(self):
+        maximum = int(np.iinfo(np.intc).max)
+        for script in SCRIPTS:
+            for value in (0, -1, maximum + 1):
+                with self.subTest(script=script, threads=value):
+                    self._assert_threads_usage_error(self._run(script, ["--threads", str(value)]))
+            with self.subTest(script=script, grid="missing"):
+                result = self._run(script, ["--threads", "0", "--grid-json", str(self.root / "missing.json")])
+                self._assert_threads_usage_error(result)
+
+    def test_invalid_threads_preserve_matching_partial_resume(self):
+        for script in SCRIPTS:
+            with self.subTest(script=script):
+                run_dir = self.root / Path(script).stem
+                run_dir.mkdir()
+                config = self._legacy_config(script)
+                config["threads"] = 0
+                saved = json.dumps(config, indent=2).encode("utf-8")
+                config_path = run_dir / "configuration.json"
+                config_path.write_bytes(saved)
+
+                result = self._run(script, ["--threads", "0"], resume=run_dir)
+                self._assert_threads_usage_error(result)
+                self.assertEqual(list(run_dir.iterdir()), [config_path])
+                self.assertEqual(config_path.read_bytes(), saved)
+
+    def test_last_threads_option_is_forwarded(self):
+        for script in SCRIPTS:
+            with self.subTest(script=script):
+                result = self._run(script, ["--threads", "0", "--threads", "2"])
+                self.assertEqual(self._configuration(result)["threads"], 2)
+                result.provenance.assert_called_once_with(2)
+                result.comparison.assert_called_once()
+                self.assertEqual(result.comparison.call_args.kwargs["threads"], 2)
+                self.assertIs(result.comparison.call_args.kwargs["serial_final"], True)
 
     def test_grid_json_overrides_cli_defaults_with_correct_parameter_names(self):
         overrides = {

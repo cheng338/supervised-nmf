@@ -3,13 +3,18 @@
 Author: Chang Cheng. Historical decision fixtures remain unchanged.
 """
 
+from concurrent.futures import Future
+from contextlib import ExitStack
 from copy import deepcopy
 import importlib.util
 import itertools
 import json
 from pathlib import Path
+import shutil
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from sklearn.model_selection import ParameterGrid
@@ -24,6 +29,13 @@ RULE = {"candidates": list(METHODS), "global_regret_limit": .01, "per_dataset_re
         "per_task_regret_limit": .02, "relative_cost_tie_band": .05, "numerical_comparison_slack": 1e-12,
         "sensitivities": {"global_and_dataset_regret_limits": [.005, .01, .02], "per_task_limit_multiplier": 2,
                           "prediction_cost_multipliers": [.1, 1, 10, 100]}}
+
+
+def four_solver_drivers():
+    spec = importlib.util.spec_from_file_location("_timed_celeba_four_solver", ROOT / "scripts/celeba_four_solver_study.py")
+    celeba = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(celeba)
+    return celeba.shared, celeba
 
 
 def rows_for(scores=None, costs=None):
@@ -434,6 +446,223 @@ class FourSolverRuleTests(unittest.TestCase):
                 inputs.verify()
             with self.assertRaisesRegex(ValueError, "checksum"):
                 reporter.Inputs().read(path)
+
+    def test_cv_wall_history_follows_registered_order_and_audits_staged_attempt(self):
+        from supervised_nmf.study import _write_receipt
+
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            journal = run / "cv-timing"
+            index = journal / "attempts.index"
+            config = reporter.digest({"dataset": "CelebA"})
+            first = {"attempt_id": "a" * 32, "configuration_sha256": config, "previous_sha256": None,
+                     "state": "completed", "started_utc": "2999-01-01", "cv_wall_seconds_this_invocation": 3.}
+            second = {**first, "attempt_id": "b" * 32, "previous_sha256": reporter.digest(first),
+                      "state": "admitted", "started_utc": "2000-01-01", "cv_wall_seconds_this_invocation": 0.}
+            finished, staged = journal / (first["attempt_id"] + ".json"), journal / ".starting"
+            ids = [first["attempt_id"], second["attempt_id"]]
+            catalog = {"attempts": ids, "terminal_sha256": None}
+            _write_receipt(finished, first)
+            _write_receipt(staged, second)
+            _write_receipt(index, catalog)
+            inputs = reporter.Inputs()
+            self.assertEqual(reporter.cv_wall_history(run, config, inputs, []), [first, second])
+            self.assertEqual(set(inputs.hashes), {str(p.resolve()) for p in (index, finished, staged)})
+            with self.assertRaises(ValueError):
+                reporter.cv_wall_history(run, "another configuration", reporter.Inputs(), [])
+            _write_receipt(index, {**catalog, "attempts": ids + ids[-1:]})
+            with self.assertRaisesRegex(ValueError, "changed"):
+                inputs.verify()
+            with self.assertRaises(ValueError):
+                reporter.cv_wall_history(run, config, reporter.Inputs(), [])
+            _write_receipt(index, catalog)
+            duplicate = journal / "copy.json"
+            duplicate.write_bytes(finished.read_bytes())
+            with self.assertRaisesRegex(ValueError, "Unregistered"):
+                reporter.cv_wall_history(run, config, reporter.Inputs(), [])
+            duplicate.unlink()
+            staged.unlink()
+            with self.assertRaisesRegex(ValueError, "Missing registered"):
+                reporter.cv_wall_history(run, config, reporter.Inputs(), [])
+            index.unlink()
+            with self.assertRaisesRegex(ValueError, "Missing attempt index"):
+                reporter.cv_wall_history(run, config, reporter.Inputs(), [])
+
+    def test_cv_wall_history_handles_historical_archives_and_missing_timed_evidence(self):
+        from supervised_nmf.study import _write_receipt
+
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            configuration = receipt_fixture(run)
+            identity = reporter.digest(configuration)
+            self.assertEqual(reporter.cv_wall_history(run, identity, reporter.Inputs(), []), [])
+            _write_receipt(run / "executions" / "cv.json", {"configuration_sha256": identity, "mode": "cv",
+                           "cv": {"cv_wall_seconds_this_invocation": 2.}})
+            _, _, executions = reporter.load_dataset(run, "CelebA", reporter.Inputs())
+            with self.assertRaisesRegex(ValueError, "Missing CV timing history"):
+                reporter.cv_wall_history(run, identity, reporter.Inputs(), executions)
+            row = {"configuration_sha256": identity, "started_utc": "2025-01-01",
+                   "cv_wall_seconds_this_invocation": 2.}
+            _write_receipt(run / "cv-timing" / "old.json", row)
+            self.assertEqual(reporter.cv_wall_history(run, identity, reporter.Inputs(), executions), [row])
+            with self.assertRaisesRegex(ValueError, "Missing CV timing history"):
+                reporter.cv_wall_history(run, identity, reporter.Inputs(), executions + executions)
+            with self.assertRaisesRegex(ValueError, "another configuration"):
+                reporter.cv_wall_history(run, "another configuration", reporter.Inputs(), executions)
+
+    def test_both_cli_writers_bind_completed_cv_and_zero_work_replay_to_their_receipts(self):
+        from supervised_nmf import study
+
+        shared, celeba = four_solver_drivers()
+        configuration = {"sources": {}, "protocol": {"workers": 1}}
+        identity = reporter.digest(configuration)
+        for driver in (shared, celeba):
+            with self.subTest(driver=driver.__name__), tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+                run = Path(tmp) / "run"
+                argv = ["study", "--mode", "cv", "--output", str(run), "--protocol", "unused"]
+                stack.enter_context(patch.object(sys, "argv", argv))
+                stack.enter_context(patch.object(driver, "initialize", return_value=configuration))
+                check = stack.enter_context(patch.object(shared, "_check_source", side_effect=ValueError("before CV")))
+                # Rejection before CV admission creates a command record without a timing attempt.
+                with self.assertRaisesRegex(ValueError, "before CV"):
+                    driver.main()
+                def executions():
+                    return reporter.read_executions(run, identity, reporter.Inputs())
+                def history():
+                    return reporter.cv_wall_history(run, identity, reporter.Inputs(), executions())
+                self.assertEqual(history(), [])
+                check.side_effect = None
+                chunk = (str(run), {"job": {"id": "case"}}, {"id": "chunk", "grid": {}}, {})
+                work = stack.enter_context(patch.object(shared, "_protocol_cv_chunks", return_value=([chunk], [run / "chunk"])))
+                stack.enter_context(patch.object(shared, "_cv_work_pending", return_value=True))
+                stack.enter_context(patch.object(shared, "aggregate_cv", return_value={"state": "cv_completed", "missing_chunks": []}))
+                pool = stack.enter_context(patch.object(shared, "ProcessPoolExecutor"))
+                completed = Future()
+                completed.set_result({"job": "case", "chunk": "chunk", "valid_candidates": 1, "candidates": 1})
+                pool.return_value.__enter__.return_value.submit.return_value = completed
+                # Save the genuine in-flight version of each numbered receipt.
+                running = {}
+                write = study._write_receipt
+                def save(path, row):
+                    write(path, row)
+                    if path.suffix == ".json" and path.parent.name == "cv-timing" and row["state"] == "running":
+                        running[row["attempt_id"]] = path.read_bytes()
+                stack.enter_context(patch.object(study, "_write_receipt", side_effect=save))
+                driver.main()
+                index = run / "cv-timing" / "attempts.index"
+                original_index = index.read_bytes()
+                first, = history()
+                self.assertGreater(first["cv_wall_seconds_this_invocation"], 0.)
+                work.return_value = ([], [])
+                driver.main()
+                self.assertEqual(pool.call_count, 1)
+                first, replay = history()
+                self.assertEqual(replay["cv_wall_seconds_this_invocation"], 0.)
+                commands = {row["cv_timing_attempt_id"]: row for row in executions() if row["state"] == "completed"}
+                self.assertEqual(set(commands), {first["attempt_id"], replay["attempt_id"]})
+                for receipt in (first, replay):
+                    self.assertEqual(commands[receipt["attempt_id"]]["cv_timing_sha256"], reporter.digest(receipt))
+                with self.assertRaisesRegex(ValueError, "timing receipt"):
+                    reporter.cv_wall_history(Path(tmp) / "missing", identity, reporter.Inputs(), executions())
+                sibling = Path(tmp) / "sibling"
+                with study._cv_wall_attempt(sibling, identity, active=False, workers=1, native_threads=1):
+                    pass
+                with self.assertRaisesRegex(ValueError, "timing receipt"):
+                    reporter.cv_wall_history(sibling, identity, reporter.Inputs(), executions())
+                tail = index.parent / (replay["attempt_id"] + ".json")
+                tail.write_bytes(running[replay["attempt_id"]])
+                with self.assertRaises(ValueError):
+                    history()
+                tail.unlink()
+                index.write_bytes(original_index)
+                with self.assertRaisesRegex(ValueError, "timing receipt"):
+                    history()
+
+    def test_failed_commands_preserve_the_cv_phase_outcome_and_measured_wall(self):
+        from supervised_nmf import study
+
+        shared, celeba = four_solver_drivers()
+        configuration = {"sources": {}, "protocol": {"workers": 1}}
+        identity = reporter.digest(configuration)
+        for driver in (shared, celeba):
+            with self.subTest(driver=driver.__name__), tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+                run = Path(tmp) / "run"
+                argv = ["study", "--mode", "cv", "--output", str(run), "--protocol", "unused"]
+                stack.enter_context(patch.object(sys, "argv", argv))
+                stack.enter_context(patch.object(driver, "initialize", return_value=configuration))
+                stack.enter_context(patch.object(shared, "_check_source"))
+                chunks = stack.enter_context(patch.object(shared, "_protocol_cv_chunks", return_value=([], [])))
+                stack.enter_context(patch.object(shared, "_cv_work_pending", return_value=True))
+                aggregate = stack.enter_context(patch.object(shared, "aggregate_cv", return_value={
+                    "state": "cv_completed", "missing_chunks": []}))
+                pool = stack.enter_context(patch.object(shared, "ProcessPoolExecutor"))
+                submit = pool.return_value.__enter__.return_value.submit
+                driver.main()  # A genuine earlier, complete journal.
+                chunk = (str(run), {"job": {"id": "case"}}, {"id": "chunk", "grid": {}}, {})
+                chunks.return_value = ([chunk], [run / "chunk"])
+                cases = [("worker", RuntimeError("worker"), "failed", None),
+                         ("interrupt", KeyboardInterrupt(), "interrupted", None),
+                         ("interrupt-then-io", KeyboardInterrupt(), "interrupted", OSError("index publication")),
+                         ("worker-then-interrupt", RuntimeError("worker"), "failed", KeyboardInterrupt()),
+                         ("aggregate", ValueError("aggregate"), "completed", None)]
+                if driver is shared:
+                    cases.append(("evaluate", ValueError("evaluate"), "completed", None))
+                for stage, error, cv_state, index_error in cases:
+                    with self.subTest(stage=stage), ExitStack() as call:
+                        prior = Path(tmp) / stage
+                        shutil.copytree(run / "cv-timing", prior / "cv-timing")
+                        future = Future()
+                        if cv_state != "completed":
+                            future.set_exception(error)
+                        else:
+                            future.set_result({"job": "case", "chunk": "chunk", "valid_candidates": 1, "candidates": 1})
+                        submit.return_value = future
+                        aggregate.side_effect = error if stage == "aggregate" else None
+                        if stage == "evaluate":
+                            argv[2] = "all"
+                            stack.enter_context(patch.object(shared, "evaluate", side_effect=error))
+                        if index_error is not None:
+                            write_cv = study._write_receipt
+
+                            def fail_terminal_index(path, payload):
+                                if path.name == "attempts.index" and payload["terminal_sha256"] is not None:
+                                    raise index_error
+                                write_cv(path, payload)
+
+                            call.enter_context(patch.object(study, "_write_receipt", side_effect=fail_terminal_index))
+                        command_error = index_error or error
+                        with self.assertRaises(type(command_error)):
+                            driver.main()
+                        commands = reporter.read_executions(run, identity, reporter.Inputs())
+                        history = reporter.cv_wall_history(run, identity, reporter.Inputs(), commands)
+                        receipt = history[-1]
+                        command, = (c for c in commands if c["cv_timing_attempt_id"] == receipt["attempt_id"])
+                        self.assertEqual(command["state"], "interrupted" if isinstance(command_error, KeyboardInterrupt) else "failed")
+                        self.assertEqual(command["cv_timing_state"], cv_state)
+                        self.assertEqual(receipt["state"], cv_state)
+                        self.assertGreater(receipt["cv_wall_seconds_this_invocation"], 0.)
+                        self.assertEqual(command["cv_timing_sha256"], reporter.digest(receipt))
+                        if cv_state != "completed":
+                            with self.assertRaisesRegex(ValueError, "timing receipt"):
+                                reporter.cv_wall_history(run, identity, reporter.Inputs(), [{**command, "state": "completed"}])
+                        with self.assertRaisesRegex(ValueError, "timing receipt"):
+                            reporter.cv_wall_history(prior, identity, reporter.Inputs(), commands)
+
+                # A hard stop can leave only the initially published running command.
+                # The journal still includes a terminal CV attempt that has no independent witness.
+                write = driver._write_receipt
+                def stop_before_command_receipt(path, payload):
+                    if path.parent.name == "executions" and payload["state"] != "running":
+                        raise OSError("command receipt was not published")
+                    write(path, payload)
+                stack.enter_context(patch.object(driver, "_write_receipt", side_effect=stop_before_command_receipt))
+                with self.assertRaisesRegex(OSError, "not published"):
+                    driver.main()
+                commands = reporter.read_executions(run, identity, reporter.Inputs())
+                running, = (row for row in commands if row["state"] == "running")
+                self.assertNotIn("cv_timing_attempt_id", running)
+                attempts = reporter.cv_wall_history(run, identity, reporter.Inputs(), commands)
+                self.assertEqual(len(attempts), len(commands))
 
     def test_complete_receipt_graph_metrics_profiles_and_labels(self):
         with tempfile.TemporaryDirectory() as directory:

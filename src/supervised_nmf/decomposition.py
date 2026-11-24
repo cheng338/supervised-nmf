@@ -5,9 +5,10 @@ from numbers import Integral, Real
 import numpy as np
 from scipy.linalg.blas import dgemv, dger
 from scipy.optimize import nnls
-from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.base import BaseEstimator, ClassNamePrefixFeaturesOutMixin, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
 
+from ._feature_names import _check_input_features, _input_feature_names
 from .screening import _clear_fitted_attributes, _nonnegative_array
 from ._nnls import project_nnls
 from ._projection import project_rows, validate_projection_parameters
@@ -30,7 +31,7 @@ def _fit_basis(coordinates, X, maxiter):
     return np.ascontiguousarray(rows.T)
 
 
-class FeatureSPA(TransformerMixin, BaseEstimator):
+class FeatureSPA(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
     """Successive Projection Algorithm with feature columns as anchors.
 
     Rows are observations and columns are features. With ``normalize=True``,
@@ -143,6 +144,7 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
     def fit(self, X, y=None):
         _clear_fitted_attributes(self)
         self._projection_options()
+        feature_names = _input_feature_names(X)
         X = _nonnegative_array(X).astype(np.float64, copy=False)
         if isinstance(self.n_components, bool) or not isinstance(self.n_components, Integral) or not 1 <= self.n_components <= min(X.shape):
             raise ValueError("n_components must be an integer between 1 and min(n_samples, n_features).")
@@ -156,16 +158,36 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
             scales = X.sum(axis=0) if self.normalize else np.ones(X.shape[1])
         if not np.isfinite(scales).all():
             raise ValueError("Training column sums overflowed; rescale X before fitting SPA.")
-        scaled = np.divide(X, scales, out=np.zeros_like(X), where=scales > 0)
-        residual = scaled.copy()
-        initial_norm = np.linalg.norm(residual, axis=0).max()
+        # An underflow handler or a custom rank can edit X during selection.
+        # Keep normalized columns when revisiting all of them, or when
+        # retaining at most 32 KiB avoids another indexed division.
+        ordinary_selection = (type(self) is FeatureSPA and type(self.n_components) is int
+                              and np.geterr()["under"] == "ignore")
+        if not ordinary_selection or (
+            self.normalize and (X.size <= 4096 or self.n_components == X.shape[1])
+        ):
+            selection = np.divide(X, scales, out=np.zeros_like(X), where=scales > 0)
+            residual = selection.copy()
+        elif self.normalize:
+            selection = None
+            residual = np.zeros_like(X, order="C")
+            np.divide(X, scales, out=residual, where=scales > 0)
+        else:
+            selection = X
+            residual = X.copy(order="C")
+        norms = np.linalg.norm(residual, axis=0)
+        initial_norm = norms.max()
         if not np.isfinite(initial_norm) or initial_norm == 0:
+            del norms
             raise ValueError("SPA requires nonzero data with finite column norms.")
+        if not ordinary_selection:
+            del norms
         tolerance = np.finfo(np.float64).eps * max(X.shape) * initial_norm
         anchors = []
         directions = []
-        for _ in range(self.n_components):
-            norms = np.linalg.norm(residual, axis=0)
+        for pivot in range(self.n_components):
+            if pivot or not ordinary_selection:
+                norms = np.linalg.norm(residual, axis=0)
             norms[anchors] = -1
             index = int(np.argmax(norms))
             if norms[index] <= tolerance:
@@ -189,22 +211,30 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
             residual = dger(-1.0, projection, direction,
                             a=residual.T, overwrite_a=1).T
         anchors = np.asarray(anchors, dtype=int)
-        anchor_condition = float(np.linalg.cond(scaled[:, anchors]))
-        original_anchor_condition = float(np.linalg.cond(X[:, anchors]))
-        if max(anchor_condition, original_anchor_condition) > self.condition_limit:
-            raise ValueError("SPA anchors exceed condition_limit; reduce rank or examine feature scaling.")
-        # Anchor selection and its condition checks are finished. Release the
-        # full-size workspaces before allocating coordinates and fitting H;
-        # loop variables otherwise keep the final directions alive as well.
-        del scaled, residual, directions, direction, projection, norms
+        del residual, directions
+        if anchors.size:
+            del direction, projection, norms
         if len(anchors) > 1:
             del old_direction
+        if selection is None:
+            selected = X[:, anchors] / scales[anchors]
+        else:
+            selected = selection[:, anchors]
+        anchor_condition = float(np.linalg.cond(selected))
+        del selected
+        original_anchor_condition = (anchor_condition if selection is X
+                                     else float(np.linalg.cond(X[:, anchors])))
+        del selection
+        if max(anchor_condition, original_anchor_condition) > self.condition_limit:
+            raise ValueError("SPA anchors exceed condition_limit; reduce rank or examine feature scaling.")
         coordinates = X[:, anchors].copy()
         components = _fit_basis(coordinates, X, self.nnls_max_iter)
         basis_condition = float(np.linalg.cond(components))
         if not np.isfinite(basis_condition) or basis_condition > self.condition_limit:
             raise ValueError("Fitted SPA basis is rank deficient or exceeds condition_limit.")
         try:
+            if feature_names is not None:
+                self.feature_names_in_ = feature_names
             self.n_features_in_ = X.shape[1]
             self.n_samples_seen_ = X.shape[0]
             self.n_components_ = int(self.n_components)
@@ -221,6 +251,10 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
             _clear_fitted_attributes(self)
             raise
         return self
+
+    @property
+    def _n_features_out(self):
+        return self.n_components_
 
     def fit_transform(self, X, y=None, **fit_params):
         """Fit the basis, then project training observations by fixed-basis NNLS.
@@ -240,6 +274,7 @@ class FeatureSPA(TransformerMixin, BaseEstimator):
         stored anchor coordinates or their ``reconstruction_err_`` diagnostic.
         """
         check_is_fitted(self, "components_")
+        _check_input_features(self, X, reset=False)
         X = _nonnegative_array(X).astype(np.float64, copy=False)
         if X.shape[1] != self.n_features_in_:
             raise ValueError(

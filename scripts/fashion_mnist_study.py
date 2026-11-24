@@ -41,14 +41,16 @@ from threadpoolctl import threadpool_limits
 
 from supervised_nmf._identity import configuration_identity, implementation_sources
 from supervised_nmf.evaluation import (
-    _diagnostics, _digest, _jsonable, _nonconverged, _warning_records,
+    _SerialTimingError, _check_serial_workers, _diagnostics, _digest, _jsonable, _nonconverged,
+    _timing_study_lock, _warning_records,
     comparison_models, data_fingerprint, evaluate_classifier, provenance,
     refinement_diagnostics, write_json,
 )
 from supervised_nmf.screening import BinaryScreening
 from supervised_nmf.study import (
-    _checkpoint_lock, _initialized_provenance, _read_receipt, _runtime_identity as _calibration_runtime,
-    _write_receipt, calibration_knn_grid,
+    _calibration_knn_grid, _checkpoint_lock, _cv_wall_attempt, _cv_work_pending, _evaluation_cv_repairs, _frozen_study_cv,
+    _initialized_provenance, _protocol_cv_chunks, _read_receipt, _replay_frozen_cv, _runtime_identity as _calibration_runtime,
+    _seal_study_cv, _time_study_fit, _write_receipt, calibration_knn_grid,
 )
 import profile_celeba_stages as _profile_helper
 if (getattr(_profile_helper, "__file__", None) is None
@@ -213,24 +215,27 @@ def _dataset(protocol):
         raise ValueError("Dataset manifest must explicitly exclude official test data.")
     # Deliberately never enumerate/open official-test arrays.
     X = np.load(cache / "X_train.npy", mmap_mode="r", allow_pickle=False)
-    y = np.load(cache / "y_train.npy", allow_pickle=False)
-    if (X.shape != EXPECTED_SHAPE or X.dtype != np.float32 or not np.isfinite(X).all()
-            or X.min() < 0 or X.max() > 1 or y.shape != (len(X),) or y.dtype != np.uint8
-            or np.any(y > 9)):
-        raise ValueError("Expected official training pixels as float32 [0,1] and uint8 labels 0..9.")
-    identity = {"cache": str(cache), "manifest": manifest, "manifest_file_sha256": _file_hash(manifest_path),
-                "files_sha256": {name: _file_hash(cache / name) for name in ("X_train.npy", "y_train.npy")},
-                "shape": list(X.shape), "dtype": str(X.dtype), "class_counts": np.bincount(y, minlength=10).tolist()}
-    for name, array in (("X_train.npy", X), ("y_train.npy", y)):
-        record = manifest.get("arrays", {}).get(name, {})
-        if (record.get("sha256") != identity["files_sha256"][name]
-                or record.get("shape") != list(array.shape) or record.get("dtype") != str(array.dtype)):
-            raise ValueError("Training arrays differ from their manifest checksum, shape or dtype.")
-    if EXPECTED_SHAPE == (60000, 784) and identity["class_counts"] != [6000] * 10:
-        raise ValueError("Official Fashion-MNIST training must contain exactly 6,000 rows per class.")
-    if manifest.get("class_counts", identity["class_counts"]) != identity["class_counts"]:
-        raise ValueError("Training label counts differ from the manifest.")
-    return X, y, identity
+    try:
+        y = np.load(cache / "y_train.npy", allow_pickle=False)
+        if (X.shape != EXPECTED_SHAPE or X.dtype != np.float32 or not np.isfinite(X).all()
+                or X.min() < 0 or X.max() > 1 or y.shape != (len(X),) or y.dtype != np.uint8
+                or np.any(y > 9)):
+            raise ValueError("Expected official training pixels as float32 [0,1] and uint8 labels 0..9.")
+        identity = {"cache": str(cache), "manifest": manifest, "manifest_file_sha256": _file_hash(manifest_path),
+                    "files_sha256": {name: _file_hash(cache / name) for name in ("X_train.npy", "y_train.npy")},
+                    "shape": list(X.shape), "dtype": str(X.dtype), "class_counts": np.bincount(y, minlength=10).tolist()}
+        for name, shape, dtype in (("X_train.npy", X.shape, X.dtype), ("y_train.npy", y.shape, y.dtype)):
+            record = manifest.get("arrays", {}).get(name, {})
+            if (record.get("sha256") != identity["files_sha256"][name]
+                    or record.get("shape") != list(shape) or record.get("dtype") != str(dtype)):
+                raise ValueError("Training arrays differ from their manifest checksum, shape or dtype.")
+        if EXPECTED_SHAPE == (60000, 784) and identity["class_counts"] != [6000] * 10:
+            raise ValueError("Official Fashion-MNIST training must contain exactly 6,000 rows per class.")
+        if manifest.get("class_counts", identity["class_counts"]) != identity["class_counts"]:
+            raise ValueError("Training label counts differ from the manifest.")
+        return X, y, identity
+    finally:
+        del X
 
 
 def _save_arrays(path, X, y):
@@ -246,10 +251,25 @@ def _save_arrays(path, X, y):
             "shape": list(X.shape), "class_counts": np.bincount(y, minlength=2).tolist()}
 
 
-def _load_arrays(record):
+def _load_worker_array(path):
+    # NumPy can transfer the stream to a ZIP reader before archive parsing fails.
+    # Owning the stream here permits cache repair even with a live traceback.
+    with path.open("rb") as stream:
+        array = np.load(stream, allow_pickle=False)
+        if isinstance(array, np.lib.npyio.NpzFile):
+            array.close()
+            raise ValueError(f"Expected a single .npy array in {path.name}.")
+        return array
+
+
+def _load_arrays(record, *, mmap_mode="r"):
     filenames = record.get("filenames", {"X": "X.npy", "y": "y.npy"})
-    return (np.load(Path(record["path"]) / filenames["X"], mmap_mode="r", allow_pickle=False),
-            np.load(Path(record["path"]) / filenames["y"], allow_pickle=False))
+    directory = Path(record["path"])
+    if mmap_mode is None:
+        return (_load_worker_array(directory / filenames["X"]),
+                _load_worker_array(directory / filenames["y"]))
+    return (np.load(directory / filenames["X"], mmap_mode=mmap_mode, allow_pickle=False),
+            np.load(directory / filenames["y"], allow_pickle=False))
 
 
 def _verify_arrays(record):
@@ -407,17 +427,26 @@ def _estimator(job):
     return comparison_models(random_state=job["seed"], max_iter=job["max_iter"], tol=job["tol"])[job["method"]][0]
 
 
-def _worker(work):
+def _worker(work, *, reuse_only=False, _frozen_report=None):
     output, plan, chunk, sources = work
     _check_source(sources)
     job = plan["job"]
-    X, y = _load_arrays(job.get("training_array_record", {"path": job["cache"]}))
+    # A retained Windows worker error must allow replacing its training cache.
+    mode = None if os.name == "nt" else "r"
+    X, y = _load_arrays(job.get("training_array_record", {"path": job["cache"]}), mmap_mode=mode)
+    X.setflags(write=False)
     if data_fingerprint(X, y) != job["training_data_sha256"]:
         raise ValueError("Worker training data differ from the frozen configuration.")
     # Preserve this protocol's declared balanced-accuracy selection objective.
-    report = calibration_knn_grid(_estimator(job), chunk["grid"], X, y, cv=5, seed=job["seed"], threads=1,
-                                  scoring="balanced_accuracy",
-                                  checkpoint_dir=Path(output) / job["id"] / chunk["id"])
+    options = {"cv": 5, "seed": job["seed"], "threads": 1, "scoring": "balanced_accuracy",
+               "checkpoint_dir": Path(output) / job["id"] / chunk["id"]}
+    if reuse_only:
+        report = _calibration_knn_grid(_estimator(job), chunk["grid"], X, y, **options,
+                                       _reuse_only=True, _frozen_report=_frozen_report)
+        if report is None:
+            return None
+    else:
+        report = calibration_knn_grid(_estimator(job), chunk["grid"], X, y, **options)
     _check_source(sources)
     return {"job": job["id"], "chunk": chunk["id"], "valid_candidates": sum(row["valid"] for row in report["candidates"]),
             "candidates": len(report["candidates"]), "new_representation_fits": report["new_representation_fits"],
@@ -498,22 +527,47 @@ def aggregate_cv(output, configuration, *, require_complete=False):
     return result
 
 
-def run_cv(output, configuration, *, workers=None):
+def run_cv(output, configuration, *, workers=None, execution=None):
     workers = _integer(workers if workers is not None else configuration["protocol"].get("workers", 8), "workers", 1, 8)
     _check_source(configuration["sources"])
-    work = [(str(output), plan, chunk, configuration["sources"])
-            for plan in configuration["plans"] for chunk in plan["chunks"]
-            if not (Path(output) / plan["job"]["id"] / chunk["id"] / "report.json").exists()]
+    chunks, directories = _protocol_cv_chunks(output, configuration)
+    work = [item for item, directory in zip(chunks, directories) if not (directory / "report.json").exists()]
+    pins = _frozen_study_cv(output, configuration, directories)
     completed = []
     # Spawn prevents inheriting numerical threads/state. Each fit also enters native1.
-    with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) as executor:
-        futures = [executor.submit(_worker, item) for item in work]
-        for index, future in enumerate(as_completed(futures), 1):
-            result = future.result()
-            completed.append(result)
-            print(f"CV {index}/{len(work)} {result['job']} {result['chunk']} valid={result['valid_candidates']}/{result['candidates']}", flush=True)
+    attempt = _cv_wall_attempt(output, _digest(configuration),
+                               active=pins is None and bool(work) and _cv_work_pending(
+                                   (Path(output) / plan["job"]["id"] / chunk["id"] for _, plan, chunk, _ in work),
+                                   (chunk["grid"] for _, _, chunk, _ in work)),
+                               preexisting_work=any(path.exists() for path in directories),
+                               workers=workers, native_threads=1)
+    cv_timing = None
+    try:
+        with attempt as cv_timing:
+            if pins is not None:
+                repairs, repair_pins = _evaluation_cv_repairs(chunks, directories, pins)
+                for _ in _replay_frozen_cv(repairs, repair_pins, _worker, workers):
+                    pass
+            elif work:
+                with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) as executor:
+                    futures = [executor.submit(_worker, item) for item in work]
+                    for index, future in enumerate(as_completed(futures), 1):
+                        result = future.result()
+                        completed.append(result)
+                        print(f"CV {index}/{len(work)} {result['job']} {result['chunk']} valid={result['valid_candidates']}/{result['candidates']}", flush=True)
+    finally:
+        # A worker failure can close a measured interval. Aggregation or evaluation
+        # can also fail later, after CV has completed.
+        if cv_timing is not None and "finished_utc" in cv_timing:
+            timing = {"cv_timing_attempt_id": cv_timing["attempt_id"], "cv_timing_sha256": _digest(cv_timing),
+                      "cv_timing_state": cv_timing["state"],
+                      "cv_wall_seconds_this_invocation": cv_timing["cv_wall_seconds_this_invocation"],
+                      "cv_wall_seconds_cumulative": cv_timing["cv_wall_seconds_cumulative"]}
+            if execution is not None:
+                execution["cv"] = timing
     summary = aggregate_cv(output, configuration)
-    return {"state": summary["state"], "completed_chunks_this_call": len(completed), "missing_chunks": summary["missing_chunks"]}
+    return {**timing, "state": summary["state"], "completed_chunks_this_call": len(completed),
+            "missing_chunks": summary["missing_chunks"]}
 
 
 def _profile_medians(records):
@@ -530,29 +584,29 @@ def _profile(estimator, X, y, Xv, yv, *, reference, sample_ids):
     """Extend unchanged stage instrumentation to the two experimental pipelines."""
     if not (isinstance(estimator, Pipeline) and "nmf" in estimator.named_steps):
         return profile_selected_estimator(estimator, X, y, Xv, yv, reference=reference, sample_ids=sample_ids)
+    _check_serial_workers(estimator)
     capture_transform_diagnostics = _experimental_module().capture_transform_diagnostics
     model, caught, projection = clone(estimator), [], None
     record = {"status": "failed", "exact_prediction_match": False,
               "timing": {"total_fit_seconds": None, "prediction_seconds": None}, "evaluation": None}
-    with threadpool_limits(limits=1), _StageProfiler() as meter:
+    with _StageProfiler() as meter:
         decomposition_type = type(estimator.named_steps["nmf"])
         if decomposition_type is not NMF:
             meter._wrap(decomposition_type, "fit_transform", {"fit": "decomposition_fit_seconds"})
         meter._wrap(decomposition_type, "transform", {"fit": "training_projection_seconds",
                                                      "prediction": "decomposition_projection_seconds"})
-        start = time.perf_counter()
         try:
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
-                model.fit(X, y)
-            record["timing"]["total_fit_seconds"] = time.perf_counter() - start
+                _time_study_fit(model, X, y, record, profile=True)
             record["diagnostics"] = _model_diagnostics(model)
             if _model_nonconverged(model, caught):
                 record["status"] = "nonconverged"
             else:
                 meter.phase = "prediction"
                 with capture_transform_diagnostics(model.named_steps["nmf"]) as projection:
-                    reproduced = evaluate_classifier(model, Xv, yv, threads=1, sample_ids=sample_ids)
+                    reproduced = evaluate_classifier(model, Xv, yv, threads=1, sample_ids=sample_ids,
+                        _serial_timing=record.setdefault("prediction_execution", {}))
                 record["evaluation"] = reproduced
                 if projection is None:
                     record["diagnostics"] = _model_diagnostics(model)
@@ -562,13 +616,13 @@ def _profile(estimator, X, y, Xv, yv, *, reference, sample_ids):
                 record["exact_prediction_match"] = comparison["exact_match"]
                 record["status"] = ("valid" if reproduced["status"] == "valid" and comparison["exact_match"]
                                     and not _model_nonconverged(model, [], projection, query=True) else "invalid_reproduction")
+        except _SerialTimingError:
+            raise
         except Exception as error:
             record.update(status="failed", error_type=type(error).__name__, error=str(error))
         finally:
             if projection is not None:
                 record["diagnostics"] = _model_diagnostics(model, projection)
-            if record["timing"]["total_fit_seconds"] is None:
-                record["timing"]["total_fit_seconds"] = time.perf_counter() - start
             record["fit_warnings"] = _warning_records(caught)
             record["timing"].update(meter.seconds)
             record["stage_calls"] = meter.calls
@@ -658,10 +712,21 @@ def _training_stationarity(model, X):
                 "diagnostic_seconds": time.perf_counter() - started}
 
 
-def evaluate(output, configuration):
+def _verified_evaluation_cv(output, configuration):
+    chunks, directories = _protocol_cv_chunks(output, configuration)
+    pins = _frozen_study_cv(output, configuration, directories)
+    repairs, repair_pins = _evaluation_cv_repairs(chunks, directories, pins)
+    for _ in _replay_frozen_cv(repairs, repair_pins, _worker, 1):
+        pass
+    cv = aggregate_cv(output, configuration, require_complete=True)
+    _seal_study_cv(output, configuration, directories)
+    return cv
+
+
+def evaluate(output, configuration, *, _cv=None):
     capture_transform_diagnostics = _experimental_module().capture_transform_diagnostics
     output = Path(output)
-    cv = aggregate_cv(output, configuration, require_complete=True)
+    cv = _verified_evaluation_cv(output, configuration) if _cv is None else _cv
     # Freeze exact CV evidence before any validation scoring, including resume.
     gate = {"configuration_sha256": _digest(configuration), "cv_sha256": _digest(cv),
             "evaluation_order": configuration["evaluation_order"], "all_cv_completed": True}
@@ -703,6 +768,7 @@ def evaluate(output, configuration):
             X, y = _load_arrays(configuration["arrays"][job["array_key"]])
             Xv, yv = _load_arrays(validation)
             template = _estimator(job).set_params(**selected["selected_parameters"])
+            _check_serial_workers(template)
             original_path = output / job_id / "original-evaluation.json"
             with threadpool_limits(limits=1):
                 if original_path.exists():
@@ -711,12 +777,10 @@ def evaluate(output, configuration):
                         raise ValueError("Saved original selected fit identity differs.")
                 else:
                     model, caught, projection = clone(template), [], None
-                    start = time.perf_counter()
                     try:
                         with warnings.catch_warnings(record=True) as caught:
                             warnings.simplefilter("always")
-                            model.fit(X, y)
-                        result["final_fit_seconds"] = time.perf_counter() - start
+                            _time_study_fit(model, X, y, result)
                         result["diagnostics"] = _model_diagnostics(model)
                         result["training_stationarity"] = _training_stationarity(model, X)
                         if _model_nonconverged(model, caught):
@@ -724,18 +788,19 @@ def evaluate(output, configuration):
                         else:
                             decomposition = model.named_steps.get("nmf") if isinstance(model, Pipeline) else None
                             with capture_transform_diagnostics(decomposition) as projection:
-                                result["evaluation"] = evaluate_classifier(model, Xv, yv, threads=1, sample_ids=ids)
+                                result["evaluation"] = evaluate_classifier(model, Xv, yv, threads=1, sample_ids=ids,
+                                    _serial_timing=result.setdefault("prediction_execution", {}))
                         if projection is None:
                             result["diagnostics"] = _model_diagnostics(model)
                         if result["evaluation"]["status"] == "valid" and _model_nonconverged(model, [], projection, query=True):
                             result["evaluation"]["status"] = "provisional_nonconvergence"
+                    except _SerialTimingError:
+                        raise
                     except Exception as error:
                         result["evaluation"] = {"status": "failed", "error_type": type(error).__name__, "error": str(error)}
                     finally:
                         if projection is not None:
                             result["diagnostics"] = _model_diagnostics(model, projection)
-                        if result["final_fit_seconds"] is None:
-                            result["final_fit_seconds"] = time.perf_counter() - start
                         result["final_fit_warnings"] = _warning_records(caught)
                     _check_source(configuration["sources"])
                     _write_receipt(original_path, result)
@@ -782,7 +847,7 @@ def main():
     parser.add_argument("--workers", type=int)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    with _checkpoint_lock(args.output):
+    with _timing_study_lock(), _checkpoint_lock(args.output):
         configuration = initialize(args.protocol, args.output)
         attempt_path = args.output / "executions" / f"{uuid.uuid4().hex}.json"
         start = time.perf_counter()
@@ -793,7 +858,7 @@ def main():
         _write_receipt(attempt_path, attempt)
         try:
             if args.mode in {"cv", "all"}:
-                attempt["cv"] = run_cv(args.output, configuration, workers=args.workers)
+                attempt["cv"] = run_cv(args.output, configuration, workers=args.workers, execution=attempt)
             if args.mode in {"evaluate", "all"}:
                 attempt["evaluation"] = evaluate(args.output, configuration)
             attempt["state"] = "completed"

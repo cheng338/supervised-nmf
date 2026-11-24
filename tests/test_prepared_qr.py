@@ -3,6 +3,7 @@ from copy import copy, deepcopy
 import gc
 import os
 import pickle
+import sys
 import warnings
 import weakref
 
@@ -17,6 +18,7 @@ from tests._prepared_qr_support import (
 )
 
 
+@pytest.mark.parametrize("qr_state", ["cold"], indirect=True)
 def test_repeated_projection_reuses_only_qualified_preparation(qr_state):
     owner, query, known = problem()
     model = fixed_model(owner)
@@ -24,21 +26,29 @@ def test_repeated_projection_reuses_only_qualified_preparation(qr_state):
     with observed_calls() as cold:
         first = model.transform(query)
     entry = _projection._qr_registry_get(owner)
-    assert (entry is not None) is qr_state
-    assert cold['qr'] == 1
+    first_publish = qr_state and sys.platform == "linux"
+    assert (entry is not None) is first_publish
+    assert cold['qr'] == 1 and cold['publish'] == int(first_publish)
     with observed_calls() as warm:
         second = model.transform(query)
-    assert warm['qr'] == int(not qr_state)
+    assert warm['qr'] == int(not first_publish)
+    assert warm['publish'] == int(qr_state and not first_publish)
+    second_entry = _projection._qr_registry_get(owner)
+    assert (second_entry is not None) is qr_state
+    if first_publish:
+        assert second_entry is entry
     assert_coordinates(first, known)
     np.testing.assert_array_equal(first, second)
     assert not np.shares_memory(first, second)
     assert not np.shares_memory(first, owner) and not np.shares_memory(first, query)
     first[:] = -123
-    assert_coordinates(model.transform(query), known)
+    with observed_calls() as third:
+        assert_coordinates(model.transform(query), known)
+    assert third['qr'] == int(not qr_state) and third['publish'] == 0
     assert pickle.dumps(model) == before
-    if entry is not None:
-        assert _projection._qr_registry_get(owner) is entry
-        for factor in entry.factors():
+    if second_entry is not None:
+        assert _projection._qr_registry_get(owner) is second_entry
+        for factor in second_entry.factors():
             assert not factor.flags.writeable
             with pytest.raises(ValueError):
                 factor.flat[0] = 0
@@ -175,6 +185,108 @@ def test_required_solve_error_does_not_publish_partial_preparation(qr_state, mon
     assert (_projection._qr_registry_get(owner) is not None) is qr_state
 
 
+@pytest.mark.parametrize("controller", ["MKLController", "OpenMPController"])
+@pytest.mark.parametrize("field", ["user_api", "internal_api"])
+def test_changed_api_field_preserves_required_callbacks(qr_state, monkeypatch, controller, field):
+    owner, query, known = problem()
+    model = fixed_model(owner)
+    cls = getattr(threadpoolctl, controller, None)
+    original = getattr(cls, field, None)
+    active = type(original) is str and any(
+        type(lib) is cls for lib in getattr(_projection._controller, "lib_controllers", ()))
+
+    class FieldWarning(UserWarning):
+        pass
+
+    def read(self):
+        warnings.warn(field, FieldWarning)
+        return original
+
+    def observed(call, *args):
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always")
+            assert_coordinates(call(*args), known)
+        return [(w.category, str(w.message)) for w in seen]
+
+    with monkeypatch.context() as patch:
+        if type(original) is str:
+            patch.setattr(cls, field, property(read))
+        required = observed(_projection._project_block, np.ascontiguousarray(owner.T), query,
+                            "qr", model.nnls_max_iter, model.projection_batch_size, 1)
+        assert ((FieldWarning, field) in required) is active
+        assert observed(model.transform, query) == required
+        if active:
+            assert _projection._qr_registry_get(owner) is None
+    assert_coordinates(model.transform(query), known)
+    assert (_projection._qr_registry_get(owner) is not None) is qr_state
+    with observed_calls() as warm:
+        assert_coordinates(model.transform(query), known)
+    assert warm["qr"] == int(not qr_state)
+
+
+@pytest.mark.parametrize("handle_owner", ["MKLController", "OpenMPController", "LibController"])
+def test_replaced_dynlib_getter_preserves_required_reads(qr_state, monkeypatch, handle_owner):
+    owner, query, known = problem()
+    model = fixed_model(owner)
+    assert_coordinates(model.transform(query), known)
+    cls = getattr(threadpoolctl, handle_owner, None)
+    if cls is None or not any(isinstance(lib, cls) for lib in _projection._controller.lib_controllers):
+        pytest.skip(f"No active {handle_owner} on this backend")
+    reads = []
+
+    def read(lib):
+        reads.append(id(lib))
+        return vars(lib)["dynlib"]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cls, "dynlib", property(read), raising=False)
+        required = _projection._project_block(
+            np.ascontiguousarray(owner.T), query, "qr", model.nnls_max_iter,
+            model.projection_batch_size, model.projection_native_threads)
+        assert_coordinates(required, known)
+        required_reads = reads.copy()
+        if qr_state:
+            assert required_reads
+        reads.clear()
+        with observed_calls() as changed:
+            assert_coordinates(model.transform(query), known)
+        assert reads == required_reads
+        assert changed["qr"] == 1
+
+    with observed_calls() as restored:
+        assert_coordinates(model.transform(query), known)
+    assert restored["qr"] == int(not qr_state)
+
+
+@pytest.mark.parametrize("change", ["class-string", "instance-shadow"])
+def test_changed_api_metadata_declines_preparation(qr_state, monkeypatch, change):
+    owner, query, known = problem()
+    model = fixed_model(owner)
+    with monkeypatch.context() as patch:
+        if qr_state:
+            cls = threadpoolctl.MKLController
+            if change == "class-string":
+                patch.setattr(cls, "internal_api", "custom-mkl")
+            else:
+                # Shadow the field on one library with its stock value. Every
+                # public inventory field still compares equal to the original.
+                mkl = next(lib for lib in _projection._controller.lib_controllers
+                           if type(lib) is cls)
+                patch.setitem(vars(mkl), "user_api", cls.user_api)
+        with observed_calls() as changed:
+            assert_coordinates(model.transform(query), known)
+        assert changed["qr"] == 1 and changed["publish"] == 0
+        assert _projection._qr_registry_get(owner) is None
+
+    with observed_calls() as restored:
+        assert_coordinates(model.transform(query), known)
+    assert restored["qr"] == 1 and restored["publish"] == int(qr_state)
+    assert (_projection._qr_registry_get(owner) is not None) is qr_state
+    with observed_calls() as warm:
+        assert_coordinates(model.transform(query), known)
+    assert warm["qr"] == int(not qr_state) and warm["publish"] == 0
+
+
 @pytest.mark.parametrize('control', ['below_geometry', 'short_query', 'small_cap', 'auto'])
 def test_ineligible_controls_do_not_inspect_provider_or_cache(qr_state, control):
     owner, query, _ = problem(features=256 if control == 'below_geometry' else 1024)
@@ -258,7 +370,7 @@ def test_unsupported_runtime_state_declines_without_optional_callbacks(qr_state,
             class UnknownController:
                 def __init__(self, *args, **kwargs):
                     forbidden()
-            patch.setattr(threadpoolctl, '_ALL_CONTROLLERS', [UnknownController])
+            patch.setattr(threadpoolctl, '_ALL_CONTROLLERS', [UnknownController], raising=False)
         else:
             patch.setattr(threadpoolctl.ThreadpoolController, 'info', property(forbidden))
         assert _projection._qr_mkl_controller() is None

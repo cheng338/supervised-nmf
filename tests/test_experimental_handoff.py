@@ -1,21 +1,21 @@
 """Successful H solves may supply the outer residual and H gradient.
 
-Natural-fit checks observe original arithmetic without replacing its selector.
-The terminal-state tests deliberately enter the final NNLS qualification at a
-controlled seam: their extreme values are not claims of full-solver reachability.
+Natural fits use the original selector. A separate fit counts logical products
+at the selected backend and its output workspaces while running their arithmetic.
+Terminal replay tests run a bound NNLS solve with controlled passive-set
+proposals. The reconstruction-overflow case also changes its basis at that point.
 No historical solver copy, benchmark timer, or installed backend mock is used.
 """
 
-import ast
 from collections import Counter
 from contextlib import contextmanager
-import copy
 import gc
 import inspect
 import math
 from pathlib import Path
 import struct
 import sys
+from traceback import walk_tb
 import warnings
 import weakref
 
@@ -30,7 +30,6 @@ import experimental_nmf as experimental
 
 
 assert Path(experimental.__file__).resolve() == ROOT / "scripts" / "experimental_nmf.py"
-TREE = ast.parse(Path(experimental.__file__).read_text(encoding="utf-8"))
 FIT = inspect.unwrap(experimental.ANLSBPP.fit_transform).__code__
 CORE = experimental._nnls_block_pivot.__code__
 DEFAULT_POLICY = dict(divide="warn", over="warn", under="ignore", invalid="warn")
@@ -40,7 +39,6 @@ DEFAULT_POLICY = dict(divide="warn", over="warn", under="ignore", invalid="warn"
 def isolated_observation_state():
     policy, callback = np.geterr(), np.geterrcall()
     profile, trace = sys.getprofile(), sys.gettrace()
-    assert profile is None and trace is None
     with threadpool_limits(limits=1):
         try:
             yield
@@ -49,8 +47,15 @@ def isolated_observation_state():
         finally:
             np.seterr(**policy)
             np.seterrcall(callback)
-            sys.setprofile(profile)
-            sys.settrace(trace)
+            if sys.getprofile() is not profile:
+                sys.setprofile(profile)
+            if sys.gettrace() is not trace:
+                sys.settrace(trace)
+
+
+@pytest.fixture
+def idle_profiler():
+    assert sys.getprofile() is None, "The handoff observer requires an idle profile hook."
 
 
 def _snapshot(value):
@@ -83,110 +88,179 @@ def _fit_result(data, rank, observer=None):
             [(item.category, str(item.message)) for item in caught])
 
 
-def _fit_product_lines():
-    """Executed source routes, not claimed native-BLAS event instrumentation."""
-    fit = next(node for node in ast.walk(TREE)
-               if isinstance(node, ast.FunctionDef) and node.name == "fit_transform")
-    names = {"outer_reconstruction", "outer_gradient_w", "outer_gradient_h"}
-    lines = {}
-    for node in ast.walk(fit):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in names:
-            lines.setdefault(node.lineno, []).append(node.func.id)
-    return lines
+def _positional_arg(frame, index):
+    return frame.f_locals[frame.f_code.co_varnames[index]]
 
 
 class _FitObserver:
-    def __init__(self, fault=None):
-        self.lines = _fit_product_lines()
-        self.routes = Counter()
-        self.takes = self.objective_reuses = self.gradient_reuses = 0
-        self.usability_calls = self.fired = self.post_gradient_checkpoint = 0
+    def __init__(self, data, rank, fault=None, *, count_products=False):
+        rows, columns = data.shape
+        self.target = weakref.ref(data)
+        self.product_shapes = {
+            ((rows, rank), (rank, columns)): "reconstruction",
+            ((rows, columns), (columns, rank)): "W gradient",
+            ((rank, rows), (rows, columns)): "H gradient",
+        }
+        self.count_products = count_products
+        self.products = Counter()
+        self.after_pg = Counter()
+        self.active_counts = None
+        self.takes = self.gradient_reuses = 0
+        self.objective_inputs = []
+        self.usability_calls = self.fired = 0
         self.roles, self.arrays = [], []
+        self.offer_writes = 0
         self.last_residual = self.last_gradient = None
-        self.target = None
+        self.check_objective_inputs = False
+        self.producer_role = None
         self.tail_calls = 0
         self.fault = fault
         self.error = (RuntimeError("required projected-gradient sentinel")
                       if fault == "required-pg" else MemoryError("handoff allocation sentinel"))
-        core = next(node for node in TREE.body
-                    if isinstance(node, ast.FunctionDef) and node.name == "_nnls_block_pivot")
-        publications = [node for node in ast.walk(core) if isinstance(node, ast.Assign)
-                        and isinstance(node.value, ast.Tuple)
-                        and any(isinstance(target, ast.Attribute) and target.attr == "_handoff"
-                                for target in node.targets)]
-        assert len(publications) == 1
-        self.publication_line = publications[0].lineno
-        fit = next(node for node in ast.walk(TREE)
-                   if isinstance(node, ast.FunctionDef) and node.name == "fit_transform")
-        self.objective_line = next(node.lineno for node in ast.walk(fit)
-            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name)
-                and target.id == "objective" for target in node.targets))
 
     def _raise(self):
         assert self.fired == 0
         self.fired = 1
         raise self.error
 
-    def trace(self, frame, event, arg):
-        if frame.f_code is FIT:
-            if event == "line":
-                self.routes.update(self.lines.get(frame.f_lineno, ()))
-            return self.trace
-        if self.fault == "optional-publication" and frame.f_code is CORE:
-            if event == "line" and frame.f_lineno == self.publication_line and not self.fired:
-                self._raise()
-            return self.trace
-        return None
+    def holds_taken_products(self, value):
+        """Recognize the full offer by the arrays actually returned to this fit."""
+        return (type(value) is tuple and len(value) == 5
+                and value[2] is not None and value[3] is not None
+                and self.last_residual is not None and self.last_gradient is not None
+                and value[2] is self.last_residual() and value[3] is self.last_gradient())
+
+    def _observe_products(self, patch):
+        """Count logical products, including direct and workspace dispatch."""
+        selector = experimental.nnls_matmul
+        backend = selector()
+        make_workspace = experimental.make_output_workspace
+
+        def counted(operation):
+            def product(left, right, *args, **kwargs):
+                if self.active_counts is not None:
+                    kind = self.product_shapes.get((left.shape, right.shape))
+                    if kind is not None:
+                        self.active_counts[kind] += 1
+                return operation(left, right, *args, **kwargs)
+            return product
+
+        observed = counted(backend)
+
+        def select():
+            assert selector() is backend
+            return observed
+
+        def workspace(operation):
+            assert operation is observed
+            original = make_workspace(backend)
+            if original is backend:
+                return observed
+            product = counted(original)
+            product.clear = original.clear
+            return product
+
+        # Keep this instrumented fit on the same identity-gated route. The
+        # independent natural fit exercises the unmodified identities as well.
+        if backend is experimental.padded_matmul:
+            patch.setattr(experimental, "padded_matmul", observed)
+            patch.setattr(experimental, "_HANDOFF_PADDED", observed)
+        else:
+            assert backend is np.matmul
+            patch.setattr(experimental, "_HANDOFF_MATMUL", observed)
+        patch.setattr(experimental, "nnls_matmul", select)
+        patch.setattr(experimental, "make_output_workspace", workspace)
+
+    def _inject_optional_fault(self, patch):
+        if self.fault in ("offer-preparation", "optional-publication"):
+            role_type = experimental._FixedTrainingRHS
+            store = role_type.__setattr__
+
+            def publish(role, name, value):
+                if (name == "_handoff" and value is not None and self.producer_role is not None
+                        and role is self.producer_role()):
+                    self.offer_writes += 1
+                    if self.fault == "optional-publication" and not self.fired:
+                        assert self.tail_calls == 1
+                        assert value[2] is self.arrays[0]() and value[3] is self.arrays[1]()
+                        self._raise()
+                store(role, name, value)
+
+            patch.setattr(role_type, "__setattr__", publish)
+        elif self.fault in ("optional-take", "optional-consumer"):
+            usable = experimental._handoff_usable
+            signature = inspect.signature(usable)
+            after_take = int(self.fault == "optional-consumer")
+
+            def check(*args, **kwargs):
+                if self.takes == after_take and not self.fired:
+                    payload, role, *_ = signature.bind(*args, **kwargs).arguments.values()
+                    assert role is self.producer_role() and role._handoff is None
+                    assert self.tail_calls == 1 and payload is not None
+                    assert payload[2] is self.arrays[0]() and payload[3] is self.arrays[1]()
+                    assert usable(*args, **kwargs)
+                    if after_take:
+                        assert self.products == {"W gradient": 1}
+                        assert self.objective_inputs == [True]
+                        assert self.holds_taken_products(payload) and np.geterr() == payload[4]
+                    self._raise()
+                return usable(*args, **kwargs)
+
+            patch.setattr(experimental, "_handoff_usable", check)
 
     def profile(self, frame, event, arg):
         if event == "return" and frame.f_code is experimental._FixedTrainingRHS.__init__.__code__:
-            self.roles.append(weakref.ref(frame.f_locals["self"]))
+            self.roles.append(weakref.ref(_positional_arg(frame, 0)))
+        if event == "call" and frame.f_code is experimental._FixedTrainingRHS.solve.__code__:
+            role = _positional_arg(frame, 0)
+            if role._targets is self.target():
+                self.producer_role = weakref.ref(role)
         if event == "return" and frame.f_code is experimental._nnls_final_state.__code__ and type(arg) is tuple:
-            role = frame.f_back.f_locals["cross_rhs"]
-            assert role._handoff_enabled and role._targets is self.target()
+            assert _positional_arg(frame, 2) is self.producer_role()._targets
             self.tail_calls += 1
             self.arrays.extend(weakref.ref(value) for value in arg[2:])
+        if (event == "return" and frame.f_code is CORE and arg is not None
+                and _positional_arg(frame, 1) is self.target() and arg[1]["success"]):
+            self.active_counts = self.products
         if event == "return" and frame.f_code is experimental._take_handoff.__code__ and arg is not None:
             self.takes += 1
+            self.check_objective_inputs = True
+            assert self.tail_calls == 1 and arg[2] is self.arrays[0]()
+            assert arg[3] is None or arg[3] is self.arrays[1]()
             self.last_residual = weakref.ref(arg[2])
             self.last_gradient = None if arg[3] is None else weakref.ref(arg[3])
         if event != "call":
             return
+        if (self.fault == "offer-preparation" and frame.f_code is np.geterr.__code__
+                and self.tail_calls and self.active_counts is None and not self.offer_writes):
+            self._raise()
         if frame.f_code is experimental._handoff_usable.__code__:
             self.usability_calls += 1
-            if self.fault == "optional-take" and self.usability_calls == 1:
+        if self.check_objective_inputs and frame.f_code is experimental.linalg.norm.__code__:
+            used_residual = _positional_arg(frame, 0) is self.last_residual()
+            self.objective_inputs.append(used_residual)
+            if self.fault == "required-objective-norm" and used_residual:
                 self._raise()
-            if self.fault == "optional-consumer" and self.usability_calls == 2:
-                caller = frame.f_back
-                assert caller.f_code is FIT and caller.f_locals["_w_quiet"] is True
-                assert caller.f_locals["_handoff"] is frame.f_locals["payload"]
-                self.post_gradient_checkpoint += 1
-                self._raise()
-        caller = frame.f_back
-        if caller is None or caller.f_code is not FIT:
-            return
-        if frame.f_code is experimental.linalg.norm.__code__:
-            if (caller.f_lineno == self.objective_line and self.last_residual is not None
-                    and caller.f_locals.get("residual") is self.last_residual()):
-                self.objective_reuses += 1
-                if self.fault == "required-objective-norm":
-                    self._raise()
-        if frame.f_code is experimental._pg_values.__code__ and "iteration" in caller.f_locals:
-            if self.last_gradient is not None and frame.f_locals["grad_H"] is self.last_gradient():
+        if frame.f_code is experimental._pg_values.__code__:
+            if self.active_counts is self.products:
+                self.active_counts = self.after_pg
+            self.check_objective_inputs = False
+            if self.last_gradient is not None and _positional_arg(frame, 3) is self.last_gradient():
                 self.gradient_reuses += 1
-            if self.fault == "required-pg":
+            if self.fault == "required-pg" and self.takes:
                 self._raise()
 
     @contextmanager
     def active(self):
-        assert sys.getprofile() is None and sys.gettrace() is None
-        try:
-            sys.setprofile(self.profile)
-            sys.settrace(self.trace)
-            yield
-        finally:
-            sys.setprofile(None)
-            sys.settrace(None)
+        with pytest.MonkeyPatch.context() as patch:
+            if self.count_products:
+                self._observe_products(patch)
+            self._inject_optional_fault(patch)
+            try:
+                sys.setprofile(self.profile)
+                yield
+            finally:
+                sys.setprofile(None)
 
     def assert_released(self):
         assert all(ref() is None or ref()._handoff is None for ref in self.roles)
@@ -194,6 +268,7 @@ class _FitObserver:
         assert all(ref() is None for ref in self.arrays)
 
 
+@pytest.mark.usefixtures("idle_profiler")
 @pytest.mark.parametrize("shape,rank,bypass,residual_only", [
     ((127, 129), 1, True, False),   # 16383 elements
     ((128, 128), 1, True, False),   # inclusive 16384 boundary
@@ -209,26 +284,30 @@ def test_fit_reuses_only_qualified_products_and_matches_ordinary_route(
     operation = experimental.nnls_matmul()
     admitted = not bypass and (rank == 1 or (
         operation is experimental.padded_matmul and (shape[0] % 8 != 0 or shape[1] % 8 != 0)))
-    observer = _FitObserver()
-    observer.target = weakref.ref(data)
-    optimized = _fit_result(data, rank, observer)
-    observer.assert_released()
-    # This is a declared ordinary-arithmetic reference, not a supported public
-    # runtime-replacement contract. The natural route above used original math.
     with monkeypatch.context() as context:
-        context.setattr(experimental, "_handoff_producer", lambda *args: False)
+        context.setattr(experimental, "_handoff_producer", lambda *args, **kwargs: False)
         ordinary = _fit_result(data, rank)
-    assert optimized == ordinary
-    assert observer.tail_calls == observer.takes == observer.objective_reuses == int(admitted)
     joint = admitted and not residual_only
-    assert observer.gradient_reuses == int(joint)
-    assert observer.routes["outer_reconstruction"] == int(not admitted)
-    assert observer.routes["outer_gradient_w"] == 1
-    assert observer.routes["outer_gradient_h"] == int(not joint)
-    if bypass:
-        assert observer.usability_calls == 0
-    elif joint:
-        assert observer.usability_calls == 2
+    for count_products in (False, True):
+        observer = _FitObserver(data, rank, count_products=count_products)
+        assert _fit_result(data, rank, observer) == ordinary
+        observer.assert_released()
+        assert observer.tail_calls == observer.takes == int(admitted)
+        assert observer.objective_inputs == ([True] if admitted else [])
+        assert observer.gradient_reuses == int(joint)
+        if bypass:
+            assert observer.usability_calls == 0
+        elif joint:
+            assert observer.usability_calls == 2
+        if count_products:
+            expected_products = Counter({"W gradient": 1})
+            if not admitted:
+                expected_products["reconstruction"] = 1
+            if not joint:
+                expected_products["H gradient"] = 1
+            assert observer.products == expected_products
+            # A completed fit may reconstruct once to report its final error.
+            assert observer.after_pg <= Counter({"reconstruction": 1})
 
 
 def _payload():
@@ -336,56 +415,44 @@ def test_public_nnls_is_two_results_and_owned_role_clears_offer_on_next_solve():
     assert role._handoff is None
 
 
-TAIL_ARGUMENTS = ("matmul", "A", "B", "coefficients", "pending", "gradient_scale", "tol",
-                  "iterations", "cap", "solves", "direct_solves", "backups", "cross_rhs")
-
-
-def _terminal_seam():
-    """Execute the actual core's final qualification/replay, with explicit locals."""
-    core = next(node for node in TREE.body
-                if isinstance(node, ast.FunctionDef) and node.name == "_nnls_block_pivot")
-    starts = [i for i, node in enumerate(core.body) if isinstance(node, ast.Assign)
-              and any(isinstance(target, ast.Name) and target.id == "_handoff_quiet"
-                      for target in node.targets)]
-    assert len(starts) == 1
-    body = copy.deepcopy(core.body[starts[0]:])
-    assert isinstance(body[-1], ast.Return)
-    function = ast.FunctionDef(name="_controlled_terminal",
-        args=ast.arguments(posonlyargs=[], args=[ast.arg(arg=name) for name in TAIL_ARGUMENTS],
-                           vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]),
-        body=body, decorator_list=[])
-    ast.copy_location(function, body[0])
-    tree = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
-    namespace = {}
-    exec(compile(tree, experimental.__file__, "exec"), experimental.__dict__, namespace)
-    return namespace["_controlled_terminal"]
-
-
-def _terminal_arguments(kind):
-    a, coefficients, b = np.zeros((9, 1)), np.zeros((1, 9)), np.zeros((9, 9))
-    scale = np.ones(9)
-    # Exact powers of two from the qualified finite-fault recipes. Later
-    # norm reductions may also signal; compare every actual emitted event.
-    powers = {
-        "quiet": (0, 0, -1, 1., 0),
-        "reconstruction-overflow": (600, 600, None, 1., 0),
-        "late-overflow": (-450, 1000, 549, 2., 99),
-        "underflow": (0, -600, -599, 1., -599),
-        "gradient-w-overflow": (-100, 600, 499, 2., 399),
-        "unsuccessful": (0, 0, -1, 1., 0),
-    }
-    ap, cp, bp, tol, sp = powers[kind]
+def _terminal_problem(kind, patch):
+    """Give the real pivot solver a finite basis, target and passive-set proposal."""
+    columns = 9
+    a, b = np.zeros((9, 1)), np.zeros((9, columns))
+    coefficients = np.zeros((1, columns))
+    ap, cp, bp, tol = {
+        "quiet": (0, 0, -1, 1.),
+        "reconstruction-overflow": (0, 600, None, 1.),
+        "late-overflow": (-450, 1000, 549, 2.),
+        "underflow": (0, -600, -599, 1.),
+        "unsuccessful": (0, 0, -1, np.nextafter(1., 0.)),
+    }[kind]
     a[0, 0], coefficients[0, 0] = math.ldexp(1., ap), math.ldexp(1., cp)
     if bp is not None:
         b[0, 0] = math.ldexp(1., bp)
-    scale[0] = math.ldexp(1., sp)
-    return dict(matmul=experimental.nnls_matmul(), A=a, B=b, coefficients=coefficients,
-                pending=np.array([0], dtype=int) if kind == "unsuccessful" else np.empty(0, dtype=int), gradient_scale=scale, tol=tol,
-                iterations=1, cap=3, solves=1, direct_solves=0, backups=0)
+    if kind == "underflow":
+        # Exactly solved companion columns keep the pivot tolerances normal.
+        # The first inexact tiny product occurs in the terminal diagnostic.
+        coefficients[0, 1:] = b[0, 1:] = 1.
+    initial = np.ones_like(coefficients)
+    if kind == "unsuccessful":
+        # Start at zero so the solver pivots the first column into its passive
+        # set. A negative proposal at the cap leaves a real primal violation.
+        initial = None
+        coefficients[0, 0] = -1.
+
+    def propose(A, B, gram, cross, passive):
+        if kind == "reconstruction-overflow":
+            # Its initial Gram product must stay finite. Change the controlled
+            # basis after that product, so the real reconstruction overflows.
+            A[0, 0] = math.ldexp(1., 600)
+        return coefficients[:, :passive.shape[1]].copy(), 1, 0
+
+    patch.setattr(experimental, "_passive_solve", propose)
+    return a, b, dict(init=initial, max_iter=1, tol=tol)
 
 
 def _terminal_run(kind, mode, enabled, repeats=1):
-    terminal = _terminal_seam()
     policy = dict(DEFAULT_POLICY)
     if mode in ("raise", "callback", "callback-error"):
         policy["over"] = "raise" if mode == "raise" else "call"
@@ -412,16 +479,28 @@ def _terminal_run(kind, mode, enabled, repeats=1):
     for namespace, _ in registries:
         namespace["__warningregistry__"] = {}
     try:
-        with warnings.catch_warnings(record=True) as caught, np.errstate(**policy):
+        with pytest.MonkeyPatch.context() as patch, warnings.catch_warnings(record=True) as caught, np.errstate(**policy):
+            basis, target, options = _terminal_problem(kind, patch)
+            if mode == "default":
+                # Input validation changes Python's warning-filter version.
+                # Validate these fixed inputs once so successive tails share a registry.
+                for array in (basis, target, options["init"]):
+                    assert experimental._array(array, nonnegative=array is options["init"]) is array
+
+                def validated(value, *, nonnegative=False):
+                    assert any(value is array for array in (basis, target, options["init"]))
+                    assert nonnegative == (value is options["init"])
+                    return value
+
+                patch.setattr(experimental, "_array", validated)
             warnings.simplefilter("error" if mode == "warning-error" else
                                   "default" if mode == "default" else "always")
             for iteration in range(repeats):
-                arguments = _terminal_arguments(kind)
-                role = experimental._FixedTrainingRHS(arguments["B"])
+                target_before = target.copy()
+                role = experimental._FixedTrainingRHS(target)
                 # W and H share the same ordinary warning site. Alternation
                 # explicitly checks default suppression after a replaying H tail.
                 role._handoff_enabled = enabled and (repeats == 1 or iteration % 2 == 1)
-                arguments["cross_rhs"] = role
                 mutated = False
 
                 def callback(message, flag):
@@ -430,13 +509,18 @@ def _terminal_run(kind, mode, enabled, repeats=1):
                     if mode == "callback-error":
                         raise sentinel
                     if not mutated:
-                        arguments["B"][0, 0] = 1.
+                        target[0, 0] = 1.
                         mutated = True
 
-                np.seterrcall(callback if mode.startswith("callback") else saved_callback)
+                caller_callback = callback if mode.startswith("callback") else saved_callback
+                np.seterrcall(caller_callback)
                 try:
                     sys.setprofile(observe)
-                    result = terminal(**arguments)
+                    result = role.solve(basis, **options)
+                    if kind == "unsuccessful":
+                        info = result[1]
+                        assert not info["success"] and info["n_iter"] == info["max_iter"]
+                        assert info["projected_gradient_relative"] <= info["kkt_tolerance"]
                     values.append(_snapshot(result))
                     errors.append(None)
                 except (FloatingPointError, RuntimeWarning, RuntimeError, ValueError) as error:
@@ -447,11 +531,16 @@ def _terminal_run(kind, mode, enabled, repeats=1):
                     error.__traceback__ = None
                 finally:
                     sys.setprofile(None)
+                assert np.geterrcall() is caller_callback
                 publications.append(role._handoff is not None)
-                values.append(_snapshot(arguments["B"]))
+                if mode == "callback":
+                    assert mutated and target_before[0, 0] != 1.
+                    target_before[0, 0] = 1.
+                assert _snapshot(target) == _snapshot(target_before)
+                values.append(_snapshot(target))
                 role._handoff = None
             final_policy = np.geterr()
-        warning_records = [(item.category, str(item.message)) for item in caught]
+        warning_records = [(item.category, str(item.message), item.filename, item.lineno) for item in caught]
         return values, errors, warning_records, callbacks, final_policy, publications, helper_returns
     finally:
         sys.setprofile(None)
@@ -464,6 +553,7 @@ def _terminal_run(kind, mode, enabled, repeats=1):
         sentinel.__traceback__ = sentinel.__context__ = sentinel.__cause__ = None
 
 
+@pytest.mark.usefixtures("idle_profiler")
 @pytest.mark.parametrize("kind,mode,repeats", [
     ("quiet", "always", 1),
     ("unsuccessful", "always", 1),
@@ -489,113 +579,154 @@ def test_terminal_replay_matches_caller_policy_warnings_errors_and_mutations(kin
         assert optimized[2]
     else:
         assert not any(optimized[5])
-        assert optimized[6] and not any(optimized[6])
+        assert optimized[6] == [False] * (repeats // 2 if repeats > 1 else 1)
+    expected_error = {"raise": FloatingPointError, "under-raise": FloatingPointError,
+                      "warning-error": RuntimeWarning, "callback-error": RuntimeError}.get(mode)
+    if kind == "reconstruction-overflow":
+        expected_error = ValueError  # the nonfinite reconstruction reaches the norm
+    if expected_error is None:
+        assert optimized[1] == [None] * repeats
+    else:
+        error, = optimized[1]
+        assert error[0] is expected_error and error[2] == (mode == "callback-error")
+        assert error[3] is None
     if mode.startswith("callback"):
-        assert optimized[3]  # prove a genuine arithmetic callback, not a fake FP exception
+        assert any("overflow" in message for message, flag in optimized[3])
     if mode == "default":
-        assert optimized[2]  # repeated W/H tails preserve shared-site suppression
+        once = _terminal_run(kind, mode, False)[2]
+        assert once and optimized[2] == once
 
 
-def _consumer_seam():
-    """Use the actual take/objective/PG block with explicit controlled fit locals."""
-    fit = next(node for node in ast.walk(TREE)
-               if isinstance(node, ast.FunctionDef) and node.name == "fit_transform")
-
-    def assigned(node, name):
-        return isinstance(node, ast.Assign) and any(isinstance(target, ast.Name)
-            and target.id == name for target in node.targets)
-
-    take = next(node for node in ast.walk(fit) if assigned(node, "_handoff")
-                and isinstance(node.value, ast.IfExp))
-    residual = next(node for node in ast.walk(fit) if isinstance(node, ast.If)
-                    and ast.unparse(node.test) == "_handoff is None"
-                    and any(assigned(item, "residual") for item in node.body))
-    objective = next(node for node in ast.walk(fit) if assigned(node, "objective"))
-    pg = next(node for node in ast.walk(fit) if isinstance(node, ast.If)
-              and ast.unparse(node.test) == "_handoff is None or _handoff[3] is None")
-    finish = ast.copy_location(ast.Return(value=ast.Name(id="current_pg", ctx=ast.Load())), pg)
-    arguments = ("W", "H", "X", "matmul", "training_H_rhs", "outer_reconstruction",
-                 "outer_gradient_w", "outer_gradient_h", "_fit_handoff_enabled")
-    # The copied pre-acceptance take/reconstruction names the proposed factors
-    # new_W/new_H; this controlled seam supplies those same factors as W/H.
-    aliases = ast.copy_location(ast.parse("new_W, new_H = W, H").body[0], take)
-    function = ast.FunctionDef(name="_controlled_consumer",
-        args=ast.arguments(posonlyargs=[], args=[ast.arg(arg=name) for name in arguments],
-                           vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]),
-        body=copy.deepcopy([aliases, take, residual, objective, pg, finish]), decorator_list=[])
-    ast.copy_location(function, take)
-    tree = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
-    namespace = {}
-    exec(compile(tree, experimental.__file__, "exec"), experimental.__dict__, namespace)
-    return namespace["_controlled_consumer"]
-
-
-def _consumer_run(mode, enabled):
-    terminal, consume = _terminal_seam(), _consumer_seam()
-    arguments = _terminal_arguments("gradient-w-overflow")
-    role = experimental._FixedTrainingRHS(arguments["B"])
-    role._handoff_enabled = enabled
-    arguments["cross_rhs"] = role
-    operation = arguments["matmul"]
-    workspaces = [experimental.make_output_workspace(operation) for _ in range(3)]
-    saved_callback = np.geterrcall()
+def _consumer_run(monkeypatch, mode, enabled):
+    """Give the real fit controlled passive-set solutions and let it qualify both."""
+    data = np.zeros((129, 128))
+    w = np.zeros((data.shape[0], 1))
+    h = np.zeros((1, data.shape[1]))
+    data[0, 0] = math.ldexp(1., 499)
+    w[0, 0] = math.ldexp(1., -100)
+    h[0, 0] = math.ldexp(1., 600)
+    data.setflags(write=False)
+    before = _snapshot(data)
+    solutions, roles, takes, w_policies = [], [], [], []
     events, policy_at_pg = [], []
-    sentinel = RuntimeError("unexpected consumer result")
+    h_products, h_at_pg = [], []
+    accepted_w = None
+
+    def initialize(X, n_components, init=None, eps=1e-6, random_state=None):
+        assert X is data and n_components == 1
+        return np.ones_like(w), np.ones_like(h)
+
+    def passive_solve(A, B, gram, cross, passive):
+        # The two transposed target shapes identify the normal W and H solves.
+        # Their qualification, publication and all matrix products run in production.
+        if B.shape == data.T.shape:
+            solution = w.T
+            solutions.append("W")
+        else:
+            assert B is data and np.array_equal(A, w)
+            solution = h
+            solutions.append("H")
+        assert solution.shape == passive.shape and passive.all()
+        return solution.copy(), 1, 0
 
     def callback(message, flag):
         events.append((message, int(flag)))
         np.seterr(over="ignore")
+        # A callback can change a factor before the next gradient is computed.
+        accepted_w[0, 0] = math.ldexp(1., -99)
+
+    make_workspace = experimental.make_output_workspace
+
+    def observed_workspace(operation):
+        workspace = make_workspace(operation)
+
+        def product(left, right, *args, **kwargs):
+            if left.shape == data.shape and right.shape == (data.shape[1], 1):
+                w_policies.append(np.geterr())
+            result = workspace(left, right, *args, **kwargs)
+            if left.shape == (1, data.shape[0]) and right.shape == data.shape:
+                h_products.append(float(result[0, 0]))
+            return result
+
+        # The native operation itself has no workspace to release.
+        product.clear = workspace.clear if workspace is not operation else lambda: None
+        return product
 
     def observe(frame, event, value):
-        if event == "call" and frame.f_code is experimental._pg_values.__code__:
+        nonlocal accepted_w
+        if frame.f_code is experimental._take_handoff.__code__:
+            if event == "call":
+                role = _positional_arg(frame, 0)
+                accepted_w = _positional_arg(frame, 1)
+                assert role._targets is data
+                roles.append(role)
+            if event == "return":
+                takes.append(value is not None)
+                if value is not None:
+                    assert value[3] is not None
+        if frame.f_code is experimental._pg_values.__code__ and event == "call" and takes:
             policy_at_pg.append(np.geterr())
+            h_at_pg.append(float(_positional_arg(frame, 3)[0, 0]))
+        return None
 
-    try:
-        policy = dict(DEFAULT_POLICY, over="call" if mode == "callback" else
-                      "raise" if mode == "raise" else "warn")
-        with warnings.catch_warnings(record=True) as caught, np.errstate(**policy):
-            warnings.simplefilter("error" if mode == "warning-error" else "always")
-            np.seterrcall(callback if mode == "callback" else saved_callback)
-            h, info = terminal(**arguments)
-            assert info["success"] and (role._handoff is not None) == enabled
-            # These terminal values finish quietly; only actual outer GW
-            # overflows. In enabled mode its strict attempt must replay.
-            before = _snapshot(arguments["B"])
-            result = None
-            try:
+    policy = dict(DEFAULT_POLICY, over="call" if mode == "callback" else
+                  "raise" if mode == "raise" else "warn")
+    probe_policy = dict.fromkeys(DEFAULT_POLICY, "raise")
+    probe_policy["under"] = "ignore"
+    saved_callback = np.geterrcall()
+    with monkeypatch.context() as patch, warnings.catch_warnings(record=True) as caught, np.errstate(**policy):
+        patch.setattr(experimental, "_initialize_nmf", initialize)
+        patch.setattr(experimental, "_passive_solve", passive_solve)
+        patch.setattr(experimental, "make_output_workspace", observed_workspace)
+        if not enabled:
+            patch.setattr(experimental, "_handoff_producer", lambda *args, **kwargs: False)
+        warnings.simplefilter("error" if mode == "warning-error" else "always")
+        np.seterrcall(callback if mode == "callback" else saved_callback)
+        try:
+            # At nnls_tol=2 both real NNLS tails qualify. The proposed residual
+            # has the same norm as the initial one to float64 precision. Only
+            # the outer W gradient overflows, from 2**499 times 2**600.
+            model = experimental.ANLSBPP(1, max_iter=1, tol=0., nnls_tol=2.)
+            with pytest.raises((FloatingPointError, RuntimeWarning, ValueError)) as caught_error:
                 sys.setprofile(observe)
-                consume(arguments["A"], h, arguments["B"], operation, role,
-                        *workspaces, enabled)
-                raise sentinel
-            except (FloatingPointError, RuntimeWarning, ValueError) as error:
-                result = (type(error), str(error), None if error.__context__ is None else
-                          (type(error.__context__), str(error.__context__)))
-                error.__traceback__ = None
-            finally:
-                sys.setprofile(None)
-            assert result is not None and result[2] is None
-            assert role._handoff is None and _snapshot(arguments["B"]) == before
+                try:
+                    model.fit_transform(data)
+                finally:
+                    sys.setprofile(None)
+            error = caught_error.value
+            assert error.__context__ is None
+            result = (type(error), str(error))
+            error.__traceback__ = None
             final_policy = np.geterr()
-        return result, [(item.category, str(item.message)) for item in caught], events, policy_at_pg, final_policy
-    finally:
-        sys.setprofile(None)
-        np.seterrcall(saved_callback)
-        role._handoff = None
-        for workspace in workspaces:
-            if workspace is not operation:
-                workspace.clear()
+        finally:
+            np.seterrcall(saved_callback)
+    assert solutions == ["W", "H"] and takes == [enabled]
+    assert len(roles) == 1 and roles[0]._handoff is None and _snapshot(data) == before
+    # The strict W product raises before replay under the caller's policy.
+    assert w_policies == ([probe_policy] if enabled else []) + [policy]
+    # R[0, 0] is 2**499. In callback mode W[0, 0] doubles before W.T @ R.
+    expected_h = math.ldexp(1., 400 if mode == "callback" else 399)
+    assert h_products == h_at_pg == ([expected_h] if mode in ("warn", "callback") else [])
+    return result, [(item.category, str(item.message)) for item in caught], events, policy_at_pg, final_policy
 
 
+@pytest.mark.usefixtures("idle_profiler")
 @pytest.mark.parametrize("mode", ["warn", "raise", "warning-error", "callback"])
-def test_outer_gradient_replay_preserves_callback_policy_and_error_context(mode):
-    ordinary = _consumer_run(mode, False)
-    optimized = _consumer_run(mode, True)
+def test_outer_gradient_replay_preserves_callback_policy_and_error_context(monkeypatch, mode):
+    ordinary = _consumer_run(monkeypatch, mode, False)
+    optimized = _consumer_run(monkeypatch, mode, True)
     assert optimized == ordinary
-    assert len(optimized[3]) == int(mode in ("warn", "callback"))
+    (error_type, _), caught, events, policy_at_pg, final_policy = optimized
+    assert error_type is {"warn": ValueError, "raise": FloatingPointError,
+                          "warning-error": RuntimeWarning, "callback": ValueError}[mode]
+    assert len(policy_at_pg) == int(mode in ("warn", "callback"))
+    if mode == "warn":
+        assert any(category is RuntimeWarning and "overflow" in message for category, message in caught)
     if mode == "callback":
-        assert optimized[2] and optimized[3][0]["over"] == "ignore"
+        assert events and policy_at_pg[0]["over"] == final_policy["over"] == "ignore"
 
 
+@pytest.mark.usefixtures("idle_profiler")
 @pytest.mark.parametrize("fault", [
     "optional-publication", "optional-take", "optional-consumer",
     "required-objective-norm", "required-pg",
@@ -603,14 +734,23 @@ def test_outer_gradient_replay_preserves_callback_policy_and_error_context(mode)
 def test_optional_failures_fall_back_and_required_errors_release_handoff(monkeypatch, fault):
     data = np.random.default_rng(4308).uniform(.05, 2., size=(513, 33))
     data.setflags(write=False)
-    observer = _FitObserver(fault)
-    observer.target = weakref.ref(data)
+    observer = _FitObserver(data, 1, fault, count_products=fault == "optional-consumer")
     if fault.startswith("optional"):
         with monkeypatch.context() as context:
-            context.setattr(experimental, "_handoff_producer", lambda *args: False)
+            context.setattr(experimental, "_handoff_producer", lambda *args, **kwargs: False)
             expected = _fit_result(data, 1)
+        if fault == "optional-publication":
+            # Allocation of the offer's policy snapshot can also fail before
+            # the store. Both failures must preserve the ordinary result.
+            preparation = _FitObserver(data, 1, "offer-preparation")
+            assert _fit_result(data, 1, preparation) == expected
+            assert preparation.fired == 1 and preparation.takes == 0
+            assert preparation.offer_writes == 0
+            preparation.error.__traceback__ = None
+            preparation.assert_released()
         actual = _fit_result(data, 1, observer)
         assert actual == expected
+        assert observer.takes == int(fault == "optional-consumer")
         # The owned injected exception may retain the swallowed fallback's
         # traceback. Pending ownership must already be gone; array release is
         # required after the test releases that deliberately retained traceback.
@@ -624,16 +764,25 @@ def test_optional_failures_fall_back_and_required_errors_release_handoff(monkeyp
             caught = error
         assert caught is observer.error
         assert all(ref() is None or ref()._handoff is None for ref in observer.roles)
-        traceback = caught.__traceback__
-        fit_frames = 0
-        while traceback is not None:
-            if traceback.tb_frame.f_code is FIT:
-                fit_frames += 1
-                assert traceback.tb_frame.f_locals.get("_handoff") is None
-            traceback = traceback.tb_next
-        assert fit_frames == 1
+        fit_frame, = (frame for frame, _ in walk_tb(caught.__traceback__)
+                      if frame.f_code is FIT)
+        assert observer.takes == 1 and observer.last_gradient is not None
+        if fault == "required-objective-norm":
+            gc.collect()
+            assert observer.last_gradient() is None
+        else:
+            assert observer.gradient_reuses == 1
+        # The failing projected-gradient call owns an argument. Release its
+        # traceback while the fit frame remains alive to check the fit's cleanup.
         caught.__traceback__ = caught.__context__ = caught.__cause__ = None
         caught = None
+        gc.collect()
+        assert observer.last_gradient() is None
+        del fit_frame
     assert observer.fired == 1
-    assert observer.post_gradient_checkpoint == int(fault == "optional-consumer")
+    if fault == "optional-publication":
+        assert observer.offer_writes == 1
+    if fault == "optional-consumer":
+        assert observer.products == {"W gradient": 1, "H gradient": 1}
+        assert observer.after_pg <= Counter({"reconstruction": 1})
     observer.assert_released()

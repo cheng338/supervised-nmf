@@ -84,12 +84,15 @@ def test_nonboolean_private_values_do_not_enable_forkserver(monkeypatch, flag, p
 
 
 @pytest.mark.parametrize("flag", [False, True])
-def test_one_worker_completed_reuse_precedes_any_context(monkeypatch, flag, present_checkpoints):
+@pytest.mark.parametrize("frozen", [False, True])
+def test_one_worker_completed_reuse_precedes_any_context(monkeypatch, flag, frozen, present_checkpoints):
     item, environment, token = object(), object(), object()
+    pin = {"sha256": "a" * 64}
     calls = []
 
-    def worker(value, *, reuse_only, _reuse_environment):
+    def worker(value, *, reuse_only, _reuse_environment, **kwargs):
         assert value is item and reuse_only is True and _reuse_environment is environment
+        assert kwargs == ({"_frozen_report": pin} if frozen else {})
         calls.append(value)
         return token
 
@@ -104,7 +107,8 @@ def test_one_worker_completed_reuse_precedes_any_context(monkeypatch, flag, pres
                         lambda *args: pytest.fail("completed reuse constructed a context"))
     monkeypatch.setattr(DEFAULT, "ProcessPoolExecutor",
                         lambda **kwargs: pytest.fail("completed reuse created a pool"))
-    assert list(DEFAULT._completed_or_spawned([item], 1, _cli_forkserver=flag)) == [token]
+    pins = [pin] if frozen else None
+    assert list(DEFAULT._completed_or_spawned([item], 1, _cli_forkserver=flag, _pins=pins)) == [token]
     assert calls == [item]
 
 
@@ -473,8 +477,10 @@ def test_hint_is_unreachable_outside_eligible_cli_pool(tmp_path, monkeypatch, ca
 
 
 @pytest.mark.parametrize("state", ["present", "missing", "hint_error"])
-def test_real_hint_selects_only_backend_and_preserves_worker_dispatch(tmp_path, monkeypatch, state):
+@pytest.mark.parametrize("frozen", [False, True])
+def test_real_hint_selects_only_backend_and_preserves_worker_dispatch(tmp_path, monkeypatch, state, frozen):
     work = _work(tmp_path)
+    pins = [{"sha256": str(i)} for i in range(len(work))] if frozen else None
     expected = "forkserver" if state == "present" else "spawn"
     events, submitted = [], []
     original_is_file = Path.is_file
@@ -507,8 +513,9 @@ def test_real_hint_selects_only_backend_and_preserves_worker_dispatch(tmp_path, 
             return self
         def __exit__(self, *args):
             events.append(("exit", None))
-        def submit(self, function, item):
+        def submit(self, function, item, **kwargs):
             assert function is DEFAULT._worker
+            assert kwargs == ({"reuse_only": True, "_frozen_report": pins[len(submitted)]} if frozen else {})
             submitted.append(item)
             return Future(item)
 
@@ -524,7 +531,7 @@ def test_real_hint_selects_only_backend_and_preserves_worker_dispatch(tmp_path, 
     monkeypatch.setattr(DEFAULT.multiprocessing, "get_context", context)
     monkeypatch.setattr(DEFAULT, "ProcessPoolExecutor", Pool)
     monkeypatch.setattr(DEFAULT, "as_completed", lambda futures: futures)
-    assert list(DEFAULT._completed_or_spawned(work, 8, _cli_forkserver=True)) == work
+    assert list(DEFAULT._completed_or_spawned(work, 8, _cli_forkserver=True, _pins=pins)) == work
     assert submitted == work
     assert events[0] == ("completed", 8)
     assert next(event for event in events if event[0] == "context") == ("context", expected)

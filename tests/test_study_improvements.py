@@ -35,6 +35,194 @@ class StudyImprovementTests(unittest.TestCase):
                                     seed=11, checkpoint_dir=Path(self.temp.name) / name,
                                     **kwargs)
 
+    def test_missing_knn_training_state_resumes_from_last_completed_fold(self):
+        from supervised_nmf import study
+
+        estimator = KNeighborsClassifier()
+        grid = {"n_neighbors": [1, 3, len(self.y)]}
+        reference = calibration_search(estimator, grid, self.X, self.y, cv=3, seed=11,
+                                       threads=1, refit=False).report
+        read_training = study._stored_training_representation
+        reads = 0
+
+        def lose_second_matrix(fitted, kind, *args, **kwargs):
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                del fitted._fit_X
+            return read_training(fitted, kind, *args, **kwargs)
+
+        with patch.object(study, "_stored_training_representation", lose_second_matrix):
+            with self.assertRaises(study._KNNTrainingStateCompatibilityError) as caught:
+                self.run_grid(estimator, grid)
+
+        self.assertEqual(reads, 2)
+        directory = Path(self.temp.name) / "run"
+        committed, = (directory / "folds").glob("*.json")
+        saved = committed.read_bytes()
+        attempts = [study._read_receipt(path) for path in (directory / "attempts").glob("*.json")]
+        self.assertCountEqual([entry["state"] for entry in attempts], ["completed", "failed"])
+        failed, = [entry for entry in attempts if entry["state"] == "failed"]
+        self.assertEqual(failed["attempt_error_type"], type(caught.exception).__name__)
+        self.assertFalse((directory / "folds" / (failed["key"] + ".json")).exists())
+        self.assertFalse((directory / "report.json").exists())
+
+        restored = self.run_grid(estimator, grid)
+        self.assertEqual(restored["reused_representation_folds"], 1)
+        self.assertEqual(restored["new_representation_fits"], 2)
+        self.assertEqual(committed.read_bytes(), saved)
+        self.assertEqual(restored["selected_parameters"], reference["selected_parameters"])
+        for actual, expected in zip(restored["candidates"], reference["candidates"], strict=True):
+            self.assertEqual(actual["parameters"], expected["parameters"])
+            self.assertEqual(actual["valid"], expected["valid"])
+            self.assertEqual([row.get("score") for row in actual["folds"]],
+                             [row.get("score") for row in expected["folds"]])
+
+        with patch.object(study, "_stored_training_representation", side_effect=AssertionError) as reader:
+            completed = self.run_grid(estimator, grid)
+        reader.assert_not_called()
+        self.assertEqual(completed["reused_representation_folds"], 3)
+        self.assertEqual(completed["new_representation_fits"], 0)
+        self.assertEqual(completed["candidates"], restored["candidates"])
+        self.assertEqual(completed["ranked_candidate_indices"], restored["ranked_candidate_indices"])
+
+    def test_malformed_knn_width_preserves_compatibility_error_on_abort(self):
+        from supervised_nmf import study
+
+        estimator = KNeighborsClassifier()
+        grid = {"n_neighbors": [1, 3]}
+        read_training = study._stored_training_representation
+
+        def malformed_width(fitted, kind):
+            fitted.n_features_in_ = "unavailable"
+            return read_training(fitted, kind)
+
+        with patch.object(study, "_stored_training_representation", malformed_width):
+            with self.assertRaisesRegex(study._KNNTrainingStateCompatibilityError,
+                                        "n_features_in_='unavailable'") as caught:
+                self.run_grid(estimator, grid)
+
+        directory = Path(self.temp.name) / "run"
+        attempt, = (directory / "attempts").glob("*.json")
+        failed = study._read_receipt(attempt)
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(failed["attempt_error_type"], type(caught.exception).__name__)
+        self.assertFalse(list((directory / "folds").glob("*.json")))
+        self.assertFalse((directory / "report.json").exists())
+
+        resumed = self.run_grid(estimator, grid)
+        self.assertEqual(resumed["reused_representation_folds"], 0)
+        self.assertEqual(resumed["new_representation_fits"], 3)
+        self.assertTrue(all(candidate["valid"] for candidate in resumed["candidates"]))
+
+    def test_native_knn_fit_failure_stays_a_completed_fold(self):
+        estimator = KNeighborsClassifier(leaf_size=0)
+        grid = {"n_neighbors": [1, 3]}
+        report = self.run_grid(estimator, grid)
+        self.assertTrue(all(row["failure_stage"] == "fit" and row["status"] == "failed"
+                            for row in report["representation_folds"]))
+        self.assertFalse(report["ranked_candidate_indices"])
+        resumed = self.run_grid(estimator, grid)
+        self.assertEqual(resumed["reused_representation_folds"], 3)
+        self.assertEqual(resumed["new_representation_fits"], 0)
+        self.assertEqual(resumed["candidates"], report["candidates"])
+
+    def test_optional_kd_metadata_missing_on_one_real_head(self):
+        from supervised_nmf import study
+
+        X = self.X[:40].copy()
+        query = self.X[40:]
+        models = {k: KNeighborsClassifier(n_neighbors=k, algorithm="kd_tree").fit(X, self.y[:40])
+                  for k in (1, 3, 5)}
+        expected = models[3].predict(query)
+        del models[3].effective_metric_params_
+        # Stock tree prediction uses the built index for this explicit query.
+        np.testing.assert_array_equal(models[3].predict(query), expected)
+        self.assertIsNone(study._kd_training_snapshot({1: models[1], 3: models[3]}, X))
+        snapshot = study._kd_training_snapshot(models, X)
+        np.testing.assert_array_equal(snapshot, X)
+        reuse = _KNNQueryReuse(models, query, _head_fit_input=X)
+        self.assertIsNone(reuse.by_k[3][0])
+        predictions, metadata, _ = reuse.predict(3)
+        self.assertFalse(metadata["shared_query_attempted"])
+        np.testing.assert_array_equal(predictions, expected)
+
+    def test_knn_reader_requires_usable_storage_and_preserves_fitted_carriers(self):
+        from joblib import dump, load
+        from scipy.sparse import csr_matrix
+        from sklearn.neighbors import BallTree, KDTree, NearestNeighbors
+        from supervised_nmf import study
+
+        class ShapeOnly:
+            shape = self.X.shape
+            dtype = self.X.dtype
+
+            def __array__(self, *args, **kwargs):
+                raise AssertionError("A shape and a dtype do not establish usable storage")
+
+        class MisreportedDtype(np.ndarray):
+            @property
+            def dtype(self):
+                return np.dtype("float64")
+
+        index_path = Path(self.temp.name) / "sparse-index.joblib"
+        dump(NearestNeighbors().fit(csr_matrix(self.X)), index_path)
+        mapped_index = load(index_path, mmap_mode="r")
+        for array in (mapped_index._fit_X.data, mapped_index._fit_X.indices, mapped_index._fit_X.indptr):
+            if isinstance(array, np.memmap):
+                self.addCleanup(array._mmap.close)
+        self.assertIsInstance(mapped_index._fit_X.data, np.memmap)
+        for source in (self.X, csr_matrix(self.X), KDTree(self.X), BallTree(self.X),
+                       NearestNeighbors().fit(self.X), mapped_index):
+            with self.subTest(source=type(source).__name__):
+                head = KNeighborsClassifier().fit(source, self.y)
+                matrix, template = study._stored_training_representation(Pipeline([("knn", head)]), "pipeline")
+                self.assertIs(template, head)
+                if isinstance(source, (KDTree, BallTree)):
+                    fitted_values = np.asarray(head._fit_X)
+                    self.assertTrue(np.shares_memory(matrix, fitted_values))
+                    self.assertEqual(matrix.dtype, fitted_values.dtype)
+                    np.testing.assert_array_equal(matrix, fitted_values)
+                else:
+                    self.assertIs(matrix, head._fit_X)
+
+        head = KNeighborsClassifier().fit(self.X, self.y)
+        strings = np.full(self.X.shape, "invalid")
+        for unusable in (strings, strings.view(MisreportedDtype), self.X.astype(object),
+                         self.X.astype(complex), ShapeOnly()):
+            with self.subTest(carrier=type(unusable).__name__, dtype=unusable.dtype):
+                with patch.object(head, "_fit_X", unusable):
+                    with self.assertRaises(study._KNNTrainingStateCompatibilityError):
+                        study._stored_training_representation(head, "raw")
+
+        def broken_count(model):
+            raise RuntimeError("Fitted metadata is unreadable")
+
+        with patch.object(KNeighborsClassifier, "n_samples_fit_", property(broken_count), create=True):
+            with self.assertRaises(study._KNNTrainingStateCompatibilityError) as caught:
+                study._stored_training_representation(head, "raw")
+        self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+
+    def test_nonfinite_training_values_remain_ordinary_fold_failures(self):
+        from supervised_nmf import study
+
+        read = study._stored_training_representation
+        for name, value in (("nan", np.nan), ("inf", np.inf)):
+            with self.subTest(value=name):
+                def nonfinite(fitted, kind, *args, **kwargs):
+                    matrix = fitted._fit_X.copy()
+                    matrix[0, 0] = value
+                    with patch.object(fitted, "_fit_X", matrix):
+                        return read(fitted, kind, *args, **kwargs)
+
+                with patch.object(study, "_stored_training_representation", nonfinite):
+                    report = self.run_grid(KNeighborsClassifier(), {"n_neighbors": [1]}, name=name)
+                for row in report["representation_folds"]:
+                    self.assertEqual(row["status"], "failed")
+                    self.assertEqual(row["failure_stage"], "projection")
+                    self.assertEqual(row["error_type"], "ValueError")
+                    self.assertIn("nonfinite coordinates", row["error"])
+
     def test_reused_statistics_match_direct_masks_including_constant_and_infinite(self):
         X = np.column_stack([self.X, np.ones(60), self.y])
         base = BinaryScreening(screening="absolute", score_threshold=0).fit(X, self.y)

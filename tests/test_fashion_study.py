@@ -1,12 +1,16 @@
 """Synthetic checks for Chang Cheng's training-only Fashion benchmark runner."""
 
 from copy import deepcopy
+from datetime import datetime, timezone
 import gc
+from io import BytesIO
 from pathlib import Path
+from shutil import copytree
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from zipfile import BadZipFile
 
 import numpy as np
 from threadpoolctl import threadpool_info, threadpool_limits
@@ -15,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import fashion_mnist_study as runner
 from supervised_nmf.evaluation import _digest, evaluate_classifier, write_json
-from supervised_nmf.study import _read_receipt, _write_receipt
+from supervised_nmf.study import _cv_report_pin, _read_receipt, _write_receipt
 
 
 class FashionStudyTests(unittest.TestCase):
@@ -58,6 +62,84 @@ class FashionStudyTests(unittest.TestCase):
                    for plan in config["plans"] for chunk in plan["chunks"]]
         return records, runner.aggregate_cv(self.output, config, require_complete=True)
 
+    def test_failed_fashion_worker_allows_cache_replacement(self):
+        config = self.initialize()
+        plan = config["plans"][0]
+        plan["job"]["training_data_sha256"] = "0" * 64
+        feature_file = Path(plan["job"]["cache"]) / "X.npy"
+        expected = np.load(feature_file, allow_pickle=False)[:1]
+        replacement = self.root / "replacement.npy"
+        np.save(replacement, np.zeros_like(expected))
+        fingerprint = runner.data_fingerprint
+        view = None
+
+        def keep_view(X, y):
+            nonlocal view
+            view = X[:1]
+            return fingerprint(X, y)
+
+        with patch.object(runner, "data_fingerprint", keep_view):
+            try:
+                runner._worker((str(self.output), plan, plan["chunks"][0], config["sources"]))
+            except ValueError as error:
+                self.assertIn("Worker training data differ", str(error))
+                retained = error.__traceback__
+            else:
+                self.fail("Worker accepted a different training fingerprint")
+        try:
+            self.assertIsNotNone(retained)
+            replacement.replace(feature_file)
+            self.assertIsNotNone(view)
+            self.assertFalse(view.flags.writeable)
+            owner = view
+            while isinstance(owner, np.ndarray):
+                mapping = getattr(owner, "_mmap", None)
+                if mapping is not None:
+                    self.assertFalse(mapping.closed, "Worker closed a map still backing the view")
+                owner = owner.base
+            np.testing.assert_array_equal(view, expected)
+        finally:
+            del retained, view
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows worker file ownership")
+    def test_worker_releases_archive_under_npy_with_live_traceback(self):
+        config = self.initialize()
+        plan = config["plans"][0]
+        chunk = plan["chunks"][0]
+        with BytesIO() as archive:
+            np.savez(archive, values=[1, 2])
+            encoded = archive.getvalue()
+        archives = (("npz", encoded, ValueError), ("truncated_zip", encoded[:6], BadZipFile))
+
+        for filename in ("X.npy", "y.npy"):
+            for kind, contents, expected_error in archives:
+                with self.subTest(filename=filename, kind=kind):
+                    cache = copytree(plan["job"]["cache"], self.root / f"{filename}-{kind}")
+                    job = {**plan["job"], "cache": str(cache)}
+                    output = cache / "run"
+                    target = cache / filename
+                    original = target.read_bytes()
+                    replacement = cache / "replacement.npy"
+                    replacement.write_bytes(original)
+                    target.write_bytes(contents)
+
+                    try:
+                        runner._worker((str(output), {"job": job}, chunk, config["sources"]))
+                    except Exception as error:
+                        held = error
+                    else:
+                        self.fail("Worker accepted an archive in the training cache")
+                    try:
+                        self.assertIsNotNone(held.__traceback__)
+                        self.assertFalse((output / job["id"] / chunk["id"]).exists())
+                        replacement.replace(target)
+                        self.assertEqual(target.read_bytes(), original)
+                        self.assertIsInstance(held, expected_error)
+                        if kind == "npz":
+                            self.assertIn(filename, str(held))
+                    finally:
+                        del held
+
     def test_fixed_balanced_validation_and_nested_training_samples(self):
         protocol = deepcopy(self.protocol)
         protocol.update(train_sizes=[20, 80, 40], seeds=[43, 44, 45])
@@ -96,9 +178,9 @@ class FashionStudyTests(unittest.TestCase):
     def test_cv_isolates_validation_shares_neighbors_and_resumes(self):
         config = self.initialize()
         load = runner._load_arrays
-        def training_only(record):
+        def training_only(record, **options):
             self.assertNotEqual(Path(record["path"]).name, "validation")
-            return load(record)
+            return load(record, **options)
         with patch.object(runner, "_load_arrays", training_only):
             records, first = self.complete(config)
             files = list(self.output.glob("*/c*/folds/*.json"))
@@ -121,13 +203,87 @@ class FashionStudyTests(unittest.TestCase):
                 runner.evaluate(self.output, config)
         self.assertFalse((self.output / "validation-gate.json").exists())
 
+    def test_rebuilt_report_retains_original_worker_pool_order(self):
+        config = self.initialize()
+        plan = config["plans"][0]
+        chunk = plan["chunks"][0]
+        work = (str(self.output), plan, chunk, config["sources"])
+        directory = self.output / plan["job"]["id"] / chunk["id"]
+        report = directory / "report.json"
+        pools = [{"internal_api": "mkl", "num_threads": 1}, {"internal_api": "openmp", "num_threads": 1}]
+        with patch("supervised_nmf.study.threadpool_info", return_value=pools):
+            runner._worker(work)
+        self.assertEqual(_read_receipt(report)["active_threadpools"], pools)
+        pin = _cv_report_pin(directory)
+        original = report.read_bytes()
+        report.unlink()
+        with patch("supervised_nmf.study.threadpool_info", return_value=pools[::-1]):
+            replay = runner._worker(work, reuse_only=True, _frozen_report=pin)
+        self.assertEqual(replay["new_representation_fits"], 0)
+        self.assertEqual(replay["reused_representation_folds"], 5)
+        self.assertEqual(report.read_bytes(), original)
+
     def test_spawned_workers_finish_and_resume_without_new_chunks(self):
         config = self.initialize()
+        argv = ["fashion", "--protocol", str(self.protocol_path), "--output", str(self.output), "--mode", "all"]
+        with (patch.object(sys, "argv", argv),
+              patch.object(runner, "ProcessPoolExecutor", side_effect=KeyboardInterrupt),
+              self.assertRaises(KeyboardInterrupt)):
+            runner.main()
+        first, = [_read_receipt(path) for path in (self.output / "cv-timing").glob("*.json")]
+        self.assertEqual(first["state"], "interrupted")
+        self.assertGreater(first["cv_wall_seconds_this_invocation"], 0.)
         result = runner.run_cv(self.output, config, workers=2)
         self.assertEqual(result["state"], "cv_completed")
         self.assertEqual(result["completed_chunks_this_call"], 4)
+        self.assertEqual(result["cv_wall_seconds_cumulative"], first["cv_wall_seconds_this_invocation"]
+                         + result["cv_wall_seconds_this_invocation"])
+        def evaluate_after_cv(*unused):
+            latest = max((_read_receipt(path) for path in (self.output / "cv-timing").glob("*.json")),
+                         key=lambda row: row["started_utc"])
+            self.assertEqual(latest["state"], "completed")
+            self.assertEqual(latest["cv_wall_seconds_this_invocation"], 0.)
+            raise RuntimeError("evaluation interruption")
+        with (patch.object(sys, "argv", argv), patch.object(runner, "evaluate", evaluate_after_cv),
+              self.assertRaisesRegex(RuntimeError, "evaluation interruption")):
+            runner.main()
         resumed = runner.run_cv(self.output, self.initialize(), workers=2)
         self.assertEqual(resumed["completed_chunks_this_call"], 0)
+        self.assertEqual(resumed["cv_wall_seconds_this_invocation"], 0.)
+        self.assertEqual(resumed["cv_wall_seconds_cumulative"], result["cv_wall_seconds_cumulative"])
+
+        with (patch.object(runner, "_verify_arrays", side_effect=RuntimeError("after gate")),
+              self.assertRaisesRegex(RuntimeError, "after gate")):
+            runner.evaluate(self.output, config)
+        plan = config["plans"][0]
+        directory = self.output / plan["job"]["id"] / plan["chunks"][0]["id"]
+        report = directory / "report.json"
+        original, gate = report.read_bytes(), (self.output / "validation-gate.json").read_bytes()
+        report.unlink()
+        replay = runner.run_cv(self.output, config, workers=1)
+        self.assertEqual(replay["cv_wall_seconds_this_invocation"], 0.)
+        self.assertEqual(report.read_bytes(), original)
+        self.assertEqual((self.output / "validation-gate.json").read_bytes(), gate)
+        evaluate_argv = argv[:-1] + ["evaluate"]
+        report.unlink()
+        with patch.object(sys, "argv", evaluate_argv):
+            runner.main()
+        self.assertEqual(report.read_bytes(), original)
+        self.assertEqual((self.output / "validation-gate.json").read_bytes(), gate)
+        contents = _read_receipt(report)
+        # A valid checksum on an incomplete derived report cannot authorize refitting.
+        fold = contents["representation_folds"].pop()
+        (directory / "folds" / f"{fold['key']}.json").unlink()
+        attempts = set((directory / "attempts").iterdir())
+        with (patch.object(sys, "argv", evaluate_argv), patch.object(runner, "aggregate_cv") as summarize,
+              self.assertRaisesRegex(ValueError, "fresh CV is closed")):
+            runner.main()
+        summarize.assert_not_called()
+        _write_receipt(report, contents)
+        with self.assertRaisesRegex(ValueError, "fresh CV is closed"):
+            runner.run_cv(self.output, config, workers=1)
+        self.assertEqual(set((directory / "attempts").iterdir()), attempts)
+        self.assertFalse((directory / "folds" / f"{fold['key']}.json").exists())
 
     def test_source_inventory_is_stable_and_restores_thread_limits(self):
         expected = runner._sources()
@@ -154,7 +310,13 @@ class FashionStudyTests(unittest.TestCase):
     def test_serial_exact_profiles_metrics_and_resume(self):
         config = self.initialize()
         self.complete(config)
-        result = runner.evaluate(self.output, config)
+        stationarity = runner._training_stationarity
+        between_phases = []
+        def observe_stationarity(*args):
+            between_phases.append(datetime.now(timezone.utc).isoformat())
+            return stationarity(*args)
+        with patch.object(runner, "_training_stationarity", observe_stationarity):
+            result = runner.evaluate(self.output, config)
         self.assertEqual(result["valid_evaluations"], 4)
         self.assertEqual(result["models_with_valid_profiling"], 4)
         records = {}
@@ -164,6 +326,14 @@ class FashionStudyTests(unittest.TestCase):
             records[path] = path.read_bytes()
             self.assertEqual(len(record["profiling"]), 3)
             self.assertTrue(all(row["exact_prediction_match"] for row in record["profiling"]))
+            middle = between_phases[config["evaluation_order"].index(plan["job"]["id"])]
+            self.assertLessEqual(record["fit_execution"]["finished_utc"], middle)
+            self.assertLessEqual(middle, record["prediction_execution"]["started_utc"])
+            for row in [record, *record["profiling"]]:
+                self.assertEqual(row["fit_execution"]["seconds"],
+                                 row["final_fit_seconds"] if row is record else row["timing"]["total_fit_seconds"])
+                self.assertLessEqual(row["fit_execution"]["finished_utc"], row["prediction_execution"]["started_utc"])
+                self.assertEqual(row["prediction_execution"]["seconds"], row["evaluation"]["prediction_seconds"])
             if plan["job"]["method"] == "screened_spa_absolute":
                 self.assertEqual(record["training_stationarity"]["status"], "valid")
                 self.assertTrue({"raw", "canonical"} <= set(record["training_stationarity"]["diagnostics"]))

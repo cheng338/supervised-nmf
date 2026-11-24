@@ -27,7 +27,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import numpy as np
 
 import fashion_mnist_study as shared
-from supervised_nmf.evaluation import _digest, data_fingerprint, provenance, write_json
+from supervised_nmf.evaluation import _digest, _timing_study_lock, data_fingerprint, provenance, write_json
 from supervised_nmf.study import _checkpoint_lock, _read_receipt, _write_receipt
 
 METHODS = ("screened_cd_absolute", "screened_spa_absolute", "screened_mu_absolute", "screened_anls_bpp_absolute")
@@ -227,11 +227,11 @@ def initialize(protocol_path, output):
 
 def evaluate(output, configuration):
     # No validation array is opened until the complete local CV gate passes.
-    shared.aggregate_cv(output, configuration, require_complete=True)
+    cv = shared._verified_evaluation_cv(output, configuration)
     for key, record in configuration["arrays"].items():
         if key.endswith("/validation"):
             _verify_values(record, training=False)
-    return shared.evaluate(output, configuration)
+    return shared.evaluate(output, configuration, _cv=cv)
 
 
 def main():
@@ -242,7 +242,7 @@ def main():
     parser.add_argument("--workers", type=int)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    with _checkpoint_lock(args.output):
+    with _timing_study_lock(), _checkpoint_lock(args.output):
         configuration = initialize(args.protocol, args.output)
         path = args.output / "executions" / f"{uuid.uuid4().hex}.json"
         start = time.perf_counter()
@@ -252,7 +252,7 @@ def main():
                    (args.workers or configuration["protocol"].get("workers", 8)), "official_test_loaded": False}
         _write_receipt(path, attempt)
         try:
-            attempt[args.mode] = (shared.run_cv(args.output, configuration, workers=args.workers)
+            attempt[args.mode] = (shared.run_cv(args.output, configuration, workers=args.workers, execution=attempt)
                                  if args.mode == "cv" else evaluate(args.output, configuration))
             attempt["state"] = "completed"
         except BaseException as error:

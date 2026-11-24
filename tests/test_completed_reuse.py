@@ -73,8 +73,8 @@ def completed(tmp_path):
     def describe(i):
         return KNeighborsClassifier(n_jobs=1), grid, directories[i], 1
     def invoke(i, environment):
-        return study._reuse_calibration_knn_grid(KNeighborsClassifier(n_jobs=1), grid, X, y,
-               cv=3, seed=17, threads=1, checkpoint_dir=directories[i], _reuse_environment=environment)
+        return study._calibration_knn_grid(KNeighborsClassifier(n_jobs=1), grid, X, y,
+               cv=3, seed=17, threads=1, checkpoint_dir=directories[i], _reuse_only=True, _reuse_environment=environment)
     return directories, reports, describe, invoke, X, y
 
 
@@ -369,8 +369,9 @@ def test_default_worker_entry_and_tail_use_explicit_provider(tmp_path, monkeypat
     monkeypatch.setattr(DEFAULT, "_estimator", lambda job: KNeighborsClassifier())
     def completed_call(*a, **kwargs):
         assert kwargs["_reuse_environment"] is provider
+        assert kwargs["_reuse_only"] is True
         return {"candidates": [], "new_representation_fits": 0, "reused_representation_folds": 3}
-    monkeypatch.setattr(DEFAULT, "_reuse_calibration_knn_grid", completed_call)
+    monkeypatch.setattr(study, "_calibration_knn_grid", completed_call)
     report = DEFAULT._worker(work, reuse_only=True, _reuse_environment=provider)
     assert report["new_representation_fits"] == 0 and len(provider_calls) == 3
 

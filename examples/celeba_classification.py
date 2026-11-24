@@ -22,7 +22,9 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from supervised_nmf.datasets import load_celeba
+from supervised_nmf.validation import _validate_threads
 from supervised_nmf.evaluation import (
+    _serial_comparison_batch, _timing_study_lock,
     comparison_models, new_run_directory, provenance, run_comparison, save_data_manifest, write_json,
 )
 
@@ -36,7 +38,8 @@ def main():
     parser.add_argument("--max-train", type=int, default=1000)
     parser.add_argument("--max-validation", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--threads", type=int, default=1,
+                        help="Native threads for CV. Final fit and prediction use one worker and one native thread.")
     parser.add_argument("--max-iter", type=int, default=20000)
     parser.add_argument("--tol", type=float, default=1e-4)
     parser.add_argument("--classifier", choices=("knn", "logistic", "linear_svm"), default="knn")
@@ -54,6 +57,15 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("runs"))
     parser.add_argument("--resume", type=Path)
     args = parser.parse_args()
+    try:
+        args.threads = _validate_threads(args.threads)
+    except ValueError as error:
+        parser.error(str(error))
+    with _timing_study_lock():
+        _run(args)
+
+
+def _run(args):
     logistic_class_weight = None if args.logistic_class_weight == "none" else "balanced"
     svm_options = {}
     if args.classifier == "linear_svm":
@@ -97,9 +109,10 @@ def main():
         raise ValueError(f"Unknown grid model names: {sorted(unknown)}")
     for name, grid in configuration["grid_override"].items():
         models[name] = (models[name][0], grid)
-    run_comparison(models, training.data, training.target, validation.data, validation.target,
-                   output_dir=run_dir, seed=args.seed, threads=args.threads,
-                   validation_ids=validation.image_ids)
+    with _serial_comparison_batch(_host_reserved=True) as batch:
+        run_comparison(models, training.data, training.target, validation.data, validation.target,
+                       output_dir=run_dir, seed=args.seed, threads=args.threads,
+                       validation_ids=validation.image_ids, serial_final=True, _batch=batch)
     print(f"Development reports: {run_dir.resolve()}\nOfficial test data were not loaded. This run does not reselect package defaults.")
 
 

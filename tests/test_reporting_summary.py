@@ -101,6 +101,15 @@ def test_refit_cost_and_fitted_estimator_components_are_not_added():
     assert "unsuccessful refit attempts" in text
     assert "Do not add these overlapping totals" in text
     assert "batch throughput are separate measurements" in text
+    report["cumulative_final_fit_seconds"] = 7
+    timed = format_evaluation_summary(report)
+    assert "| Final fitting (evaluated model) | 3 |" in timed
+    assert "| Final fitting (all recorded attempts) | 7 |" in timed
+    report.update(tuning_seconds_complete=False, cumulative_final_fit_seconds_complete=False)
+    incomplete = format_evaluation_summary(report)
+    assert "| Tuning (measured subtotal, incomplete) | 12.5 |" in incomplete
+    assert "| Final fitting (measured subtotal, incomplete) | 7 |" in incomplete
+    assert "| Final fitting (evaluated model) | 3 |" in incomplete
 
 
 def test_absent_timing_is_not_synthesized_from_components():

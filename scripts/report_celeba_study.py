@@ -239,6 +239,8 @@ def summarize(run_dir, scan_folds=False):
         "run_identity": _digest(configuration),
         "role": "one_paired_development_comparison", "seed": configuration["seed"],
         "workers": configuration["workers"], "native_threads_per_worker": configuration["threads"],
+        "final_native_threads": configuration.get("final_native_threads", configuration["threads"]),
+        "final_workers": configuration.get("final_workers"),
         "training_cv_folds": configuration["cv"], "selection_metric": configuration["selection_metric"],
         "n_train": len(data["splits"]["train"]["image_ids"]),
         "n_validation": len(data["splits"]["validation"]["image_ids"]),
@@ -252,6 +254,9 @@ def summarize(run_dir, scan_folds=False):
         "fold_diagnostics_scanned": scan_folds, "attributes": {},
         "execution_transition": _execution_transition(inputs, configuration),
     }
+    if "cv_wall_seconds_this_invocation" in comparison:
+        for field in ("cv_wall_seconds_this_invocation", "cv_wall_seconds_recorded", "cv_wall_seconds_cumulative"):
+            summary[field] = comparison[field]
     plots = {}
     for attribute in ATTRIBUTES:
         block = comparison["attributes"][attribute]
@@ -547,9 +552,20 @@ def markdown_report(summary, figures):
             values = [row["label"], f"{row['valid_cv_candidates']} / {row['declared_cv_candidates']}", numerical, pending]
             lines.append("| " + " | ".join(_cell(value) for value in values) + " |")
         lines += [""]
+    workers = summary["final_workers"]
+    final_worker_note = "The final worker count was unrecorded." if workers is None else f"The final worker count was {workers}."
+    calibration_timing = (f"{'Continuation calibration' if summary['execution_transition'] else 'Calibration'} "
+                          f"call wall time: {summary['calibration_call_wall_seconds']:.2f} seconds.")
+    if "cv_wall_seconds_this_invocation" in summary:
+        cumulative = summary["cv_wall_seconds_cumulative"]
+        total = (f"{cumulative:.2f} seconds" if cumulative is not None else
+                 f"unknown ({summary['cv_wall_seconds_recorded']:.2f} seconds recorded)")
+        calibration_timing = (f"CV wall time was {summary['cv_wall_seconds_this_invocation']:.2f} seconds "
+                              f"for this invocation. Cumulative CV wall time was {total}.")
     lines += ["## Timing and reproducibility", "",
-              f"{'Continuation calibration' if summary['execution_transition'] else 'Calibration'} call wall time: "
-              f"{summary['calibration_call_wall_seconds']:.2f} seconds. "
+              f"{calibration_timing} "
+              f"CV used a worker count of {summary['workers']} and a per-worker native thread limit of {summary['native_threads_per_worker']}. "
+              f"The final fit and prediction had a native thread limit of {summary['final_native_threads']}. {final_worker_note} "
               "Per-method compute and final-fit times are preserved in `summary.json`. Shared representation "
               "fits and projections count once per fold, independent of the number of neighbor values. "
               "Concurrent worker compute times must not be interpreted as elapsed wall time. "

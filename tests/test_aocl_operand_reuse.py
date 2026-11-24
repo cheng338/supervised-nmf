@@ -61,21 +61,28 @@ def ordinary_layout(values, layout):
 def observe(monkeypatch, left, right):
     """Record references before any copying, with no native matrix multiply."""
     allocations, calls = [], []
-    original_zeros = np.zeros
+    class ObservedNumpy:
+        def __getattr__(self, name):
+            return getattr(np, name)
 
-    def zeros(shape, *args, **kwargs):
-        result = original_zeros(shape, *args, **kwargs)
-        allocations.append({"shape": tuple(shape), "array": result})
-        return result
+        def zeros(self, *args, **kwargs):
+            array = np.zeros(*args, **kwargs)
+            allocations.append(array)
+            return array
 
-    def product(a, b):
-        result = reference_product(a, b)
-        calls.append({"left": a, "right": b, "result": result})
-        return result
+        def empty(self, *args, **kwargs):
+            array = np.empty(*args, **kwargs)
+            array.fill(np.nan)
+            allocations.append(array)
+            return array
+
+        def matmul(self, a, b):
+            result = reference_product(a, b)
+            calls.append({"left": a, "right": b, "result": result})
+            return result
 
     with monkeypatch.context() as patch:
-        patch.setattr(_aocl.np, "zeros", zeros)
-        patch.setattr(_aocl.np, "matmul", product)
+        patch.setattr(_aocl, "np", ObservedNumpy())
         result = _aocl.padded_matmul(left, right)
     assert len(calls) in (1, 2)
     if len(calls) == 2:
@@ -87,14 +94,16 @@ def observe(monkeypatch, left, right):
 def assert_two_product_contract(result, calls, allocations, left, right):
     m, k = left.shape
     n = right.shape[1]
-    mp, npad = (m + 7) // 8 * 8, (n + 7) // 8 * 8
-    mc, nc = m // 8 * 8, n // 8 * 8
+    mp, nc = (m + 7) // 8 * 8, n // 8 * 8
     assert m >= 8 and n >= 8 and m % 8 and n % 8
-    assert len(calls) == len(allocations) == 2
+    assert len(calls) == 2
+    assert sum(array.nbytes for array in allocations) <= (mp*k + k*8 + m*n) * left.itemsize
     assert [(c['left'].shape, c['right'].shape) for c in calls] == [((mp,k),(k,nc)),((mp,k),(k,8))]
     full, fringe, core = calls[0]['left'], calls[1]['right'], calls[0]['right']
     assert calls[1]['left'] is full
-    assert allocations[0]['array'] is full and allocations[1]['array'] is fringe
+    assert not np.shares_memory(full, left) and not np.shares_memory(fringe, right)
+    for role in (full, fringe, result):
+        assert any(np.shares_memory(role, array) for array in allocations)
     assert np.shares_memory(core, right)
     np.testing.assert_array_equal(core, right[:, :nc])
     np.testing.assert_array_equal(full[:m], left)
@@ -104,7 +113,8 @@ def assert_two_product_contract(result, calls, allocations, left, right):
         assert value.dtype == np.float64 and value.flags.c_contiguous and value.flags.aligned
     assert result.shape == (m,n) and result.dtype == np.float64
     assert result.flags.owndata and result.flags.c_contiguous and result.base is None
-    assert all(not np.shares_memory(result, value) for value in (left, right, *(c['result'] for c in calls)))
+    assert all(not np.shares_memory(result, value)
+               for value in (left, right, full, fringe, *(c['result'] for c in calls)))
     np.testing.assert_array_equal(result, reference_product(left,right))
 
 
@@ -120,20 +130,19 @@ def assert_partial_contract(result, call, allocations, left, right, borrow_left,
     a, b = call["left"], call["right"]
     assert (a is left) is borrow_left
     assert (b is right) is borrow_right
-    assert len(allocations) == 2 - int(borrow_left) - int(borrow_right)
+    padding = [array for array in allocations if array is not result]
+    assert len(padding) == 2 - int(borrow_left) - int(borrow_right)
     assert a.shape == (mp, k) and b.shape == (k, npad)
     for array in (a, b):
         assert type(array) is np.ndarray
         assert array.dtype == np.dtype(np.float64) and array.dtype.isnative
         assert array.flags.c_contiguous and array.flags.aligned
         assert array.strides == (array.shape[1] * 8, 8)
-    assert [entry["shape"] for entry in allocations] == (
-        ([] if borrow_left else [(mp, k)]) + ([] if borrow_right else [(k, npad)]))
     if not borrow_left:
-        assert any(entry["array"] is a for entry in allocations)
+        assert any(array is a for array in padding)
         assert not np.shares_memory(a, left)
     if not borrow_right:
-        assert any(entry["array"] is b for entry in allocations)
+        assert any(array is b for array in padding)
         assert not np.shares_memory(b, right)
     np.testing.assert_array_equal(a[:m], np.asarray(left))
     np.testing.assert_array_equal(b[:, :n], np.asarray(right))
@@ -145,6 +154,7 @@ def assert_partial_contract(result, call, allocations, left, right, borrow_left,
     assert result.base is None
     assert result is not call["result"]
     assert not np.shares_memory(result, call["result"])
+    assert not np.shares_memory(result, a) and not np.shares_memory(result, b)
     assert not np.shares_memory(result, left)
     assert not np.shares_memory(result, right)
     expected = reference_product(np.asarray(left, dtype=np.float64),

@@ -4,7 +4,6 @@ Native route observations use an independent einsum reference, optimize=False;
 no raw AOCL product is called by these focused storage tests.
 """
 import gc
-import inspect
 from pathlib import Path
 import sys
 import weakref
@@ -140,13 +139,11 @@ def test_diagnostic_private_gradient_helper_does_not_replace_solver_helper(monke
     original = experimental._pg_values
     private = experimental._diagnostic_pg_values
     assert private is not original
-    assert '_diagnostic_pg_values' not in inspect.getsource(experimental.ANLSBPP)
-    assert '_pg_values' in inspect.getsource(experimental.ANLSBPP)
     X = np.full((8, 8), 0.75)
     W = np.full((8, 3), 0.5)
     H = np.full((3, 8), 0.5)
 
-    def solver_only(*args):
+    def solver_only(*args, **kwargs):
         raise AssertionError('descriptive diagnostic reached the solver helper')
 
     # Reference dispatch is explicit and uses no native fringe product.
@@ -156,5 +153,23 @@ def test_diagnostic_private_gradient_helper_does_not_replace_solver_helper(monke
     assert answer['reconstruction_error'] == answer['objective'] == 0.
     assert answer['raw']['relative_projected_gradient'] == 0.
     assert answer['canonical']['relative_projected_gradient'] == 0.
-    assert experimental._pg_values is solver_only
-    assert inspect.unwrap(experimental.ANLSBPP.fit_transform).__globals__['_pg_values'] is solver_only
+
+    calls = []
+    def solver_gradient(*args, **kwargs):
+        result = original(*args, **kwargs)
+        calls.append(result['projected_gradient_norm'])
+        return result
+
+    def diagnostic_only(*args, **kwargs):
+        raise AssertionError('solver reached descriptive diagnostic helper')
+
+    monkeypatch.setattr(experimental, '_pg_values', solver_gradient)
+    monkeypatch.setattr(experimental, '_diagnostic_pg_values', diagnostic_only)
+    data = np.random.default_rng(84).uniform(0.25, 1., (8, 8))
+    model = experimental.ANLSBPP(2, max_iter=1, tol=0., random_state=17)
+    from sklearn.exceptions import ConvergenceWarning
+    with pytest.warns(ConvergenceWarning, match='outer_iteration_limit'):
+        model.fit(data)
+    assert model.n_iter_ == 1 and model.nnls_diagnostics_['failed_solves'] == 0
+    assert calls == model.projected_gradient_history_
+    assert len(calls) == 2

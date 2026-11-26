@@ -27,6 +27,25 @@ import numpy as np
 from sklearn.base import BaseEstimator
 
 
+def _extended_float_json(value):
+    """Encode an unboxable NumPy float exactly, without narrowing its range."""
+    if not np.isfinite(value):
+        return None
+    numerator, denominator = value.as_integer_ratio()
+    if numerator == 0:
+        significand = "-0" if np.signbit(value) else "0"
+        exponent = 0
+    else:
+        # A binary float has a power-of-two denominator. Remove powers of two
+        # from the numerator too, keeping even extreme values compact.
+        magnitude = abs(numerator)
+        shift = (magnitude & -magnitude).bit_length() - 1
+        significand = str(numerator >> shift)
+        exponent = shift - (denominator.bit_length() - 1)
+    return {"__supervised_nmf_scalar__": "longdouble-v1",
+            "significand": significand, "exponent": exponent}
+
+
 def _qualified(value):
     return f"{value.__module__}.{value.__qualname__}"
 
@@ -658,6 +677,19 @@ class _Encoder:
                 content = None if self.sources_only else hashlib.sha256(value.tobytes()).hexdigest()
             record = {"kind": "numpy_scalar", "dtype": self._dtype(value.dtype, path + ".dtype"),
                       "content": content}
+            if (not self.sources_only and value.dtype.kind == "f"
+                    and any(type(value) is cls for cls in (np.float16, np.float32, np.float64, np.longdouble))):
+                # JSON renders every nonfinite float as null. Bind this distinction
+                # to the request alongside the hash of the untouched scalar bytes.
+                with np.errstate(invalid="ignore"):
+                    record["finite"] = bool(np.isfinite(value))
+                    if type(value) is np.longdouble:
+                        record["display"] = _extended_float_json(value)
+            if not self.sources_only and type(value) is np.str_:
+                # Dictionary keys use str(key), whereas values use .item().
+                # These spellings can differ for trailing NULs.
+                record["key_text"] = str(value)
+                record["display"] = value.item()
             if self.in_function and type(value) in (np.void, np.record):
                 # A cloned function retains the scalar and can read its NumPy flags.
                 record["scalar_flags"] = value.flags.num
@@ -715,6 +747,21 @@ class _Encoder:
                 content = hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest()
             record = {"kind": "ndarray", "dtype": self._dtype(value.dtype, path + ".dtype"),
                       "shape": list(value.shape), "content": content}
+            if not self.sources_only and value.dtype.kind == "b":
+                # tolist() maps any nonzero storage byte to True.
+                logical = np.not_equal(value, False).astype(np.uint8)
+                record["display_content"] = hashlib.sha256(logical.tobytes()).hexdigest()
+            elif (not self.sources_only and value.dtype.kind == "f" and value.dtype.itemsize in (2, 4, 8)):
+                # JSON maps all nonfinite values to null. Bind the observable
+                # entries independently of the original NaN payloads or signs.
+                with np.errstate(invalid="ignore"):
+                    finite = np.isfinite(value)
+                if finite.all():
+                    record["display_content"] = content
+                else:
+                    logical = value.copy(order="C")
+                    logical[~finite] = np.nan
+                    record["display_content"] = hashlib.sha256(logical.tobytes()).hexdigest()
             if (not self.in_rng_state and (self.in_function or value.ndim == 1 and value.dtype == np.uint32)
                     and (not self.sources_only or self.observe_rng or self.split_limits is not None)):
                 if self.external_seed_buffers is None:
@@ -740,6 +787,10 @@ class _Encoder:
             entries = [[self.encode(key, f"{path}.items[{index}].key"),
                         self.encode(item, f"{path}.items[{index}].value")]
                        for index, (key, item) in enumerate(value.items())]
+            if not self.sources_only:
+                for key, (declaration, _) in zip(value, entries):
+                    if type(key) in (np.float16, np.float32, np.float64, np.longdouble):
+                        declaration["key_text"] = str(key)
             # Insertion order is part of Python dict semantics. A dict-valued
             # transformer parameter may intentionally specify ordered steps.
             return {"kind": "dict", "items": entries}

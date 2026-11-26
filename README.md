@@ -95,6 +95,8 @@ cross-validation.
 Using the training split above, this example searches a small grid. By default,
 `calibration_search` ranks candidates by mean fold accuracy. Set
 `scoring="balanced_accuracy"` to give each class equal weight in the score.
+Keep `y_train` fixed throughout the search so every candidate is scored
+against the same labels in each validation fold.
 
 ```python
 from supervised_nmf.evaluation import calibration_search

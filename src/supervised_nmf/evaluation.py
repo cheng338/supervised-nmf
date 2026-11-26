@@ -59,9 +59,17 @@ from threadpoolctl import threadpool_info, threadpool_limits
 from .classifier import (NMFClassifier, _capture_projection, _record_warnings, _uses_projection_diagnostics,
                          _knn_probabilities_preserve_labels)
 from .decomposition import FeatureSPA
-from ._calibration import _score_fields, _score_predictions, _validate_scoring
+from ._calibration import _score_fields, _score_label_values, _score_predictions, _validate_scoring
+from ._calibration_report import (
+    _AUDITED_TARGET_VERSIONS, _BALANCED_SUPPORT_METHOD, _EXTRA_LABEL_WARNING, _FLOAT_BOUNDARY, _FLOAT_BOUNDARY_FAILED,
+    _FLOAT_BOUNDARY_PASSED, _FLOAT_OUTSIDE, _FLOAT_SCORE_ERROR, _check_completed_cv_report, _check_original_float_scores,
+    _check_screening_evidence, _decode_calibration_report, _float_label_domain, _json_digest, _may_need_balanced_hits,
+    _scalar_rows_required, load_calibration_report,
+)
 from ._feature_names import _input_feature_names, _named_frame_backend, _named_matrix
-from ._identity import _share_calibration_observation, _source_bytes, configuration_identity, implementation_sources
+from ._identity import (
+    _extended_float_json, _share_calibration_observation, _source_bytes, configuration_identity, implementation_sources,
+)
 from ._labels import _check_labeled_data, _label_values, _validate_class_label, _validate_class_labels
 from ._neighbors import _is_integer_index
 from ._search_diagnostics import mark_inactive_refinement, screening_grid_diagnostics
@@ -108,25 +116,6 @@ class _TrackedLinearSVC(LinearSVC):
         self.convergence_warnings_ = messages
         self.converged_ = not messages
         return result
-
-
-def _extended_float_json(value):
-    """Encode an unboxable NumPy float exactly, without narrowing its range."""
-    if not np.isfinite(value):
-        return None
-    numerator, denominator = value.as_integer_ratio()
-    if numerator == 0:
-        significand = "-0" if np.signbit(value) else "0"
-        exponent = 0
-    else:
-        # A binary float has a power-of-two denominator. Remove powers of two
-        # from the numerator too, keeping even extreme values compact.
-        magnitude = abs(numerator)
-        shift = (magnitude & -magnitude).bit_length() - 1
-        significand = str(numerator >> shift)
-        exponent = shift - (denominator.bit_length() - 1)
-    return {"__supervised_nmf_scalar__": "longdouble-v1",
-            "significand": significand, "exponent": exponent}
 
 
 def _jsonable(value):
@@ -253,8 +242,7 @@ def write_json(path, report):
 
 
 def _digest(value):
-    return hashlib.sha256(json.dumps(_jsonable(value), sort_keys=True,
-                                    allow_nan=False).encode("utf-8")).hexdigest()
+    return _json_digest(_jsonable(value))
 
 
 def save_data_manifest(path, manifest):
@@ -450,9 +438,231 @@ def new_run_directory(root, prefix="development"):
     return path
 
 
-def _warning_records(caught):
-    return [{"category": w.category.__name__, "message": str(w.message)}
-            for w in caught]
+def _warning_records(caught, *, classify_convergence=False):
+    records = []
+    for w in caught:
+        item = {"category": w.category.__name__, "message": str(w.message)}
+        if classify_convergence:
+            item["is_convergence_warning"] = issubclass(w.category, ConvergenceWarning)
+        records.append(item)
+    return records
+
+
+def _record_balanced_hits(score, truth, predictions, classes, counts, record):
+    """Save a direct scorer witness when reverse rounding may be indeterminate."""
+    if counts is None or not _may_need_balanced_hits(score, *counts):
+        return
+    if any(type(array) is not np.ndarray for array in (truth, predictions, classes)):
+        return
+    kinds = {truth.dtype.kind, predictions.dtype.kind}
+    # The caller has already ruled out a lossy numeric label lookup.
+    # Object-dtype comparison could re-enter user code.
+    if kinds != {"U"} and not kinds <= {"b", "i", "u", "f"}:
+        return
+    correct = truth == predictions.reshape(-1)
+    first = int(np.count_nonzero(correct & (truth == classes[0])))
+    second = int(np.count_nonzero(correct)) - first
+    if (first / counts[0] + second / counts[1]) / 2 == score:
+        record["balanced_accuracy_hits"] = [first, second]
+
+
+def _native_text_dtype(dtype):
+    return dtype.kind == "U" and dtype.type is np.str_ or dtype.kind == "S" and dtype.type is np.bytes_
+
+
+_NUMPY_SCALAR_TYPES = tuple(np.dtype(code).type for code in np.typecodes["All"])
+_CUSTOM_SCALAR_INPUTS = {(False, False): "none", (True, False): "target",
+                         (False, True): "prediction", (True, True): "both"}
+
+
+def _custom_scorer_scalar(dtype):
+    if dtype.isbuiltin == 1 or dtype.kind == "O":
+        return False
+    if dtype.kind in "US":
+        return not _native_text_dtype(dtype)
+    # A descriptor with metadata or a nonnative byte order can still use a
+    # stock scalar. Identity comparisons cannot call a custom metaclass.
+    return all(dtype.type is not scalar for scalar in _NUMPY_SCALAR_TYPES)
+
+
+def _original_float_target_policy(classes):
+    if classes.dtype.kind != "f" or _custom_scorer_scalar(classes.dtype):
+        return None
+    if not np.isfinite(classes).all():
+        raise ValueError("Calibration requires finite original floating class labels.")
+    domain = _float_label_domain(classes)
+    if domain != _FLOAT_BOUNDARY:
+        return domain
+    # Mirror type_of_target for the sole platform-sensitive endpoint, in
+    # the original dtype and before any estimator can change the target.
+    with np.errstate(invalid="ignore", over="ignore"):
+        roundtrips = np.array_equal(classes, classes.astype(np.int64).astype(classes.dtype))
+    return _FLOAT_BOUNDARY_PASSED if roundtrips else _FLOAT_BOUNDARY_FAILED
+
+
+def _plain_object_strings(values):
+    return values.dtype.type is np.object_ and all(type(v) is str or type(v) is np.str_ for v in values.flat)
+
+
+def _unique_cache_state(dtype):
+    metadata = dtype.metadata
+    if metadata is None:
+        return None
+    # Looking up "unique" directly could invoke an opaque key's equality.
+    state = None
+    for key, value in metadata.items():
+        if type(key) is not str:
+            return "opaque"
+        if key == "unique":
+            if type(value) is not np.ndarray or not (
+                value.dtype.kind in "biuf" and value.dtype.isbuiltin == 1 or _native_text_dtype(value.dtype)
+            ):
+                return "opaque"
+            state = "native"
+    return state
+
+
+def _score_confusion_rows(truth, predictions, caught, record, *, prediction_cache=...):
+    # This is sklearn's NumPy balanced_accuracy_score calculation on the
+    # observed unweighted matrix. Re-entering the cache to assign these rows
+    # to the original classes can change the answer or a subsequent fold.
+    # A label-cache callback or warning hook can change the original array's
+    # dtype while sklearn scores a flattened view. Observe the normalized
+    # input before calling sklearn, without invoking any cache key.
+    dtype = predictions.dtype
+    if prediction_cache is ...:
+        prediction_cache = _unique_cache_state(dtype)
+    prediction = {"dtype_kind": dtype.kind, "has_unique_cache": prediction_cache is not None,
+                  "opaque_unique_cache": prediction_cache == "opaque"}
+    if dtype.kind in "US":
+        prediction["native_text"] = _native_text_dtype(dtype)
+    elif dtype.kind == "O":
+        # A string subclass can replace the array's dtype/cache when sklearn
+        # probes the scalar. Type identity observes the input without calling
+        # string methods, equality, or a user-defined metaclass.
+        prediction["plain_string_values"] = _plain_object_strings(predictions)
+    matrix = confusion_matrix(truth, predictions)
+    counts, hits = matrix.sum(axis=1), matrix.diagonal()
+    present = counts != 0
+    warning_index = None
+    if not np.all(present):
+        # The public scorer must issue its own warning: filters may match
+        # sklearn's module or source line and may turn it into a fold error.
+        # Each populated row needs only its hits and misses to preserve its
+        # recall. The extra prediction label has empty true support even
+        # if all the off-diagonal weights are zero.
+        row = np.arange(np.count_nonzero(present))
+        correct = hits[present]
+        incorrect = counts[present] - correct
+        start = len(caught)
+        if len(row):
+            score = float(balanced_accuracy_score(
+                np.tile(row, 2), np.concatenate((row, np.full_like(row, len(row)))),
+                sample_weight=np.concatenate((correct, incorrect)),
+            ))
+        else:
+            # sklearn rejects all-zero sample weights. Opposite weights in
+            # the same cell reproduce its empty matrix and nonfinite score.
+            score = float(balanced_accuracy_score([0, 0], [1, 1], sample_weight=[1, -1]))
+        if (len(caught) > start and caught[start].category is UserWarning
+                and str(caught[start].message) == _EXTRA_LABEL_WARNING):
+            warning_index = start
+    else:
+        score = float(np.mean(hits / counts))
+    if not math.isfinite(score):
+        raise ValueError("Nonfinite calibration score.")
+    record["balanced_accuracy_confusion_rows"] = {
+        "rows": [[int(count), int(hit)] for count, hit in zip(counts[present], hits[present])],
+        "matrix_size": matrix.shape[0],
+        "warning_index": warning_index,
+        "prediction": prediction,
+    }
+    return score
+
+
+def _integer_promotion_can_lose_labels(truth_dtype, pred_dtype, classes):
+    if (truth_dtype == pred_dtype or truth_dtype.kind not in "biuf" or pred_dtype.kind not in "biuf"
+            or truth_dtype.kind not in "iu" and pred_dtype.kind not in "iu"):
+        return False
+    joint = np.result_type(truth_dtype, pred_dtype)
+    if joint.kind != "f":
+        return False
+    precision = np.finfo(joint).nmant + 1
+    if pred_dtype.kind in "iu" and 8 * pred_dtype.itemsize - (pred_dtype.kind == "i") > precision:
+        return True
+    if truth_dtype.kind in "iu" and 8 * truth_dtype.itemsize - (truth_dtype.kind == "i") > precision:
+        # Only two actual target labels need checking, even for a large fold.
+        return any(abs(int(label)) > 1 << precision for label in classes)
+    return False
+
+
+def _score_calibration_fold(scoring, truth, predictions, classes, caught, record, validation_counts=None):
+    if scoring != "balanced_accuracy":
+        return _score_predictions(scoring, truth, predictions)
+    # Convert the caller's predictions once, before attributing warnings to
+    # the scorer. The arrays used for the lookup are the arrays it scored.
+    truth = _label_values(truth)
+    predictions = _label_values(_validate_class_labels(predictions))
+    truth_dtype, pred_dtype = truth.dtype, predictions.dtype
+    truth_kind, pred_kind = truth_dtype.kind, pred_dtype.kind
+    truth_cache = _unique_cache_state(truth_dtype) if truth_dtype.metadata is not None else None
+    prediction_cache = _unique_cache_state(pred_dtype) if pred_dtype.metadata is not None else None
+    has_unique_cache = truth_cache is not None or prediction_cache is not None
+    custom = _CUSTOM_SCALAR_INPUTS[_custom_scorer_scalar(truth_dtype), _custom_scorer_scalar(pred_dtype)]
+    # Object, record and custom scalar operations can run user code and change
+    # a label lookup during the metric, even when both caches start empty.
+    observe_rows = (_scalar_rows_required(truth_kind, pred_kind, custom)
+                    or truth_cache == "opaque" or prediction_cache == "opaque"
+                    or has_unique_cache and (truth_kind not in "biuf" or pred_kind not in "biuf"))
+    if truth_kind == "O":
+        plain_truth = _plain_object_strings(truth)
+    start = len(caught)
+    if observe_rows:
+        score = _score_confusion_rows(truth, predictions, caught, record, prediction_cache=prediction_cache)
+    else:
+        score = _score_label_values(scoring, truth, predictions)
+    # Training slices share the dtype's metadata values with validation.
+    # The fold's pre-score observation can differ from the request identity.
+    record["balanced_accuracy_target_cache"] = truth_cache or "none"
+    record["balanced_accuracy_prediction_kind"] = pred_kind
+    record["balanced_accuracy_custom_scalar_inputs"] = custom
+    if truth_kind == "O":
+        record["balanced_accuracy_target_plain_strings"] = plain_truth
+    if observe_rows:
+        return score
+    if not has_unique_cache and not _integer_promotion_can_lose_labels(truth.dtype, predictions.dtype, classes):
+        _record_balanced_hits(score, truth, predictions, classes, validation_counts, record)
+        return score
+    warning_index = None
+    for index in range(start, len(caught)):
+        w = caught[index]
+        if (w.category is UserWarning and w.filename.replace("\\", "/").endswith("/sklearn/metrics/_classification.py")
+                and str(w.message) == _EXTRA_LABEL_WARNING):
+            warning_index = index
+            break
+    # The scorer warns about an empty confusion row. A missing prediction
+    # can drop an observation while leaving both class rows populated.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        matrix = confusion_matrix(truth, predictions)
+        retained, correct = int(matrix.sum()), int(matrix.trace())
+        if retained == len(truth) and (validation_counts is None
+                                       or not _may_need_balanced_hits(score, *validation_counts)):
+            return score
+        del matrix
+        # Weight the original first class to identify it even if the scorer
+        # omitted that class or inserted extra label rows.
+        first = confusion_matrix(truth, predictions, sample_weight=(truth == classes[0]).astype(np.int64))
+    first_count, first_hits = int(first.sum()), int(first.trace())
+    counts = [first_count, retained - first_count]
+    hits = [first_hits, correct - first_hits]
+    if 0 < retained < len(truth):
+        record["balanced_accuracy_support"] = {"warning_index": warning_index, "class_counts": counts}
+        record["balanced_accuracy_hits"] = hits
+    elif validation_counts is not None and min(counts) > 0 and _may_need_balanced_hits(score, *counts):
+        if (hits[0] / counts[0] + hits[1] / counts[1]) / 2 == score:
+            record["balanced_accuracy_hits"] = hits
+    return score
 
 
 def _diagnostics(estimator, projection=None):
@@ -519,18 +729,40 @@ def _diagnostics(estimator, projection=None):
     return result
 
 
-def _nonconverged(estimator, caught, projection=None):
+def _nonconverged(estimator, caught, projection=None, *, fold_record=None):
+    flag_checks = {}
+
+    def passed(name, value, *, literal_false=False):
+        result = value is not False if literal_false else bool(value)
+        if fold_record is not None:
+            kind = type(value)
+            exact = kind is bool or (not literal_false and (kind is int or kind is float))
+            flag_checks[name] = {"passed": result, "exact_scalar": exact}
+        return result
+
     final_classifier = estimator.steps[-1][1] if isinstance(estimator, Pipeline) and estimator.steps else None
     if _uses_projection_diagnostics(estimator):
-        projection_failed = (projection is not None
-                             and projection.get("last_transform_converged") is False)
+        projection_failed = not passed("last_transform_converged",
+                                       None if projection is None else projection.get("last_transform_converged"),
+                                       literal_false=True)
     else:
-        projection_failed = not bool(getattr(estimator, "last_transform_converged_", True))
-    return (any(issubclass(w.category, ConvergenceWarning) for w in caught)
-            or not bool(getattr(estimator, "converged_", True))
-            or not bool(getattr(estimator, "classifier_converged_", True))
-            or not bool(getattr(final_classifier, "converged_", True))
-            or projection_failed)
+        projection_failed = not passed("last_transform_converged", getattr(estimator, "last_transform_converged_", True))
+    # Estimator properties evaluated below can emit new warnings. Only this
+    # prefix was available when sklearn warning types decided the outcome.
+    if fold_record is not None:
+        checked = len(caught)
+    warned = any(issubclass(w.category, ConvergenceWarning) for w in caught)
+    failed = (warned or not passed("converged", getattr(estimator, "converged_", True))
+              or not passed("classifier_converged", getattr(estimator, "classifier_converged_", True))
+              or not passed("final_classifier_converged", getattr(final_classifier, "converged_", True))
+              or projection_failed)
+    if fold_record is not None:
+        fold_record["convergence_check"] = {
+            "warnings_checked": checked,
+            "reason": "warning" if warned else "estimator" if failed else None,
+            "flag_checks": flag_checks,
+        }
+    return failed
 
 
 def support_recovery(estimator, signal_support):
@@ -710,7 +942,7 @@ def _wide_builtin_integer(value):
             and int(value).bit_length() > 53)
 
 
-def refinement_diagnostics(candidates, selected_params, *, _rank_coordinates=None):
+def refinement_diagnostics(candidates, selected_params, *, _rank_coordinates=None, _archive_axes=None):
     """Flag range boundaries and interior intervals; this is not completed tuning."""
     if selected_params is None:
         return {"status": "pending_valid_candidate", "parameters": {}}
@@ -751,6 +983,16 @@ def refinement_diagnostics(candidates, selected_params, *, _rank_coordinates=Non
             includes_none = any(value is None for value in values)
             values = sorted(set(int(v) if _wide_builtin_integer(v) else float(v) for v in values
                                 if isinstance(v, numeric_types) and not isinstance(v, boolean_types)))
+            if _archive_axes is not None:
+                # Report JSON renders NaN and both infinities as null. Record
+                # the actual coordinates before that conversion, including
+                # the order chosen by this run for incomparable NaNs.
+                coordinates = []
+                for point in values:
+                    if type(point) is float and not math.isfinite(point):
+                        point = "nan" if math.isnan(point) else ("+inf" if point > 0 else "-inf")
+                    coordinates.append(point)
+                _archive_axes[parameter] = {"coordinates": coordinates, "includes_none": includes_none}
             if len(values) > 1:
                 location = values.index(int(selected) if _wide_builtin_integer(selected) else float(selected))
         if len(values) < 2:
@@ -1060,8 +1302,9 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
     At fold publication, a checkpoint records the first observed change to
     configuration structure or a captured NumPy RNG. The current run can
     finish. Reusing marked folds for fitting requires a fresh search, even
-    for a bookkeeping-only change. To read a compatible completed CV-only
-    report, reconstruct the estimator and grid as they were at entry. A callback
+    for a bookkeeping-only change. To inspect a completed CV-only checkpoint,
+    use load_calibration_report(path). Reopening it through calibration_search
+    requires the estimator and grid as they were at entry. A callback
     instance mutated by an earlier call can fail the fingerprint check. A change
     confined to the final refit leaves clean folds available for another refit
     from the original configuration.
@@ -1080,14 +1323,18 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
     raw_y = y
     feature_names = _input_feature_names(X)
     X, y, original_y = _check_labeled_data(X, y)
+    plain_object_target = _plain_object_strings(y) if scoring == "balanced_accuracy" and y.dtype.kind == "O" else None
     classes, counts = np.unique(y, return_counts=True)
     _validate_class_labels(raw_y, y, classes=classes)
+    float_policy = _original_float_target_policy(classes)
     groups = validate_metadata(groups, len(y), name="groups")
     data_ids = validate_metadata(data_ids, len(y), name="data_ids", unique=True)
     split_state = None
     if _private_split_rng(seed):
         split_state = _digest(configuration_identity(seed.get_state(legacy=False)))
-    folds = build_cv_folds(X, y, cv=cv, seed=seed, groups=groups, folds=folds)
+    validation_class_counts = []
+    folds = build_cv_folds(X, y, cv=cv, seed=seed, groups=groups, folds=folds,
+                           _validation_class_counts=validation_class_counts)
     cv = len(folds)
     candidates = list(ParameterGrid(param_grid))
     if not candidates:
@@ -1098,10 +1345,33 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
                                 groups=groups, folds=folds, data_ids=data_ids, scoring=scoring,
                                 _observation=entry_observation, _split_limits=split_limits,
                                 _feature_names=feature_names)
+    if identity["software"].get("scikit-learn") not in _AUDITED_TARGET_VERSIONS:
+        float_policy = None
+    if float_policy is not None:
+        identity["original_float_target_policy"] = float_policy
+    disqualified_target = float_policy in (_FLOAT_OUTSIDE, _FLOAT_BOUNDARY_FAILED)
+    if scoring == "balanced_accuracy":
+        identity["balanced_accuracy_support_method"] = _BALANCED_SUPPORT_METHOD
+    class_labels = _jsonable(classes)
+    identity.update(fold_evidence_version=6, validation_class_counts=validation_class_counts,
+                    class_label_evidence={"dtype_kind": classes.dtype.kind,
+                                          "labels": json.loads(json.dumps(class_labels, allow_nan=False))})
+    if scoring == "balanced_accuracy":
+        # sklearn may consult a "unique" cache supplied by the input dtype.
+        # Observe its possible presence without invoking user metadata objects.
+        identity["class_label_evidence"]["dtype_has_metadata"] = y.dtype.metadata is not None
+        cache = _unique_cache_state(y.dtype)
+        identity["class_label_evidence"]["has_unique_cache"] = cache is not None
+        identity["class_label_evidence"]["opaque_unique_cache"] = cache == "opaque"
+        if y.dtype.kind in "US":
+            identity["class_label_evidence"]["native_text"] = _native_text_dtype(y.dtype)
+        if plain_object_target is not None:
+            identity["class_label_evidence"]["plain_string_values"] = plain_object_target
     if type(estimator) is NMFClassifier:
         y = original_y
     # Identity must validate custom cloning before diagnostics clone anything.
-    screening_diagnostics = screening_grid_diagnostics(estimator, candidates)
+    screening_diagnostics = _jsonable(screening_grid_diagnostics(estimator, candidates))
+    identity["screening_diagnostics_sha256"] = _json_digest(screening_diagnostics)
     uses_global = _uses_global_rng(estimator, candidates, split_limits)
     ambient_entry = _ambient_mt_token() if uses_global else None
     if uses_global:
@@ -1117,6 +1387,11 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
         identity["serial_final"] = True
         identity["cv_joblib"] = _cv_joblib_settings()
     fingerprint = _digest(identity)
+    request_fields = {
+        "scoring": scoring, "class_labels": class_labels, "class_counts": counts.tolist(),
+        "folds": [{"training_indices": training.tolist(), "validation_indices": validation.tolist()}
+                  for training, validation in folds],
+    }
     writer = _checkpoint_file(checkpoint_path)
     closed_cv = serial_final and _comparison_recovery.batch.closed
     if serial_final:
@@ -1131,21 +1406,37 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
         if loaded_checkpoint:
             if _comparison_recovery is not None and _comparison_recovery.unverified_prefix:
                 raise ValueError("Cannot reuse folds after an unverifiable comparison RNG prefix.")
-            report = json.loads(path.read_text(encoding="utf-8"))
+            report = _decode_calibration_report(path.read_bytes())
             if report.get("fingerprint") != fingerprint:
                 raise ValueError("Checkpoint is incompatible with these data, settings, software, or source.")
             saved_digest = report.get("checkpoint_sha256")
             if saved_digest != _digest({k: v for k, v in report.items() if k != "checkpoint_sha256"}):
                 raise ValueError("Checkpoint content failed its integrity check.")
+            _check_screening_evidence(report)
+            if _json_digest(report["identity"]) != fingerprint:
+                raise ValueError("Checkpoint identity disagrees with the requested calibration.")
+            # These fields are displayed separately from the hashed identity.
+            # Use the writer's JSON types: e.g. [False, True] equals [0., 1.] in Python.
+            for key, expected in request_fields.items():
+                if _json_digest(report.get(key)) != _json_digest(expected):
+                    raise ValueError(f"Checkpoint {key} disagrees with the requested calibration.")
+            if disqualified_target:
+                _check_original_float_scores(report)
             if "unverified scalar owner" in split_limits:
                 raise ValueError("Cannot verify the backing storage of a captured NumPy scalar in this checkpoint.")
             if "unverified fit RNG" in split_limits:
-                raise ValueError("Checkpoint reuse requires an estimator random state with verifiable clone behavior.")
+                raise ValueError(
+                    "Checkpoint reuse requires an estimator random state with verifiable clone behavior. "
+                    "For restartable fits, use integer seeds in the estimator and its callbacks. "
+                    "To keep a live RNG, start a fresh search with a new checkpoint path."
+                )
             if uses_global and ambient_entry is None:
                 raise ValueError("Checkpoint cannot identify the estimator's global random state; use an integer estimator seed.")
-            if uses_global and report.get("global_rng_prefix_changed"):
-                if not refit and report.get("state") == "cv_completed":
-                    return CalibrationResult(None, report)
+            prefix_changed = uses_global and report.get("global_rng_prefix_changed")
+            if not refit and report.get("state") == "cv_completed":
+                _check_completed_cv_report(report, report["identity"])
+                return CalibrationResult(None, report)
+            if prefix_changed:
                 # After the last saved fold, a scalar grid needs only score aggregation.
                 complete = set(range(cv))
                 if (refit or any({f["fold"] for f in c["folds"]} != complete for c in report["candidates"])
@@ -1154,16 +1445,11 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
                                for p in candidates for k,v in p.items())):
                     raise ValueError("Checkpoint cannot reproduce the estimator's global random state; use an integer estimator seed.")
             if report.get("resume_eligible") is False:
-                if not refit and report.get("state") == "cv_completed":
-                    return CalibrationResult(None, report)
                 raise ValueError("Checkpoint is ineligible for resume. " + report["resume_ineligibility_reason"])
         else:
             report = {"schema_version": 2, "author": "Chang Cheng", "fingerprint": fingerprint,
-                      "scoring": scoring, "screening_diagnostics": screening_diagnostics,
+                      **request_fields, "screening_diagnostics": screening_diagnostics,
                       "identity": identity, "provenance": provenance(threads),
-                      "class_labels": _jsonable(classes), "class_counts": counts.tolist(),
-                      "folds": [{"training_indices": a.tolist(), "validation_indices": b.tolist()}
-                                for a, b in folds],
                       "candidates": [{"index": i, "parameters": _jsonable(p), "folds": []}
                                      for i, p in enumerate(candidates)],
                       "tuning_seconds": 0.0, "final_fit_seconds": 0.0, "final_fit_attempts": []}
@@ -1274,12 +1560,24 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
                                         predictions = fitted.predict(_named_matrix(X[validation], names))
                                 finally:
                                     record["prediction_seconds"] = time.perf_counter() - inference_start
-                                score = _score_predictions(scoring, y[validation], predictions)
-                                record.update(_score_fields(scoring, score))
-                                record["status"] = "nonconverged" if _nonconverged(fitted, caught, projection) else "valid"
+                                # Scoring can be interrupted after it observes class counts.
+                                # Publish the score and its supporting evidence together.
+                                if disqualified_target:
+                                    # Run the public metric so ordinary scorer errors and warnings
+                                    # survive. A score obtained after changing the ground truth
+                                    # cannot describe this original request.
+                                    _score_predictions(scoring, y[validation], predictions)
+                                    raise ValueError(_FLOAT_SCORE_ERROR)
+                                score_record = {}
+                                score = _score_calibration_fold(scoring, y[validation], predictions, classes,
+                                                                caught, score_record, validation_class_counts[fold])
+                                score_record.update(_score_fields(scoring, score))
+                                record.update(score_record)
+                                nonconverged = _nonconverged(fitted, caught, projection, fold_record=record)
+                                record["status"] = "nonconverged" if nonconverged else "valid"
                             except Exception as error:
                                 record.update(status="failed", error_type=type(error).__name__, error=str(error))
-                        record["warnings"] = _warning_records(caught)
+                        record["warnings"] = _warning_records(caught, classify_convergence=True)
                         if entry_observation is None:
                             check_configuration()
                         if fitted is not None:
@@ -1319,14 +1617,16 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
                             key=lambda c: (-c["mean_score"], c["index"]))
             if not refit:
                 selected = ranked[0] if ranked else None
+                axes = {}
+                refinement = refinement_diagnostics(candidates, None if selected is None else selected["parameters"],
+                                                    _archive_axes=axes)
                 report.update(state="cv_completed", is_fallback=False, refit_performed=False,
                               selected_candidate_index=None if selected is None else selected["index"],
                               selected_parameters=None if selected is None else selected["parameters"],
                               selected_mean_score=None if selected is None else selected["mean_score"],
                               tuning_complete=False, defaults_frozen=False,
-                              refinement=mark_inactive_refinement(
-                                  refinement_diagnostics(candidates, None if selected is None else selected["parameters"]),
-                                  screening_diagnostics, None if selected is None else selected["index"]))
+                              refinement_axis_inputs=axes, refinement=mark_inactive_refinement(
+                                  refinement, screening_diagnostics, None if selected is None else selected["index"]))
                 checkpoint()
                 return CalibrationResult(None, report)
 
@@ -1419,11 +1719,14 @@ def calibration_search(estimator, param_grid, X, y, *, cv=5, seed=0,
                     attempt = {"status": "fallback", "reason": "No candidate passed all folds and final refit."}
                     if feature_names is not None:
                         attempt["input_container"] = "named_numeric_frame"
+                    # DummyClassifier only needs the original class frequencies.
+                    # A fitting callback can have changed the caller's y in place.
+                    fallback_y = np.repeat(classes, counts) if disqualified_target else _label_values(y)
                     if serial_final:
-                        measured_fit(fitted, _label_values(y), attempt, feature_names)
+                        measured_fit(fitted, fallback_y, attempt, feature_names)
                         attempt["seconds"] = attempt["fit_timing"]["seconds"]
                     else:
-                        fitted = fitted.fit(_named_matrix(X, feature_names), _label_values(y))
+                        fitted = fitted.fit(_named_matrix(X, feature_names), fallback_y)
                         attempt["seconds"] = time.perf_counter() - fallback_start
                     report[cost_field] += attempt["seconds"]
                     report["final_fit_attempts"].append(attempt)
@@ -2513,7 +2816,11 @@ def run_comparison(models, X_train, y_train, X_validation, y_validation, *,
         if (restored_plan or saved_model or loaded_model_checkpoint) and "unverified scalar owner" in rng_limits:
             raise ValueError("Cannot verify the backing storage of a captured NumPy scalar in this saved comparison.")
         if (restored_plan or saved_model or loaded_model_checkpoint) and "unverified fit RNG" in rng_limits:
-            raise ValueError("Cannot verify the fit generator in this saved comparison.")
+            raise ValueError(
+                "Cannot verify the fit generator in this saved comparison. "
+                "For restartable fits, use integer seeds in the estimator and its callbacks. "
+                "To keep a live RNG, start a fresh comparison in a new output directory."
+            )
         if uses_global and saved_model and identity["comparison_global_rng_entry"] is None:
             raise ValueError("Cannot verify NumPy global randomness in this comparison.")
         if restored_plan and shares_split:

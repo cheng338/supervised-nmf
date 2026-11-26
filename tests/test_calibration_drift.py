@@ -1,6 +1,5 @@
 """Observed configuration changes affect computational recovery at fold publication."""
 
-from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -29,16 +28,24 @@ def inputs():
 
 
 def configuration(kind):
-    calls = [0]
-    rng = np.random.RandomState(13)
+    if kind == "counter":
+        calls = [0]
 
-    def transform(X):
-        if kind == "counter":
+        def transform(X):
             calls[0] += 1
-        if kind in ("random", "refit-only"):
-            stream = rng if kind == "random" or len(X) == 30 else deepcopy(rng)
-            return X @ stream.normal(size=(X.shape[1], 3))
-        return X
+            return X
+    else:
+        # Keep the projection's ordinary draw state across calls. A live RNG
+        # has a separate checkpoint contract, tested below.
+        state = [np.random.RandomState(13).get_state()]
+
+        def transform(X):
+            stream = np.random.RandomState(0)
+            stream.set_state(state[0])
+            projection = stream.normal(size=(X.shape[1], 3))
+            if kind == "random" or len(X) == 30:
+                state[0] = stream.get_state()
+            return X @ projection
 
     model = Pipeline([("map", FunctionTransformer()), ("tree", ExtraTreeClassifier(random_state=17))])
     return model, {"map__func": [transform] if kind == "refit-only" else [None, transform]}
@@ -126,6 +133,50 @@ def test_marked_completed_reports_are_available_as_archives(tmp_path):
             run(comparison, "counter", comparison=True)
     fit.assert_not_called()
     writes.assert_not_called()
+
+
+@pytest.mark.parametrize("draw", [False, True], ids=["unused", "advancing"])
+def test_completed_cv_checks_rng_captured_by_callback(tmp_path, draw):
+    X, y = inputs()
+    path = tmp_path / "cv.json"
+
+    def search():
+        rng = np.random.RandomState(13)
+
+        def transform(X):
+            if draw:
+                return X @ rng.normal(size=(X.shape[1], 3))
+            return X
+
+        model = Pipeline([("map", FunctionTransformer(transform)), ("tree", ExtraTreeClassifier(random_state=17))])
+        return evaluation.calibration_search(model, {}, X, y, cv=3, seed=5, refit=False, checkpoint_path=path)
+
+    first = search().report
+    assert first["state"] == "cv_completed"
+    assert [fold["status"] for fold in first["candidates"][0]["folds"]] == ["valid"] * 3
+    if draw:
+        assert first["resume_eligible"] is False
+        assert (first["resume_ineligibility_candidate_index"], first["resume_ineligibility_fold"]) == (0, 0)
+    else:
+        assert first.get("resume_eligible", True)
+    before = path.read_bytes()
+
+    with patch.object(ExtraTreeClassifier, "fit") as fit, patch.object(
+        evaluation, "write_json", wraps=evaluation.write_json
+    ) as writes:
+        if np.__version__.split(".", 1)[0] == "2":
+            archived = search()
+            assert archived.estimator is None
+            assert archived.report["candidates"] == first["candidates"]
+            if draw:
+                writes.assert_not_called()
+                assert path.read_bytes() == before
+        else:
+            with pytest.raises(ValueError, match="verifiable clone behavior"):
+                search()
+            writes.assert_not_called()
+            assert path.read_bytes() == before
+        fit.assert_not_called()
 
 
 def test_refit_only_mutation_can_repeat_full_training_fit(tmp_path):

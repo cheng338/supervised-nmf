@@ -306,14 +306,14 @@ def _qualified_rows(design, targets, coefficients, *, matmul=np.matmul, cross_sc
     from the 1e-12 stopping tolerance. Negative coefficients are not silently
     clipped: a row with even a small negative value uses the reference solver.
     A supplied cross_scale belongs to this exact admitted nonnegative BPP
-    design/target block. Other callers retain original-design recomputation.
+    block. Reuse requires the same target layout as the absolute-value product.
     """
     feasible = np.isfinite(coefficients).all(axis=0) & (coefficients >= 0).all(axis=0)
     with np.errstate(over="ignore", invalid="ignore", under="ignore"):
         fitted = matmul(design, coefficients)
         residual = fitted - targets
         gradient = matmul(design.T, residual)
-        if cross_scale is None:
+        if cross_scale is None or not _matches_absolute_layout(targets):
             cross_scale = matmul(design.T, np.abs(targets))
         # The original test adds a nonnegative roundoff allowance. If every
         # feasible column already passes the smaller tolerance, we only need
@@ -355,6 +355,18 @@ def _qualified_rows(design, targets, coefficients, *, matmul=np.matmul, cross_sc
         active_rhs = np.any(targets != 0, axis=0)
         representable = ~active_rhs | np.any(cross_scale >= np.finfo(float).tiny, axis=0)
     return feasible & finite & kkt & representable
+
+
+def _matches_absolute_layout(targets):
+    # np.abs makes an aligned, compact array. A differently strided operand
+    # can choose another native reduction and change a KKT boundary decision.
+    if type(targets) is not np.ndarray or not targets.flags.aligned:
+        return False
+    height, width = targets.shape
+    item = targets.itemsize
+    if targets.flags.c_contiguous:
+        return targets.strides == (width * item, item)
+    return targets.flags.f_contiguous and targets.strides == (item, height * item)
 
 
 def project_nnls(design, rows, *, solver="auto", maxiter=None, batch_size=256,

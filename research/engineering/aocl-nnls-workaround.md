@@ -50,9 +50,13 @@ product and NNLS objective are unchanged. Floating-point rounding can differ,
 so SPA's original-design KKT checks and public SciPy fallback remain in place.
 
 Covered SPA products include the package's batched NNLS and QR-reduction paths.
-Batched qualification reuses the existing cross product for the exact admitted
-design/target block; QR qualification still recomputes that scale when it is not
-supplied. Conditional branches, repeated iterations and split products mean
+Batched qualification reuses the cross product for the same admitted
+design/target block when the targets have the aligned, compact C or Fortran
+strides of their absolute-value array. For other layouts it computes the
+qualification scale with the absolute-value array. A layout change can alter
+the last bits of a native dot product and affect a threshold comparison.
+QR qualification computes the scale in the original space.
+Conditional branches, repeated iterations and split products mean
 there is no fixed count of executed native products per solve. The policy also
 covers the experimental solver's selected products and its projected-gradient
 residual/gradient calculations. It does not intercept NumPy, SciPy or

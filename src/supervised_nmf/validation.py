@@ -437,7 +437,7 @@ def _indices(values, n_samples, role):
     return array.astype(np.intp, copy=True)
 
 
-def build_cv_folds(X, y, *, cv=5, seed=0, groups=None, folds=None):
+def build_cv_folds(X, y, *, cv=5, seed=0, groups=None, folds=None, _validation_class_counts=None):
     """Build or validate an exhaustive binary-classification CV partition.
 
     Without ``groups``, use shuffled stratified folds. With one subject ID per
@@ -495,12 +495,19 @@ def build_cv_folds(X, y, *, cv=5, seed=0, groups=None, folds=None):
             raise ValueError("Every training fold must be the complement of its validation fold.")
         if group_keys is not None and set(group_keys[train].tolist()) & set(group_keys[valid].tolist()):
             raise ValueError("Training and validation groups must not overlap.")
-        if any(np.sum(y[valid] == label) == 0 for label in classes):
-            raise ValueError("Every validation fold must contain both classes.")
+        observed = []
+        for label in classes:
+            count = np.sum(y[valid] == label)
+            if count == 0:
+                raise ValueError("Every validation fold must contain both classes.")
+            if _validation_class_counts is not None:
+                observed.append(int(count))
         if any(np.sum(y[train] == label) < 2 for label in classes):
             raise ValueError("Every training fold requires at least two samples per class for screening.")
         validation_counts[valid] += 1
         normalized.append((train, valid))
+        if _validation_class_counts is not None:
+            _validation_class_counts.append(observed)
     if not np.all(validation_counts == 1):
         raise ValueError("Validation folds must partition the rows exactly once.")
     return normalized

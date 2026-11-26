@@ -123,7 +123,8 @@ def observed_qualification(monkeypatch, qualified, route, design, targets,
         mask = qualified(design, targets, coefficients, matmul=operation,
                          cross_scale=cross)
     assert [snapshot(value) for value in inputs] == before
-    assert len(products) == (4 if cross is None else 3)
+    reuse = cross is not None and targets.flags.aligned and targets.strides == np.abs(targets).strides
+    assert len(products) == (3 if reuse else 4)
     fitted, gradient = products[:2]
     roundoff = products[-1]
     assert fitted["left"] is design and fitted["right"] is coefficients
@@ -131,7 +132,11 @@ def observed_qualification(monkeypatch, qualified, route, design, targets,
     assert gradient["right"].tobytes() == (fitted["result"] - targets).tobytes()
     fitted_abs = [row for row in absolute if row["input"] is fitted["result"]]
     target_abs = [row for row in absolute if row["input"] is targets]
-    assert len(fitted_abs) == 1 and len(target_abs) == (2 if cross is None else 1)
+    assert len(fitted_abs) == 1 and len(target_abs) == (1 if reuse else 2)
+    if not reuse:
+        assert products[2]["right"] is target_abs[0]["result"]
+        np.testing.assert_array_equal(products[2]["left"], design.T)
+        assert products[2]["result"].tobytes() == selected(design.T, np.abs(targets)).tobytes()
     owned = fitted_abs[0]["result"]
     assert owned is roundoff["right"] and owned.flags.owndata and owned.base is None
     assert owned.flags.writeable and owned.flags.c_contiguous
@@ -167,7 +172,13 @@ def test_native_dense_cross_roundoff_and_near_kkt_interaction(
     first = len(native)
     recomputed = selected(design.T, absolute_targets)
     recomputed_split = check_native_route(selected, native[first:], design.T, absolute_targets)
-    assert cross.tobytes() == recomputed.tobytes()
+    if kind == "c":
+        assert cross.tobytes() == recomputed.tobytes()
+    else:
+        reference = independent_product(design.T, targets)
+        for product in (cross, recomputed):
+            np.testing.assert_allclose(product, reference, atol=0,
+                                       rtol=2 * height * np.finfo(float).eps)
     if selected is _aocl.padded_matmul:
         assert cached_split == (kind == "c") and recomputed_split
     cross.setflags(write=False)
@@ -238,8 +249,7 @@ def test_actual_public_full_and_tail_blocks_keep_cross_masks_and_fallback_exact(
             aa, bb, cross, before = batches[-1]
             assert a is aa and b is bb and cross_scale is cross and matmul is selected
             assert snapshot(cross) == before
-            expected_cross = selected(a.T, np.abs(b))
-            assert cross.tobytes() == expected_cross.tobytes()
+            assert cross.tobytes() == selected(a.T, b).tobytes()
             if layout == "canonical-full":
                 assert b.flags.c_contiguous and b.strides == (count * 8, 8)
             elif layout == "strided-target-tail":
@@ -247,6 +257,8 @@ def test_actual_public_full_and_tail_blocks_keep_cross_masks_and_fallback_exact(
                 assert np.abs(b).flags.c_contiguous
             else:
                 assert b.flags.f_contiguous and not b.flags.c_contiguous
+            if layout != "strided-target-tail":
+                assert cross.tobytes() == selected(a.T, np.abs(b)).tobytes()
             mask, products = observed_qualification(monkeypatch, qualified,
                 native_route, a, b, coefficients, None if recompute else cross)
             assert snapshot(cross) == before

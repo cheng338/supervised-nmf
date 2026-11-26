@@ -211,9 +211,14 @@ def test_native_dense_rounding_and_near_kkt_admission_match_recomputation(kind):
     product = _nnls.nnls_matmul()
     cross = product(design.T, targets)
     recomputed = product(design.T, np.abs(targets))
-    # This deliberately tests bytes, not an allclose relaxation: layout-induced
-    # product rounding is one of the unresolved premises of unrestricted D27.
-    assert cross.tobytes(order="C") == recomputed.tobytes(order="C")
+    if kind in ("c", "f"):
+        assert cross.tobytes(order="C") == recomputed.tobytes(order="C")
+    else:
+        # Two reductions of positive terms can each incur dot-product roundoff.
+        expected_product = reference(design.T, targets)
+        for value in (cross, recomputed):
+            np.testing.assert_allclose(value, expected_product, atol=0,
+                                       rtol=2 * len(design) * np.finfo(float).eps)
     before = identity_record(design), identity_record(targets), identity_record(cross)
     for perturbation in (0.0, -1e-12, 1e-14, 1e-12, 1e-10):
         coefficients = truth.copy()
@@ -223,6 +228,33 @@ def test_native_dense_rounding_and_near_kkt_admission_match_recomputation(kind):
             design, targets, coefficients, matmul=product, cross_scale=cross)
         assert actual.tobytes() == expected.tobytes()
     assert before == (identity_record(design), identity_record(targets), identity_record(cross))
+
+
+@pytest.mark.parametrize("layout", ["c", "unaligned", "singleton-stride"])
+def test_qualification_uses_absolute_product_when_native_target_layout_changes(layout):
+    tiny = np.finfo(float).tiny
+    if layout == "unaligned":
+        targets = np.ndarray((1, 2), dtype=float, buffer=bytearray(17), offset=1)
+    elif layout == "singleton-stride":
+        targets = np.empty((2, 4))[:1, :2]
+    else:
+        targets = np.empty((1, 2))
+    targets[:] = tiny
+    assert targets.flags.c_contiguous
+    assert (targets.flags.aligned and targets.strides == np.abs(targets).strides) == (layout == "c")
+    design = np.ones((1, 1))
+    products = []
+
+    def product(left, right):
+        products.append(right)
+        return reference(left, right)
+
+    # A one-ulp difference in scale crosses the normal/subnormal boundary.
+    # Inject that difference in the supplied cross to distinguish actual use.
+    cached = np.full_like(targets, np.nextafter(tiny, 0.))
+    mask = _nnls._qualified_rows(design, targets, targets, matmul=product, cross_scale=cached)
+    assert mask.tolist() == [layout != "c"] * 2
+    assert len(products) == (3 if layout == "c" else 4)
 
 
 def public_comparison(monkeypatch, design, rows, solver, *, maxiter=17, batch_size=13):

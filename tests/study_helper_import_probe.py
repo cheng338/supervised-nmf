@@ -153,14 +153,24 @@ def recovery_conflict(source, work, state):
 
 
 def recovery_terminal(work):
-    recovery = importlib.import_module("recovery_store")
-    assert "numeric_codec" not in sys.modules
-    store = recovery.RecoveryStore(work / "store", {"case": "terminal"})
-    assert store.commit({"evaluation": {"status": "failed"}})["kind"] == "terminal"
-    assert store.load_outcome()["manifest"]["kind"] == "terminal"
-    assert "numeric_codec" not in sys.modules
-    assert not any(name.split(".")[0] in ("numpy", "scipy", "sklearn", "joblib", "threadpoolctl")
-                   for name in sys.modules)
+    watched = {"numpy", "scipy", "sklearn", "joblib", "threadpoolctl", "numeric_codec"}
+    assert watched.isdisjoint(sys.modules)
+    attempts = []
+
+    class ObserveImports:
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname.partition(".")[0] in watched:
+                attempts.append(fullname)
+            return None
+
+    # Record even optional lookups whose ImportError the helper might catch.
+    with patch.object(sys, "meta_path", [ObserveImports(), *sys.meta_path]):
+        recovery = importlib.import_module("recovery_store")
+        store = recovery.RecoveryStore(work / "store", {"case": "terminal"})
+        assert store.commit({"evaluation": {"status": "failed"}})["kind"] == "terminal"
+        assert store.load_outcome()["manifest"]["kind"] == "terminal"
+    assert not attempts, attempts
+    assert watched.isdisjoint(sys.modules)
 
 
 def recovery_admission(source, work, name):

@@ -34,8 +34,11 @@ def test_study_helper_import_boundary(case, tmp_path_factory):
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                  "BLIS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         environment[name] = "1"
+    # Terminal outcomes require only the standard library. Site startup hooks
+    # can preload numerical packages before the probe gets control (Windows AOCL).
+    startup = ["-I", "-B", "-S"] if case == "recovery-terminal" else ["-I", "-B"]
     result = subprocess.run(
-        [sys.executable, "-I", "-B", str(PROBE), str(ROOT), str(work), case],
+        [sys.executable, *startup, str(PROBE), str(ROOT), str(work), case],
         env=environment, capture_output=True, text=True, encoding="utf-8", timeout=90,
     )
     assert result.returncode == 0, (case, result.stdout, result.stderr)

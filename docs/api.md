@@ -438,9 +438,11 @@ per-observation recovery when needed. The output dtype follows the rules above.
 
 During fixed-basis MU projection, a positive denominator can be too small to
 represent even when the updated coordinate is representable. The projection
-checks for this loss with scikit-learn 1.6.1, 1.7.0–1.7.2, 1.8.0 and
-1.9.0–1.9.1 and recovers the coordinate when needed. On other versions,
-ordinary batch projection delegates to the fitted estimator's transform.
+checks for this loss with scikit-learn 1.9.0 and 1.9.1 and recovers the
+coordinate when needed. Versions 1.6.1, 1.7.0–1.7.2 and 1.8.0 were also
+qualified for this check before the package minimum rose to 1.9.0.
+On versions outside this list, ordinary batch projection delegates to the
+fitted estimator's transform.
 Rowwise projection still solves each observation independently, with the
 additional denominator check disabled. If you replace `numpy.dot`
 to instrument the solve,
@@ -999,8 +1001,14 @@ joblib's reusable loky process pool. Smaller queries execute in the caller.
 Compatible calls reuse workers automatically, including across models; no
 pool or cached fitted basis is serialized with an estimator. First use pays
 startup cost, and joblib retires idle workers. `projection_native_threads=1`
-limits numerical threads per projection process and restores previous limits
-afterward. The controller discovers NumPy/SciPy libraries at first NNLS or
+limits numerical threads during projection. On exit, threadpoolctl restores
+the previously observed effective thread counts. With MKL, threadpoolctl 3.7.0
+restores the calling thread's count as a local setting. If the application
+later changes MKL's global budget, it can resume inheriting that budget on
+this thread by calling `mkl_set_num_threads_local(0)` there.
+[Intel MKL thread-local settings](https://www.intel.com/content/www/us/en/docs/onemkl/developer-reference-c/2025-1/mkl-set-num-threads-local.html)
+
+The controller discovers NumPy/SciPy libraries at first NNLS or
 projection use, which can occur during basis fitting.
 Some native thread-limit controls affect shared process state; use process
 workers for concurrent work.
@@ -1292,6 +1300,26 @@ folds or mutate the caller's grid objects. The final full-training refit starts
 fresh. Shared-KNN calibration reuses a representation only within its training
 fold and compatible representation settings.
 
+Keep `y` fixed throughout `calibration_search`, including in callbacks or
+other code that shares the target array. For object labels, equality matters
+as well as the displayed value. Replacing a string with a subclass that displays
+the same text but compares differently can change which observations count
+toward balanced accuracy and which candidate wins.
+
+`calibration_search` requires finite class labels for native floating-point
+targets, including when scikit-learn's `assume_finite=True` skips its own
+input checks. The search rejects NaN and infinity before fitting or writing a
+checkpoint. With scikit-learn 1.9.0 or 1.9.1, both accuracy
+objectives qualify fold scores against the original native floating-point class
+labels. Both classes occur in every validation fold. Scikit-learn requires each
+value to survive conversion to a signed 64-bit integer and back to the original
+float dtype. A fractional value, even one representable step from an integer,
+fails this check. The search records the local conversion result at the
+platform-sensitive upper boundary `+2**63`. If estimator code changes the
+caller's labels and the metric subsequently returns a score for a disqualified
+request, the fold records a failure and the candidate has no mean score.
+The training-majority fallback uses the original class counts and labels.
+
 These guarantees follow sklearn's ordinary cloning contract. The calibration
 helpers reject frozen estimators and custom `__sklearn_clone__` overrides: their
 retained state is not fully described by constructor parameters, so it cannot
@@ -1329,6 +1357,161 @@ When a general search writes a checkpoint, the file contains the report
 with its `checkpoint_sha256` field. The shared-grid and bounded-rank
 `report.json` files store the report under `payload` with the checksum
 in the sibling `sha256` field.
+
+### Reading a completed CV report
+
+`supervised_nmf.evaluation.load_calibration_report(path)` returns the saved
+report dictionary from a completed schema-2 `calibration_search` checkpoint
+created with `refit=False`. This example looks up the winning parameters
+and their recorded mean validation score.
+
+```python
+from supervised_nmf.evaluation import load_calibration_report
+
+report = load_calibration_report("results/calibration-cv.json")
+winner = report["selected_candidate_index"]
+if winner is None:
+    print("No candidate qualified.")
+else:
+    row = report["candidates"][winner]
+    print(row["parameters"], row["mean_score"])
+```
+
+The file path is the only required input. You can read an existing completed CV-only
+checkpoint even if it records `resume_eligible=False` or the callback's
+original random generator is unavailable. The reader checks the checksum,
+the stored request fingerprint, and whether the recorded fold results,
+candidate scores and selected candidate agree. These checks establish
+internal consistency. Establishing who produced the file requires a trusted
+source. Reproducing the scores requires the original data, configuration
+and computational environment.
+
+Each archived fold score describes the labels the scorer received for that
+candidate. If those labels changed during calibration, the archive alone
+cannot establish what the candidate would have scored on the original labels.
+
+If the recorded evidence leaves a decisive claim unresolved, the reader raises
+`ValueError` identifying the claim. For example, early writers saved a warning's
+class name and message. A solver and a callback could produce identical text
+under different warning classes. If that distinction could change which
+candidate won, or whether anyone qualified, the archive cannot establish
+the result. A candidate already ruled out by an independent failed fold
+does not create that ambiguity. Current writers record the warning
+classification and the point in the fold when eligibility was decided.
+They also save the truth values actually tested on the estimator and its
+classifier. This matters for callbacks, because a value that appears as
+zero in JSON could have evaluated to true during the fit. Reading the
+report uses the recorded decision without invoking the callback.
+
+To check the exact file against an independently retained SHA-256, use
+`load_calibration_report(path, expected_sha256=original_file_digest)`.
+The digest applies to the bytes read from disk. A mismatch raises
+`ValueError`. A match still requires the same checks on the saved scores,
+candidate ranking, class labels and refinement advice. The embedded
+`checkpoint_sha256` covers a different representation.
+
+The reader checks fold coverage, recomputes means and sample standard
+deviations, and applies the original lowest-index tie rule. When the archived
+class dtype and scikit-learn version establish the floating-point check above,
+the reader applies it to every saved fold score, including scores retained by
+failed folds. Older reports with a score that depends on the unrecorded local
+conversion at `+2**63` raise `ValueError`. If an old report omits the target
+dtype and its displayed values could represent either unscorable native floats
+or object labels, the reader cannot verify a saved score. A version-3 retained
+class-count record provides independent evidence of a native numeric target.
+Older writers displayed every nonfinite floating label as `null`. A finite
+class beside that display can still disprove a score. If the original value
+and float format leave the score uncertain, the reader raises `ValueError`.
+This includes a historical float16 target whose infinity actually survived
+the scorer's conversion. Archives containing only unscored failures remain
+readable when their remaining evidence checks pass.
+
+For balanced accuracy, the reader checks that the recorded scores are attainable with a shared
+validation-fold composition. Current reports identify how the writer
+collected the evidence. When a numeric label conversion drops rows, the
+writer saves the retained counts and correct predictions used to check the
+score. If either set of scorer inputs is an object array, uses a custom scalar
+type, or has a label cache that can run caller-defined comparisons, the writer scores one confusion
+matrix and saves each nonempty row's count and number of correct predictions.
+An object label can affect lookup even when both inputs start without a cache.
+If an older report omitted the matrix and its score does not fit the recorded
+validation counts, the reader cannot verify that score.
+The writer also records correct counts for large folds when reversing the
+scorer's rounding can be inconclusive. If the reader exhausts its numerical
+search without verifying that the score is attainable, it raises an error.
+Earlier reports can also lack the class dtype needed to interpret duplicate
+or reversed numeric class displays. For fixed-width byte labels, the reader
+checks the byte values behind the displayed strings and their ordering.
+
+When the recorded labels establish how observations map to native Unicode
+classes, a custom predictor can lose observations during scoring. Each
+retained class count must still fit within that class's validation count.
+For object-array predictions, current reports also record whether the values
+are ordinary strings. A caller-defined string can change how scikit-learn
+looks up a label while it builds the confusion matrix. In that case a single
+true class can genuinely contribute to more than one row. If an older report
+needs that explanation and lacks the observation that distinguishes ordinary
+strings from caller-defined values, the reader reports the uncertainty.
+When both scorer inputs contain ordinary strings and neither has a label
+cache, the confusion matrix must account for every validation observation.
+Each class that occurs only in the predictions requires at least one incorrect
+prediction. These checks also apply to an ordinary-string fold when
+caller-defined labels elsewhere in the request obscure its class counts.
+An ordinary decision tree fitted on the fold's two string classes can predict
+only those classes. If its true validation labels have no cached label list,
+the matrix must include every observation even when the predictions have a
+cache. A cache on the true labels can produce a genuine single-row matrix.
+For scikit-learn 1.9.0 and 1.9.1 the reader also checks whether a reported
+score is possible for the recorded dtypes. A native byte target can explain
+a failed fold. A byte prediction can sometimes score when it is a column and
+caller-defined label keys match its values to the target.
+
+The current writer records the prediction dtype before calling the scorer.
+For each balanced-accuracy score it also records the state of the target's
+label cache at that fold. A custom estimator can change a shared cache during
+fitting even when the target values and validation split stay the same.
+The earlier `confusion-matrix-v1` writer recorded the prediction dtype after scoring. A custom
+label comparison could change that dtype even when the score was valid. If
+such a report records a dtype that conflicts with its score, the reader raises
+`ValueError` because the file does not establish which dtype the scorer saw.
+This check applies to every score the report returns, including a score saved
+before a later step in the same fold failed.
+
+Earlier writers could consult a cached label list after scikit-learn had
+discarded that cache during scoring. On NumPy 2.2.6 with scikit-learn 1.9.0
+or 1.9.1, an old reduced count alone cannot verify a score that is impossible
+on the full validation fold. A stock tree with floating labels could also
+encounter a caller-defined comparison while looking up cached labels. The
+reader requires independent support for the score if that ambiguity matters.
+It raises an error when the score contradicts the recorded counts.
+
+Current checkpoints bind the observed screening diagnostics to the request
+fingerprint. The reader checks the winning candidate's inactive parameters
+and advice against that observation. Fold evidence version 6 also records
+the ordered numeric coordinates used to produce each winning parameter's
+refinement advice, including NaN, positive and negative infinity, and whether
+the grid offered `None`. These observations are saved with the completed
+CV result. They preserve distinctions that the public JSON display renders
+as `null`. The reader checks the advice against the observations and the
+recoverable grid declarations. Older files remain readable when their saved
+evidence settles the advice. For example, the recorded scikit-learn version
+can establish how a stock pipeline applied its screening parameters.
+If a hidden screening override or an unknown coordinate order could change
+the recommendation, the reader reports the unresolved parameter.
+
+Reading a report leaves the checkpoint untouched and performs no fitting or
+resumption. A malformed, detectably inconsistent or unsupported report raises
+`ValueError`. File-access errors such as `FileNotFoundError` propagate to
+the caller. Use the originating workflow for partial checkpoints, refit
+checkpoints, shared-grid and bounded-rank reports, and comparison manifests.
+When `calibration_search` reopens a checkpoint, it checks the saved scoring
+objective, class labels and counts, and fold indices against the live request
+before reusing a fold or updating the file. For example, a checkpoint
+displaying `[0.5, 1.5]` for a request with classes `[0.0, 1.0]` raises
+`ValueError`. A completed CV-only checkpoint also goes through the archive
+reader's checks. Its recorded tuning time must be finite and nonnegative, and
+its thread-pool inventory may be empty. A valid restart returns the saved
+report without fitting or rewriting the checkpoint.
 
 ### Input preparation and CV usage conditions
 
@@ -1413,11 +1596,21 @@ For supported estimator-owned NumPy generators, recovery checks the draw state,
 the seed sequence used to spawn children, and shared references that affect
 the fit. A fresh search can use configurations whose generator state cannot
 be verified for recovery. For example, a generator initialized from a mutable
-seed array can create child streams during a fresh run. If the estimator takes
-a generator and the comparison will be extended later, initialize the generator
-from an integer, such as `np.random.default_rng(123)`. On NumPy 1.26, use
-an integer estimator parameter for restartable fits; the reader cannot verify
-how an estimator-owned generator's child stream survived cloning.
+seed array can create child streams during a fresh run. On NumPy 2.x, if a
+supported estimator takes a generator and the comparison will be extended
+later, initialize the generator from an integer, such as
+`np.random.default_rng(123)`.
+
+On NumPy 1.26, copying a generator can preserve its next ordinary draws
+while losing the seed sequence used for child streams. A fresh calibration
+can fit and save its results with a live NumPy `RandomState` or `Generator`.
+Reopening that CV checkpoint requires verifiable RNG state for the estimator
+and its callbacks, including when a callback captures an RNG that the
+executed branch never uses. An integer seed on the classifier controls only
+the classifier. For restartable fits, remove unused captures and pass each
+randomized estimator its own integer seed. For example, a custom transformer
+can construct a local RNG from its `random_state` integer in `fit`, store the
+projection it draws, and apply that same projection in `transform`.
 
 A function used as an estimator parameter can keep its closure and default
 arguments across fits. When these hold a generator, sharing a container or a
@@ -1514,9 +1707,15 @@ and `resume_ineligibility_fold`, and explains the decision in
 - A compatible, completed `refit=False` checkpoint still returns its
   checksummed CV report. A compatible saved model evaluation still supplies
   its archived predictions and carries the same marker fields with the
-  `calibration_` prefix. For either archive read, reconstruct the estimator
-  and grid as they were at calibration entry. Reusing a callback instance
+  `calibration_` prefix. When reopening through `calibration_search` or
+  `run_comparison`, reconstruct the estimator and grid as they were at
+  calibration entry. Reusing a callback instance
   mutated by an earlier call can fail the entry fingerprint check.
+  `calibration_search` checks the fit RNG before returning a CV archive,
+  even with `refit=False`. On NumPy 1.26 a callback capturing a live
+  NumPy RNG can therefore require a fresh checkpoint path even for a
+  completed CV report. To inspect the saved CV results directly, see
+  [Reading a completed CV report](#reading-a-completed-cv-report).
 - When the folds were clean and a change occurred only during the final refit,
   restart from the original configuration. The search reuses the folds and
   repeats the refit.
@@ -2272,15 +2471,13 @@ preserved. The implementation does not replace query validation with an
 unconditional class-frequency result.
 
 This internal optimization has no public switch. It requires qualified native
-methods, numeric state, error policy and callback behavior. Its current
-additional compatibility checks qualify scikit-learn 1.9.1 with Joblib 1.6.0.
-With scikit-learn 1.9.0 and Joblib 1.5.3, dense brute-force heads also
-qualify when using ordinary serial Joblib dispatch (`n_jobs=None` or `1`),
-native pairwise kernels, and ordinary finite and array-API settings.
-These checks compare the live classifier and its direct operations with the
-source in the installed distribution. The version pairs above were tested
-with stock scikit-learn classifier implementations. Other version pairs and
-unsupported contexts retain the existing native route for this shortcut.
+methods, numeric state, error policy and callback behavior. Among supported
+version pairs, only scikit-learn 1.9.1 with Joblib 1.6.0 qualifies for the
+full-membership shortcut. The checks compare the live classifier and its
+direct operations with the source in the installed distribution. Other pairs,
+including scikit-learn 1.9.0 with Joblib 1.6.0, can still share an ordinary
+full-width neighbor query when eligible. Otherwise, each classifier makes
+its own prediction at its selected neighbor count.
 Custom backends or methods, unsafe coordinate magnitudes and distance-weighted
 heads do not acquire this shortcut merely because their neighbor count equals
 the training size. With BallTree, each fitted head makes its own prediction at

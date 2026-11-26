@@ -7,6 +7,44 @@ records retain their original scope.
 
 Release dates are GitHub publication dates in America/Indianapolis time.
 
+## Unreleased
+
+- Raise the minimum supported NumPy version from 1.26.0 to 1.26.3.
+- Batched NNLS uses the original cross product with absolute-valued targets
+  for its optimality check when taking the absolute value changes the target
+  layout or alignment. This preserves the reference decision for strided inputs.
+- Calibration and comparison checkpoint errors now explain how to restart
+  when an estimator or callback holds a random generator whose state cannot
+  be verified.
+- Add `supervised_nmf.evaluation.load_calibration_report(path)` to read a
+  completed CV-only calibration checkpoint, including one marked ineligible
+  for resumption. The reader raises an error when the saved evidence leaves
+  a decisive score, selection or refinement claim unresolved. An optional
+  SHA-256 verifies the file's bytes. New CV reports retain the convergence
+  checks used for selection and the numeric coordinates used for refinement.
+- Raise the minimum supported SciPy version from 1.11.0 to 1.15.0. Exclude
+  SciPy 1.16.0 and 1.16.1 because repeated NNLS calls leak memory.
+- Raise the minimum supported scikit-learn version from 1.6.1 to 1.9.0.
+  This fixes prediction with string labels for caller-supplied, uniform-weight
+  Manhattan KNN classifiers using brute-force search.
+- Raise the minimum supported threadpoolctl version from 3.1 to 3.7.0.
+  MKL limits now apply to the calling Python thread. This release also removes
+  a spurious OpenMP warning that could stop Windows AOCL fits when warnings
+  were treated as errors.
+- Raise the minimum supported Joblib version from 1.3 to 1.6.0. This fixes
+  resource-tracker errors during process-based projection on CPython 3.15.
+- Require pytest 9.0.3 or later in the test extra. Exclude 9.1.0 because
+  its fixture parametrization regression prevents collection of 32 solver tests.
+- Set pandas minimums in the test extra to 2.1.2 on Python 3.11–3.12,
+  2.2.3 on Python 3.13, 2.3.3 on Python 3.14 and 3.0.6 on Python 3.15
+  and later. Pandas remains optional for ordinary installations.
+- Lower the Matplotlib minimum in the `study` extra from 3.8 to 3.7.3
+  on Python 3.11–3.12. With NumPy 2, the effective minimum is 3.8.4.
+  Require 3.9.2 on Python 3.13, 3.10.5 on 3.14 and 3.11.2 on 3.15 and later.
+- Require Pillow 13.0.0 or later in the `examples` and `study` extras.
+  This fixes excessive memory use when the CelebA loader opens a JPEG
+  with malformed EXIF metadata.
+
 ## 0.6.0 — 2026-11-23
 
 See the [release notes](docs/releases/release-0.6.0.md) for upgrade guidance.

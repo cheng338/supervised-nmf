@@ -72,7 +72,7 @@ def main():
     from supervised_nmf.study import calibration_knn_grid
     from supervised_nmf.search import calibration_rank_search
     from supervised_nmf.validation import build_cv_folds
-    from supervised_nmf.evaluation import calibration_search, evaluate_classifier, format_evaluation_summary
+    from supervised_nmf.evaluation import calibration_search, evaluate_classifier, format_evaluation_summary, load_calibration_report
 
     assert Path(supervised_nmf.__file__).resolve().is_relative_to(installed_root), supervised_nmf.__file__
     assert Path(_aocl.__file__).resolve().is_relative_to(installed_root), _aocl.__file__
@@ -100,6 +100,7 @@ def main():
             assert result.report["scoring"] == resumed.report["scoring"] == scoring
             assert result.report["selected_parameters"] == resumed.report["selected_parameters"]
             assert result.report["selected_mean_score"] == resumed.report["selected_mean_score"]
+            assert load_calibration_report(checkpoint)["fingerprint"] == result.report["fingerprint"]
 
 
     def assert_prediction_report(estimator, X, y):

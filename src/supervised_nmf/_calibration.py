@@ -22,7 +22,11 @@ def _score_predictions(scoring, y_true, y_pred):
     # Public calibration callers already validate y_true before making folds.
     # An external estimator can still return unsupported prediction labels.
     y_pred = _validate_class_labels(y_pred)
-    score = float(_SCORERS[scoring](_label_values(y_true), _label_values(y_pred)))
+    return _score_label_values(scoring, _label_values(y_true), _label_values(y_pred))
+
+
+def _score_label_values(scoring, y_true, y_pred):
+    score = float(_SCORERS[scoring](y_true, y_pred))
     if not math.isfinite(score):
         raise ValueError("Nonfinite calibration score.")
     return score

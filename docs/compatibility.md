@@ -2,6 +2,58 @@
 
 ## Current support policy
 
+Current source requires NumPy 1.26.3 or later and SciPy 1.15.0 or later.
+SciPy 1.16.0 and 1.16.1 are excluded because repeated calls to
+`scipy.optimize.nnls` leak memory. SciPy fixed the leak in 1.16.2.
+Release 0.6.0 declared `numpy>=1.26` and `scipy>=1.11`.
+[SciPy 1.16.2 release notes](https://docs.scipy.org/doc/scipy/release/1.16.2-notes.html#issues-closed-for-1-16-2)
+
+On November 24, 2026, we compared SciPy 1.15.0 and 1.16.2 with NumPy 1.26.3
+on CPython 3.11. On each host, Windows (AOCL) and Ubuntu (MKL), both SciPy
+versions produced identical public test outcomes, including the failures
+and errors observed in that run.
+
+On November 26, 2026, we tested the package with all declared runtime and
+extra dependencies at their minimum versions, including NumPy 1.26.3 and
+SciPy 1.15.0. We ran the full public suite on CPython 3.11 and 3.12 on
+both native Windows (AOCL) and physical Ubuntu (MKL). Each of the four
+runs collected 6,301 tests and finished with zero failures or errors.
+Between 253 and 435 tests were skipped per run.
+
+Current source requires scikit-learn 1.9.0 or later. With 1.8.0, a
+caller-supplied, uniform-weight Manhattan KNN using brute-force search failed
+to predict string class labels. In our three-fold check, calibration warned
+and returned a training-majority classifier. With 1.9.0,
+calibration returned the requested KNN and evaluation classified both held-out
+observations correctly on Windows (AOCL) and Ubuntu (MKL).
+[Upstream KNN fix](https://github.com/scikit-learn/scikit-learn/pull/33048)
+
+Release 0.6.0 declared `scikit-learn>=1.6.1`. If an earlier study used
+scikit-learn 1.6.x or 1.7.x, upgrading can change automatically generated
+grouped CV folds even with the same seed. Scikit-learn 1.8.0 corrected how
+the splitter associates class counts with subjects after shuffling. To reuse
+a valid prior partition, pass its saved fold indices with the original row
+order and group labels.
+[Upstream grouped-fold fix](https://github.com/scikit-learn/scikit-learn/pull/32540)
+
+Current source requires threadpoolctl 3.7.0 or later. On Ubuntu MKL, a limit
+set in one Python thread now applies to that thread alone. If you start your
+own worker threads, set the MKL budget inside each worker that needs a limit.
+The package sets limits inside its own projection workers. On Windows AOCL,
+3.7.0 also removes a spurious OpenMP warning that could raise an exception
+during fitting when applications treated runtime warnings as errors.
+[threadpoolctl 3.7.0 release notes](https://github.com/joblib/threadpoolctl/blob/3.7.0/CHANGES.md)
+
+Current source requires Joblib 1.6.0 or later on all supported Python versions.
+On CPython 3.15.2, two-worker `FeatureSPA.transform` calls with Joblib 1.5.2
+and 1.5.3 returned the expected coordinates on Windows AOCL and Ubuntu MKL,
+but their loky resource tracker rejected messages used to track temporary
+resources for cleanup. The temporary directories were empty after normal exit.
+Joblib 1.6.0 bundles loky 3.6.0 and completed the same calls with clean stderr.
+Release 0.6.0 declared `joblib>=1.3`.
+[Upstream Python 3.15 issue](https://github.com/joblib/loky/issues/624) ·
+[Joblib 1.6.0 release notes](https://joblib.readthedocs.io/en/stable/CHANGES.html#release-1-6-0-2026-08-31)
+
 Python 3.10 support ended on October 20, 2026. Current source requires Python
 3.11 or later; Python 3.12 with AOCL remains the primary development
 environment. This removes Python 3.10 from future compatibility work and
@@ -25,6 +77,66 @@ subject-separated tuning, final fitting and held-out evaluation, use the
 [grouped example](../examples/grouped_tuning.py) and [public API guide](api.md).
 Retaining historical tools does not qualify new runs or require maintaining
 Python 3.10 compatibility.
+
+## Test runner
+
+The test extra requires `pytest>=9.0.3,!=9.1.0` on all supported Python
+versions. Pytest 9.0.3 includes the Unix temporary-directory mitigation for
+CVE-2025-71176. Version 9.1.0 rejects an indirect override of a parametrized
+fixture during collection, which blocks 32 solver tests. Version 9.1.1
+restores collection. On Ubuntu MKL with Python 3.15.2, pytest 9.0.3 and
+9.1.1 produced the same outcomes for all 5,697 distributed tests, including
+the same 44 failures.
+[pytest 9.0.3 release notes](https://github.com/pytest-dev/pytest/releases/tag/9.0.3) ·
+[pytest 9.1.1 release notes](https://github.com/pytest-dev/pytest/releases/tag/9.1.1)
+
+## pandas in the test extra
+
+Pandas is optional for ordinary installations. Installing the `test` extra
+adds pandas with a minimum that depends on the Python version.
+
+| Python | Minimum pandas |
+| --- | --- |
+| 3.11–3.12 | 2.1.2 |
+| 3.13 | 2.2.3 |
+| 3.14 | 2.3.3 |
+| 3.15 and later | 3.0.6 |
+
+On Python 3.11–3.12, pandas 2.1.2 through 2.2.1 require NumPy below 2.
+If an environment requires NumPy 2, pip therefore selects pandas 2.2.2 or
+later. The newer Python bounds follow pandas' interpreter support. The
+pandas-focused tests passed at each minimum on Windows AOCL and Ubuntu MKL
+through Python 3.15.
+[pandas NumPy 2 support](https://pandas.pydata.org/docs/whatsnew/v2.2.2.html)
+
+## Matplotlib in the study extra
+
+Matplotlib is optional for ordinary installations. The `study` extra
+installs it for plotting. Its minimum depends on the Python version.
+
+| Python | Minimum Matplotlib |
+| --- | --- |
+| 3.11–3.12 | 3.7.3 |
+| 3.13 | 3.9.2 |
+| 3.14 | 3.10.5 |
+| 3.15 and later | 3.11.2 |
+
+On Python 3.11–3.12, Matplotlib 3.7.3 through 3.8.3 require NumPy below 2.
+If the environment requires NumPy 2, pip selects Matplotlib 3.8.4 or later.
+The study reporters rendered PNGs at each minimum on Windows x64 with AOCL
+and Ubuntu x86-64 with MKL through Python 3.15.
+[Matplotlib 3.8.4 release notes](https://github.com/matplotlib/matplotlib/releases/tag/v3.8.4)
+
+## Pillow in the examples and study extras
+
+Pillow is optional for ordinary installations. Both the `examples` and
+`study` extras require Pillow 13.0.0 or later. The CelebA loader calls
+`Image.open()` on local files. Pillow 13.0.0 fixes excessive memory use
+that can occur while reading malformed JPEG EXIF metadata, before the
+loader resizes the image. On Windows AOCL and physical Ubuntu MKL,
+Pillow 13.0.0 produced the expected grayscale pixel values and all three
+study PNGs on Python 3.11–3.15.
+[Pillow JPEG metadata advisory](https://github.com/python-pillow/Pillow/security/advisories/GHSA-wqgw-9xfh-qf2g)
 
 ## Class-label strings
 
@@ -146,24 +258,27 @@ loading an existing fitted model does not retrain it or rewrite its metadata.
 
 ## Use an existing target environment
 
-Use Python 3.11 or later and scikit-learn 1.6.1 or later. Python 3.12 is the
-primary development target. Activate the intended environment and install from the
-source checkout without changing its already-provisioned numerical dependencies:
+Use Python 3.11 or later with the dependencies in the
+[current support policy](#current-support-policy). Python 3.12 is the
+primary development target. In the preconfigured environment, install only
+the project from the source checkout, then check that the installed
+dependencies satisfy the declared requirements.
 
 ```shell
 python -m pip install --no-deps .
+python -m pip check
 ```
 
-This command does not install missing dependencies or validate the environment.
 Image-loading examples additionally require Pillow, and plotting requires
 Matplotlib.
 
 ## Optional Python 3.12 environment for the October studies
 
-For a current installation, follow the [installation guide](../README.md#installation).
+For the published 0.6.0 release, follow the [installation guide](../README.md#installation).
+To install current development source, run `python -m pip install .` from its checkout.
 To reproduce the October studies’ five Python 3.12 numerical dependency versions,
 install the [study requirements](../requirements/robust-py312.txt) in a separate
-environment before installing the applicable study source. For a source checkout, run
+environment and run the following commands from the archived study checkout.
 
 ```shell
 python -m pip install -r requirements/robust-py312.txt

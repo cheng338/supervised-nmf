@@ -172,6 +172,19 @@ class _FitObserver:
         patch.setattr(experimental, "make_output_workspace", workspace)
 
     def _inject_optional_fault(self, patch):
+        if self.fault == "offer-preparation":
+            geterr = np.geterr
+
+            def policy_snapshot():
+                # Fail the producer's own request after the final NNLS state.
+                # NumPy 1.26 also calls geterr while restoring errstate.
+                if self.tail_calls and sys._getframe(1).f_code is CORE:
+                    assert self.tail_calls == 1 and self.active_counts is None
+                    assert self.offer_writes == 0
+                    self._raise()
+                return geterr()
+
+            patch.setattr(np, "geterr", policy_snapshot)
         if self.fault in ("offer-preparation", "optional-publication"):
             role_type = experimental._FixedTrainingRHS
             store = role_type.__setattr__
@@ -231,9 +244,6 @@ class _FitObserver:
             self.last_gradient = None if arg[3] is None else weakref.ref(arg[3])
         if event != "call":
             return
-        if (self.fault == "offer-preparation" and frame.f_code is np.geterr.__code__
-                and self.tail_calls and self.active_counts is None and not self.offer_writes):
-            self._raise()
         if frame.f_code is experimental._handoff_usable.__code__:
             self.usability_calls += 1
         if self.check_objective_inputs and frame.f_code is experimental.linalg.norm.__code__:

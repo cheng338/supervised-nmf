@@ -175,6 +175,9 @@ class ReinterpretingKey(str):
         return str.__hash__(self)
 
 
+_EXTRA_LABEL_WARNING = "y_pred contains classes not in y_true"
+
+
 class ReinterpretingPredictor(LabelPredictor):
     def __init__(self, callback):
         self.callback = callback
@@ -194,9 +197,11 @@ class ReinterpretingPredictor(LabelPredictor):
         else:
             showwarning = warnings.showwarning
 
-            def show(*args, **kwargs):
-                predictions.dtype = np.complex128
-                showwarning(*args, **kwargs)
+            def show(message, category, *args, **kwargs):
+                showwarning(message, category, *args, **kwargs)
+                # Only the scorer warning triggers the mutation, which may itself warn.
+                if category is UserWarning and str(message) == _EXTRA_LABEL_WARNING:
+                    predictions.dtype = np.complex128
 
             warnings.showwarning = show
         return predictions
@@ -219,6 +224,10 @@ def test_confusion_rows_record_dtype_before_user_code_runs_in_scorer(tmp_path, c
         assert pred == {"dtype_kind": "U", "native_text": True, "has_unique_cache": True,
                         "opaque_unique_cache": callback == "cache"}
         assert [w["message"] for w in fold["warnings"]] == [str(w.message) for w in caught]
+        if callback == "warning":
+            index = fold["balanced_accuracy_confusion_rows"]["warning_index"]
+            assert index is not None
+            assert caught[index].category is UserWarning and str(caught[index].message) == _EXTRA_LABEL_WARNING
 
     # Both scores are attainable with four observations per class. A v1
     # complex dtype might record a genuine callback, or an impossible claim

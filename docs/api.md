@@ -1,6 +1,6 @@
 # API reference
 
-This page describes version 0.6.0, including its solver-aware MU projection default. Per-observation MU
+This page describes version 0.6.1, including its solver-aware MU projection default. Per-observation MU
 projection was added as an option in 0.4.0; newly fitted MU models now select it
 through `mu_projection="auto"`. Version 0.3.3 introduced optional QR
 projection and MU numerical recovery. Optional KNN SD

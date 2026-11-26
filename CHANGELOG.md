@@ -7,7 +7,9 @@ records retain their original scope.
 
 Release dates are GitHub publication dates in America/Indianapolis time.
 
-## Unreleased
+## 0.6.1 — 2026-11-26
+
+See the [release notes](docs/releases/release-0.6.1.md) for upgrade guidance.
 
 - Raise the minimum supported NumPy version from 1.26.0 to 1.26.3.
 - Batched NNLS uses the original cross product with absolute-valued targets

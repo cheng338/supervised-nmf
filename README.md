@@ -34,18 +34,18 @@ the original work has yet to be selected. See [LICENSE](LICENSE) and the
 # Installation
 
 Use Python 3.11 or later. Download the wheel from the
-[GitHub release](https://github.com/cheng338/supervised-nmf/releases/tag/v0.6.0),
+[GitHub release](https://github.com/cheng338/supervised-nmf/releases/tag/v0.6.1),
 then run this command in the download directory.
 
 ```sh
-python -m pip install ./supervised_nmf-0.6.0-py3-none-any.whl
+python -m pip install ./supervised_nmf-0.6.1-py3-none-any.whl
 ```
 
 For the examples, tests and study scripts, use the matching source archive or
 clone the release.
 
 ```sh
-git clone --branch v0.6.0 https://github.com/cheng338/supervised-nmf.git
+git clone --branch v0.6.1 https://github.com/cheng338/supervised-nmf.git
 cd supervised-nmf
 python -m pip install .
 ```
@@ -188,5 +188,5 @@ python -I scripts/check_wheel.py
 
 # Changelog
 
-See the [0.6.0 release notes](docs/releases/release-0.6.0.md) for upgrade guidance
+See the [0.6.1 release notes](docs/releases/release-0.6.1.md) for upgrade guidance
 and the [changelog](CHANGELOG.md) for release history.

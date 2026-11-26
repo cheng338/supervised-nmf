@@ -274,7 +274,7 @@ Matplotlib.
 
 ## Optional Python 3.12 environment for the October studies
 
-For the published 0.6.0 release, follow the [installation guide](../README.md#installation).
+For the published 0.6.1 release, follow the [installation guide](../README.md#installation).
 To install current development source, run `python -m pip install .` from its checkout.
 To reproduce the October studies’ five Python 3.12 numerical dependency versions,
 install the [study requirements](../requirements/robust-py312.txt) in a separate

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "supervised-nmf"
-version = "0.6.0"
+version = "0.6.1"
 description = "Supervised nonnegative matrix factorization for binary classification"
 readme = {text = """
 Supervised NMF for binary classification combines training-only feature
@@ -15,7 +15,7 @@ prediction, and calibration within training folds.
 Install the downloaded wheel with Python 3.11 or later:
 
 ```sh
-python -m pip install ./supervised_nmf-0.6.0-py3-none-any.whl
+python -m pip install ./supervised_nmf-0.6.1-py3-none-any.whl
 ```
 
 For finite, nonnegative feature matrices and two training classes:
@@ -31,8 +31,8 @@ Tune screening, rank and classifier settings within training folds before
 evaluating the fitted procedure on held-out observations. The constructor
 defaults are starting values.
 
-The [0.6.0 README](https://github.com/cheng338/supervised-nmf/blob/v0.6.0/README.md)
-and [API guide](https://github.com/cheng338/supervised-nmf/blob/v0.6.0/docs/api.md)
+The [0.6.1 README](https://github.com/cheng338/supervised-nmf/blob/v0.6.1/README.md)
+and [API guide](https://github.com/cheng338/supervised-nmf/blob/v0.6.1/docs/api.md)
 give worked examples and tuning guidance. The matching source archive includes
 both documents for offline use. Other versions are available on the
 [releases page](https://github.com/cheng338/supervised-nmf/releases).

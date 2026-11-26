@@ -1,7 +1,9 @@
 """Archived dtype observations bound the outcomes of the recorded sklearn scorer."""
 
-import json
+from contextlib import nullcontext
 from hashlib import sha256
+import json
+from unittest.mock import patch
 import warnings
 
 import numpy as np
@@ -178,6 +180,18 @@ class ReinterpretingKey(str):
 _EXTRA_LABEL_WARNING = "y_pred contains classes not in y_true"
 
 
+def _reinterpret_on_scorer_warning(predictions):
+    previous = warnings.showwarning
+
+    def show(message, category, *args, **kwargs):
+        previous(message, category, *args, **kwargs)
+        # Only the scorer warning triggers the mutation, which may itself warn.
+        if category is UserWarning and str(message) == _EXTRA_LABEL_WARNING:
+            predictions.dtype = np.complex128
+
+    return patch.object(warnings, "showwarning", show)
+
+
 class ReinterpretingPredictor(LabelPredictor):
     def __init__(self, callback):
         self.callback = callback
@@ -194,28 +208,47 @@ class ReinterpretingPredictor(LabelPredictor):
         predictions = np.array(values, dtype=dtype)[X[:, 0].astype(int)]
         if self.callback == "cache":
             first.original = predictions
-        else:
-            showwarning = warnings.showwarning
-
-            def show(message, category, *args, **kwargs):
-                showwarning(message, category, *args, **kwargs)
-                # Only the scorer warning triggers the mutation, which may itself warn.
-                if category is UserWarning and str(message) == _EXTRA_LABEL_WARNING:
-                    predictions.dtype = np.complex128
-
-            warnings.showwarning = show
         return predictions
 
 
+def test_scorer_warning_hook_restores_handler_on_error():
+    predictions = np.array(["a", "b"])
+    with patch.object(warnings, "showwarning", wraps=warnings.showwarning) as incoming:
+        with pytest.raises(ValueError, match="inconsistent numbers of samples"):
+            with _reinterpret_on_scorer_warning(predictions):
+                assert warnings.showwarning is not incoming
+                balanced_accuracy_score(["a"], predictions)
+        assert warnings.showwarning is incoming
+
+
 @pytest.mark.parametrize("callback", ["cache", "warning"])
-def test_confusion_rows_record_dtype_before_user_code_runs_in_scorer(tmp_path, callback):
+def test_confusion_rows_record_dtype_before_user_code_runs_in_scorer(tmp_path, monkeypatch, callback):
     model = ReinterpretingPredictor(callback)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
+        previous = warnings.showwarning
         predictions = model.predict(np.arange(8)[:, None])
-        expected = balanced_accuracy_score(np.array(list("aaaabbbb")), predictions)
+        assert warnings.showwarning is previous
+        with _reinterpret_on_scorer_warning(predictions) if callback == "warning" else nullcontext():
+            expected = balanced_accuracy_score(np.array(list("aaaabbbb")), predictions)
+        assert warnings.showwarning is previous
     assert predictions.dtype.kind == "c"
+    if callback == "warning":
+        score_fold = evaluation._score_calibration_fold
+        scored_dtypes = []
+
+        def score_with_warning(scoring, truth, predictions, *args, **kwargs):
+            previous = warnings.showwarning
+            with _reinterpret_on_scorer_warning(predictions):
+                score = score_fold(scoring, truth, predictions, *args, **kwargs)
+            assert warnings.showwarning is previous
+            scored_dtypes.append(predictions.dtype.kind)
+            return score
+
+        monkeypatch.setattr(evaluation, "_score_calibration_fold", score_with_warning)
     report = _write_search(tmp_path / "callback.json", model)
+    if callback == "warning":
+        assert scored_dtypes == ["c", "c"]
     assert report["identity"]["balanced_accuracy_support_method"] == "confusion-matrix-v5"
     assert report["selected_candidate_index"] == 0 and report["selected_mean_score"] == expected
     assert expected == (.75 if callback == "cache" else .625)
